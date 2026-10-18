@@ -38,6 +38,11 @@ pub struct HistorySession {
     pub timestamp: u64,
     pub project: String,
     pub project_name: String,
+    /// Latest working directory observed in the transcript. Worktree sessions
+    /// launch from the repository but edit under the worktree; review/diff
+    /// surfaces must use this path rather than the launch project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1951,6 +1956,7 @@ fn merge_claude_history_line(session_map: &mut HashMap<String, HistorySession>, 
             timestamp,
             project,
             project_name,
+            cwd: None,
             env_name: None,
             config_source: None,
             task_stage: None,
@@ -2169,6 +2175,7 @@ fn history_session_from_provenance_record(
         timestamp,
         project,
         project_name,
+        cwd: None,
         env_name: Some(record.env_name.clone()).filter(|value| !value.trim().is_empty()),
         config_source: record
             .config_source
@@ -2525,6 +2532,7 @@ fn parse_claude_project_session_index(path: &Path) -> Option<HistorySession> {
     let mut display_priority = 0;
     let mut timestamp = 0;
     let mut project = String::new();
+    let mut cwd: Option<String> = None;
 
     for line_result in reader.lines() {
         let line = line_result.ok()?;
@@ -2542,10 +2550,11 @@ fn parse_claude_project_session_index(path: &Path) -> Option<HistorySession> {
             timestamp = line_ts;
         }
 
-        if project.is_empty() {
-            if let Some(cwd) = value.get("cwd").and_then(|v| v.as_str()) {
-                project = cwd.to_string();
+        if let Some(line_cwd) = value.get("cwd").and_then(|v| v.as_str()) {
+            if project.is_empty() {
+                project = line_cwd.to_string();
             }
+            cwd = Some(line_cwd.to_string());
         }
 
         let is_meta = value.get("isMeta").and_then(|v| v.as_bool()) == Some(true);
@@ -2592,6 +2601,7 @@ fn parse_claude_project_session_index(path: &Path) -> Option<HistorySession> {
         timestamp,
         project,
         project_name,
+        cwd,
         env_name: None,
         config_source: None,
         task_stage: None,
@@ -3136,6 +3146,7 @@ fn upsert_codex_history_session(
                 timestamp,
                 project: String::new(),
                 project_name: "unknown".to_string(),
+                cwd: None,
                 env_name: None,
                 config_source: None,
                 task_stage: None,
@@ -3272,6 +3283,7 @@ fn load_codex_history_from_config_limited(
                 timestamp: record.timestamp,
                 project: record.project,
                 project_name,
+                cwd: None,
                 env_name: None,
                 config_source: None,
                 task_stage: None,
@@ -4505,6 +4517,7 @@ fn parse_opencode_history_session(value: &serde_json::Value) -> Option<HistorySe
         timestamp,
         project,
         project_name,
+        cwd: None,
         env_name: extract_opencode_string(value, &["envName", "environment", "env"]).or_else(
             || {
                 metadata
@@ -4787,6 +4800,7 @@ fn local_opencode_session_to_history_session(
         timestamp: session.updated_at.max(session.created_at),
         project,
         project_name,
+        cwd: None,
         env_name: session.env_name,
         config_source: session.config_source,
         task_stage: None,
@@ -4935,6 +4949,7 @@ pub fn map_dsh_list_item(item: &dsh_history::DshSessionListItem) -> HistorySessi
         timestamp: timestamp_ms,
         project,
         project_name,
+        cwd: None,
         env_name: item.provider.clone(),
         config_source: None,
         task_stage: None,
@@ -5951,6 +5966,7 @@ mod tests {
                 timestamp: 100,
                 project: "/repo/alpha".to_string(),
                 project_name: "alpha".to_string(),
+                cwd: None,
                 env_name: None,
                 config_source: None,
                 task_stage: None,
@@ -5966,6 +5982,7 @@ mod tests {
                 timestamp: 300,
                 project: "/repo/beta".to_string(),
                 project_name: "beta".to_string(),
+                cwd: None,
                 env_name: None,
                 config_source: None,
                 task_stage: None,
@@ -5981,6 +5998,7 @@ mod tests {
                 timestamp: 200,
                 project: "/repo/alpha".to_string(),
                 project_name: "alpha".to_string(),
+                cwd: None,
                 env_name: None,
                 config_source: None,
                 task_stage: None,
@@ -6023,6 +6041,7 @@ mod tests {
             timestamp: 100,
             project: format!("/repo/{project_name}"),
             project_name: project_name.to_string(),
+            cwd: None,
             env_name: None,
             config_source: None,
             task_stage: None,
@@ -6397,6 +6416,7 @@ mod tests {
                     timestamp: 1,
                     project: "/Users/g/ccem".to_string(),
                     project_name: "ccem".to_string(),
+                    cwd: None,
                     env_name: None,
                     config_source: None,
                     task_stage: None,
@@ -6490,6 +6510,7 @@ mod tests {
                 timestamp: 10,
                 project: "".to_string(),
                 project_name: "unknown".to_string(),
+                cwd: None,
                 env_name: Some(super::opencode::OPENCODE_NATIVE_ENV_NAME.to_string()),
                 config_source: Some("native".to_string()),
                 task_stage: None,
@@ -6509,6 +6530,7 @@ mod tests {
                 timestamp: 20,
                 project: "/tmp/demo".to_string(),
                 project_name: "demo".to_string(),
+                cwd: None,
                 env_name: Some("Fixture Anthropic".to_string()),
                 config_source: Some("ccem".to_string()),
                 task_stage: None,
@@ -7291,6 +7313,30 @@ mod tests {
     }
 
     #[test]
+    fn test_claude_project_index_tracks_latest_cwd_for_review() {
+        let root = temp_history_dir("latest-cwd");
+        let path = root.join("session-1.jsonl");
+        let lines = [
+            serde_json::json!({"type":"user","cwd":"/repo","message":{"content":"start"}}),
+            serde_json::json!({"type":"progress","cwd":"/repo/.claude/worktrees/feature","sessionId":"session-1"}),
+            serde_json::json!({"type":"user","cwd":"/repo/.claude/worktrees/feature","message":{"content":"end"}}),
+        ];
+        fs::write(
+            &path,
+            lines.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"),
+        )
+        .unwrap();
+        let session = parse_claude_project_session_index(&path).unwrap();
+        assert_eq!(session.project, "/repo", "launch project stays the grouping key");
+        assert_eq!(
+            session.cwd.as_deref(),
+            Some("/repo/.claude/worktrees/feature"),
+            "review surfaces must see the worktree the session actually edited"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn test_history_display_recovers_owned_wrappers_but_preserves_user_xml() {
         let prompt = format!(
             "<system_tip>{}</system_tip>\n\n请生成报告\n并提供预览",
@@ -7330,6 +7376,7 @@ mod tests {
                 timestamp: 1_776_489_728_117,
                 project: "/Users/g/baymax".to_string(),
                 project_name: "baymax".to_string(),
+                cwd: None,
                 env_name: Some("3891".to_string()),
                 config_source: Some("ccem".to_string()),
                 task_stage: None,
@@ -7345,6 +7392,7 @@ mod tests {
                 timestamp: 1_776_489_728_586,
                 project: "/Users/g/baymax".to_string(),
                 project_name: "baymax".to_string(),
+                cwd: None,
                 env_name: None,
                 config_source: None,
                 task_stage: None,
@@ -7360,6 +7408,7 @@ mod tests {
                 timestamp: 1_776_489_735_000,
                 project: "/Users/g/baymax".to_string(),
                 project_name: "baymax".to_string(),
+                cwd: None,
                 env_name: Some("3891".to_string()),
                 config_source: Some("ccem".to_string()),
                 task_stage: None,
@@ -7408,6 +7457,7 @@ mod tests {
                 timestamp: 1_776_489_728_117,
                 project: "/Users/g/baymax".to_string(),
                 project_name: "baymax".to_string(),
+                cwd: None,
                 env_name: Some("3891".to_string()),
                 config_source: Some("ccem".to_string()),
                 task_stage: None,
@@ -7423,6 +7473,7 @@ mod tests {
                 timestamp: 1_776_489_738_586,
                 project: "/Users/g/baymax".to_string(),
                 project_name: "baymax".to_string(),
+                cwd: None,
                 env_name: None,
                 config_source: None,
                 task_stage: None,
@@ -7465,6 +7516,7 @@ mod tests {
             timestamp: 1_776_489_728_117,
             project: "/Users/g/baymax".to_string(),
             project_name: "baymax".to_string(),
+            cwd: None,
             env_name: Some("3891".to_string()),
             config_source: Some("ccem".to_string()),
             task_stage: None,
@@ -8919,6 +8971,7 @@ mod dsh_integration_tests {
             timestamp: 1000,
             project: "/home/user/project".to_string(),
             project_name: "project".to_string(),
+            cwd: None,
             env_name: Some("deepseek".to_string()),
             config_source: None,
             task_stage: None,
@@ -8939,6 +8992,7 @@ mod dsh_integration_tests {
             timestamp: 1000,
             project: "/home/user/project".to_string(),
             project_name: "project".to_string(),
+            cwd: None,
             env_name: None,
             config_source: None,
             task_stage: None,
@@ -8979,6 +9033,7 @@ mod dsh_integration_tests {
                     timestamp: 2000,
                     project: "/p1".to_string(),
                     project_name: "p1".to_string(),
+                    cwd: None,
                     env_name: None,
                     config_source: None,
                     task_stage: None,
@@ -8994,6 +9049,7 @@ mod dsh_integration_tests {
                     timestamp: 1000,
                     project: "/p1".to_string(),
                     project_name: "p1".to_string(),
+                    cwd: None,
                     env_name: None,
                     config_source: None,
                     task_stage: None,
@@ -9030,6 +9086,7 @@ mod dsh_integration_tests {
                     timestamp: 2000,
                     project: "/p1".to_string(),
                     project_name: "p1".to_string(),
+                    cwd: None,
                     env_name: None,
                     config_source: None,
                     task_stage: None,
@@ -9045,6 +9102,7 @@ mod dsh_integration_tests {
                     timestamp: 3000,
                     project: "/p1".to_string(),
                     project_name: "p1".to_string(),
+                    cwd: None,
                     env_name: Some("deepseek".to_string()),
                     config_source: None,
                     task_stage: None,
@@ -9166,6 +9224,7 @@ mod dsh_integration_tests {
             timestamp: 1000,
             project: "/p".to_string(),
             project_name: "p".to_string(),
+            cwd: None,
             env_name: None,
             config_source: None,
             task_stage: None,
@@ -9181,6 +9240,7 @@ mod dsh_integration_tests {
             timestamp: 2000,
             project: "/q".to_string(),
             project_name: "q".to_string(),
+            cwd: None,
             env_name: Some("deepseek".to_string()),
             config_source: None,
             task_stage: None,
@@ -9216,6 +9276,7 @@ mod dsh_integration_tests {
             timestamp: 1000,
             project: "/p".to_string(),
             project_name: "p".to_string(),
+            cwd: None,
             env_name: None,
             config_source: None,
             task_stage: None,

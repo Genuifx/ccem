@@ -1992,7 +1992,7 @@ export function Workspace({
     [historyEvents, selectedSession, workspaceMode],
   );
   const workspaceReviewWorkingDir = workspaceMode === 'history' && selectedSession
-    ? selectedSession.project || null
+    ? selectedSession.cwd || selectedSession.project || null
     : effectiveComposeDir;
   const workspaceReviewProviderSessionId = workspaceMode === 'history' && selectedSession
     ? resolveWorkspaceReviewProviderSessionId(selectedSession, findLiveEntryForSession(selectedSession))
@@ -3932,7 +3932,7 @@ export function Workspace({
                     isRefreshingGit={isRefreshingWorkspaceGitSnapshot}
                     onOpenChange={setWorkspaceReviewOpen}
                     onRefreshGit={() => void refreshWorkspaceGitSnapshot()}
-                    onLoadDiff={(filePath) => getWorkspaceFileDiff(workspaceReviewWorkingDir || '', filePath)}
+                    onLoadDiff={(filePath, options) => getWorkspaceFileDiff(workspaceReviewWorkingDir || '', filePath, options?.committed)}
                     onLoadMediaPreview={(filePath) => getWorkspaceMediaPreview(workspaceReviewWorkingDir || '', filePath)}
                     isLive={workspaceMode !== 'history'}
                     onLoadSubagents={

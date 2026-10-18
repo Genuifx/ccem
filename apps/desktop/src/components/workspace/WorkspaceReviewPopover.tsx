@@ -45,7 +45,7 @@ interface WorkspaceReviewPopoverProps {
   isRefreshingGit: boolean;
   onOpenChange: (open: boolean) => void;
   onRefreshGit: () => void;
-  onLoadDiff: (filePath: string) => Promise<WorkspaceFileDiff>;
+  onLoadDiff: (filePath: string, options?: { committed?: boolean }) => Promise<WorkspaceFileDiff>;
   onLoadMediaPreview?: (filePath: string) => Promise<WorkspaceMediaPreview>;
   onLoadSubagents?: (detailAgentId: string | null) => Promise<SessionSubagentsPayload>;
   isLive?: boolean;

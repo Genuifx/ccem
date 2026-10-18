@@ -142,6 +142,37 @@ test('changes stays in the side panel; source opens in browse and preserves per-
   assert.equal(document.querySelector('a[href^="javascript:"]'), null);
 });
 
+test('a clean working tree offers the latest commit diff for session files', async (t) => {
+  const requests = [];
+  const h = await setup(t, async () => file('# Current'));
+  const commitDiff = {
+    ...diff,
+    path: 'docs/report.md',
+    lines: [{ kind: 'addition', text: 'committed text', new_line: 1 }],
+    commit: 'abc1234',
+  };
+  await h.root.render({
+    ...h.props,
+    onLoadDiff: async (filePath, options) => {
+      requests.push({ filePath, options });
+      return options?.committed ? commitDiff : { ...diff, lines: [] };
+    },
+  });
+  await h.click(h.byText('改动文件2'));
+  await h.click(document.querySelector('[data-ccem-change-file][title="docs/report.md"]'));
+  await h.settle();
+  assert.match(
+    document.querySelector('[data-review-page="files"]').textContent,
+    /当前工作区没有未提交差异/,
+    'a clean tree explains why the working diff is empty',
+  );
+  await h.click(h.byText('查看最近提交差异'));
+  await h.settle();
+  assert.match(document.querySelector('[data-review-page="files"]').textContent, /committed text/);
+  assert.match(document.querySelector('[data-review-page="files"]').textContent, /来自提交 abc1234/);
+  assert.deepEqual(requests.at(-1), { filePath: 'docs/report.md', options: { committed: true } });
+});
+
 test('agent-drift preview links still open the files tab with the full untruncated path', async (t) => {
   const calls = [];
   const h = await setup(t, async (command, args) => {

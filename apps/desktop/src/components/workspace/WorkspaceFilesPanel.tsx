@@ -38,7 +38,7 @@ import { DiffPreview, MediaPreview, basename, isMarkdownPath, mediaKindForPath }
 export interface WorkspaceFilesPanelProps {
   session: NativeSessionSummary;
   model: WorkspaceReviewModel;
-  onLoadDiff: (filePath: string) => Promise<WorkspaceFileDiff>;
+  onLoadDiff: (filePath: string, options?: { committed?: boolean }) => Promise<WorkspaceFileDiff>;
   onLoadMediaPreview?: (filePath: string) => Promise<WorkspaceMediaPreview>;
   gitSnapshot?: WorkspaceGitSnapshot | null;
   requestedPath?: string;
@@ -267,6 +267,26 @@ export function WorkspaceFilesPanel({
     else fileLinks?.openFile(path);
   }, [fileLinks, sidePanel]);
 
+  const loadCommitDiff = useCallback(async () => {
+    if (!selectedPath) return;
+    const requestSeq = ++fileRequestSeqRef.current;
+    setDiff(null);
+    setTextPreview(null);
+    setMediaPreview(null);
+    setError(null);
+    setLoading(true);
+    try {
+      const next = await loaders.current.onLoadDiff(selectedPath, { committed: true });
+      if (requestSeq !== fileRequestSeqRef.current) return;
+      setDiff(next);
+    } catch (requestError) {
+      if (requestSeq !== fileRequestSeqRef.current) return;
+      setError(String(requestError));
+    } finally {
+      if (requestSeq === fileRequestSeqRef.current) setLoading(false);
+    }
+  }, [selectedPath]);
+
   useEffect(() => {
     if (scope !== 'browse') return;
     let cancelled = false;
@@ -487,7 +507,7 @@ export function WorkspaceFilesPanel({
             className="h-7 w-7 shrink-0"
             aria-label={t('workspace.filesRefreshPreview')}
             title={t('workspace.filesRefreshPreview')}
-            onClick={() => void selectFile(selectedPath, mode)}
+            onClick={() => { if (diff?.commit) void loadCommitDiff(); else void selectFile(selectedPath, mode); }}
           >
             <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
           </Button>
@@ -753,6 +773,8 @@ export function WorkspaceFilesPanel({
                         ? sidePanel || fileLinks ? () => openSourceInBrowse(selectedPath) : undefined
                         : isMedia ? undefined : () => void selectFile(selectedPath, 'source')}
                       sourceLabel={scope === 'changes' ? t('workspace.viewInBrowse') : t('workspace.filesSource')}
+                      onViewCommitDiff={scope === 'changes' ? () => void loadCommitDiff() : undefined}
+                      emptyLabel={scope === 'changes' ? t('workspace.reviewNoWorkingDiff') : undefined}
                     />
                   ) : isMedia ? (
                     <MediaPreview preview={mediaPreview} loading={loading} error={error} />

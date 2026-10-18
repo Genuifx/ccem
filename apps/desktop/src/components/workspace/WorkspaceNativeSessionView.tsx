@@ -4460,7 +4460,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
             isRefreshingGit={isRefreshingGitSnapshot}
             onOpenChange={setReviewPanelOpen}
             onRefreshGit={() => { void refreshGitSnapshot(); void refreshRecentFiles(); }}
-            onLoadDiff={(filePath) => getWorkspaceFileDiff(session.project_dir, filePath)}
+            onLoadDiff={(filePath, options) => getWorkspaceFileDiff(session.project_dir, filePath, options?.committed)}
             onLoadMediaPreview={(filePath) => getWorkspaceMediaPreview(session.project_dir, filePath)}
             isLive
             onLoadSubagents={

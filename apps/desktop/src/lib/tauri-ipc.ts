@@ -170,7 +170,7 @@ export interface TauriCommands {
     WorkspaceFileSuggestion[]
   ];
   get_workspace_git_snapshot: [{ workingDir: string }, WorkspaceGitSnapshot];
-  get_workspace_file_diff: [{ workingDir: string; filePath: string }, WorkspaceFileDiff];
+  get_workspace_file_diff: [{ workingDir: string; filePath: string; committed?: boolean | null }, WorkspaceFileDiff];
   get_workspace_file_preview: [{ workingDir: string; filePath: string }, WorkspaceFilePreview];
   get_workspace_media_preview: [
     { workingDir: string; filePath: string },
@@ -1267,6 +1267,8 @@ export interface WorkspaceFileDiff {
   lines: WorkspaceDiffLine[];
   truncated: boolean;
   error?: string | null;
+  /** Short SHA when the diff was resolved from the file's latest commit. */
+  commit?: string | null;
 }
 
 export interface WorkspaceFilePreview {

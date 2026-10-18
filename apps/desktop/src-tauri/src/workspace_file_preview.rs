@@ -163,12 +163,13 @@ mod tests {
         let nested_snapshot = crate::get_workspace_git_snapshot(nested.clone()).unwrap();
         assert_eq!(nested_snapshot.files.len(), 1);
         assert_eq!(nested_snapshot.files[0].path, "报告.md");
-        let diff = crate::get_workspace_file_diff(nested, "报告.md".into()).unwrap();
+        let diff = crate::get_workspace_file_diff(nested, "报告.md".into(), None).unwrap();
         assert_eq!(diff.additions, 1);
         assert_eq!(diff.deletions, 1);
         let new_file = crate::get_workspace_file_diff(
             root.to_string_lossy().into(),
             "outputs/my report.md".into(),
+            None,
         )
         .unwrap();
         assert!(new_file.is_untracked);
@@ -190,7 +191,7 @@ mod tests {
         git(root, &["commit", "-qm", "fixture"]);
         fs::remove_file(root.join("link.md")).unwrap();
         std::os::unix::fs::symlink("two.md", root.join("link.md")).unwrap();
-        let diff = crate::get_workspace_file_diff(root.to_string_lossy().into(), "link.md".into())
+        let diff = crate::get_workspace_file_diff(root.to_string_lossy().into(), "link.md".into(), None)
             .unwrap();
         assert_eq!(diff.additions, 1);
         assert_eq!(diff.deletions, 1);

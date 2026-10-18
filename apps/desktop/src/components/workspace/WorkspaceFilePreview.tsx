@@ -1,4 +1,4 @@
-import { FileDiff } from '@/lib/lucide-react';
+import { FileDiff, GitBranch } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { useLocale } from '@/locales';
 import type {
@@ -62,13 +62,17 @@ export function DiffPreview({
   loading,
   error,
   onViewSource,
+  onViewCommitDiff,
   sourceLabel,
+  emptyLabel,
 }: {
   diff: WorkspaceFileDiff | null;
   loading: boolean;
   error: string | null;
   onViewSource?: () => void;
+  onViewCommitDiff?: () => void;
   sourceLabel?: string;
+  emptyLabel?: string;
 }) {
   const { t } = useLocale();
   if (loading) {
@@ -96,18 +100,33 @@ export function DiffPreview({
     return (
       <div className="flex flex-col items-center gap-2 px-4 py-10 text-center">
         <FileDiff className="h-5 w-5 text-muted-foreground/30" />
-        <p className="text-xs text-muted-foreground">{diff.error || t('workspace.reviewNoDiff')}</p>
-        {onViewSource ? (
-          <Button variant="outline" size="sm" className="h-7 rounded-full px-2.5 text-[10px]" onClick={onViewSource}>
-            {sourceLabel ?? t('workspace.filesSource')}
-          </Button>
-        ) : null}
+        <p className="text-xs text-muted-foreground">
+          {diff.error || (diff.commit ? t('workspace.reviewNoDiff') : emptyLabel ?? t('workspace.reviewNoDiff'))}
+        </p>
+        <div className="flex flex-wrap items-center justify-center gap-2">
+          {onViewCommitDiff ? (
+            <Button variant="outline" size="sm" className="h-7 rounded-full px-2.5 text-[10px]" onClick={onViewCommitDiff}>
+              {t('workspace.reviewViewCommitDiff')}
+            </Button>
+          ) : null}
+          {onViewSource ? (
+            <Button variant="outline" size="sm" className="h-7 rounded-full px-2.5 text-[10px]" onClick={onViewSource}>
+              {sourceLabel ?? t('workspace.filesSource')}
+            </Button>
+          ) : null}
+        </div>
       </div>
     );
   }
 
   return (
     <div className="py-1 font-mono text-[11px] leading-[1.55]">
+      {diff.commit ? (
+        <div className="flex items-center gap-1.5 border-b border-border-subtle/40 px-3 py-1.5 font-sans text-[10px] text-muted-foreground">
+          <GitBranch className="h-3 w-3 shrink-0" />
+          {t('workspace.reviewCommitDiffSource', { sha: diff.commit })}
+        </div>
+      ) : null}
       {diff.lines.map((line, index) => {
         const addition = line.kind === 'addition';
         const deletion = line.kind === 'deletion';

@@ -12,7 +12,7 @@ use std::{
 };
 
 static INDEX_LOCK: Mutex<()> = Mutex::new(());
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const MAX_CACHE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +135,7 @@ mod tests {
             timestamp: 1,
             project: "/fixture".into(),
             project_name: "fixture".into(),
+            cwd: None,
             env_name: None,
             config_source: None,
             task_stage: None,

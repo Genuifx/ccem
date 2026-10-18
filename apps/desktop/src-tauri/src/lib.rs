@@ -4509,6 +4509,8 @@ struct WorkspaceFileDiff {
     lines: Vec<WorkspaceDiffLine>,
     truncated: bool,
     error: Option<String>,
+    /// Short SHA when the diff was resolved from the file's latest commit.
+    commit: Option<String>,
 }
 
 const MAX_DIFF_LINES: usize = 2000;
@@ -4625,10 +4627,19 @@ fn parse_unified_diff(
     (lines, additions, deletions, is_binary, truncated)
 }
 
+fn workspace_relative_path_is_safe(file_path: &str) -> bool {
+    let path = std::path::Path::new(file_path);
+    !path.is_absolute()
+        && path.components().all(|component| {
+            !matches!(component, std::path::Component::ParentDir | std::path::Component::RootDir)
+        })
+}
+
 #[tauri::command]
 fn get_workspace_file_diff(
     working_dir: String,
     file_path: String,
+    committed: Option<bool>,
 ) -> Result<WorkspaceFileDiff, String> {
     let not_repo = |error: Option<String>| WorkspaceFileDiff {
         path: file_path.clone(),
@@ -4640,6 +4651,7 @@ fn get_workspace_file_diff(
         lines: Vec::new(),
         truncated: false,
         error,
+        commit: None,
     };
 
     match run_git_command(&working_dir, &["rev-parse", "--is-inside-work-tree"]) {
@@ -4648,11 +4660,55 @@ fn get_workspace_file_diff(
         Err(error) => return Ok(not_repo(Some(error))),
     }
 
+    let absolute_path = std::path::Path::new(&working_dir).join(&file_path);
+    let absolute = absolute_path.to_string_lossy();
+
+    // Session edits may already be committed. Resolve the latest commit that
+    // touched the file instead of pretending the working tree is the only
+    // evidence the review surface can show.
+    if committed.unwrap_or(false) {
+        if !workspace_relative_path_is_safe(&file_path) {
+            return Err("File path escapes working dir".to_string());
+        }
+        let sha = run_git_command(&working_dir, &["log", "-1", "--format=%H", "--", &absolute])?;
+        let sha = sha.trim();
+        if sha.is_empty() {
+            return Ok(WorkspaceFileDiff {
+                path: file_path,
+                is_repo: true,
+                is_binary: false,
+                is_untracked: false,
+                additions: 0,
+                deletions: 0,
+                lines: Vec::new(),
+                truncated: false,
+                error: Some("No commit history for this file".to_string()),
+                commit: None,
+            });
+        }
+        let raw = run_git_command_raw(
+            &working_dir,
+            &["show", "--format=", "--no-color", "--no-ext-diff", "--no-textconv", sha, "--", &absolute],
+        )?;
+        let (lines, additions, deletions, is_binary, truncated) =
+            parse_unified_diff(&raw, false);
+        return Ok(WorkspaceFileDiff {
+            path: file_path,
+            is_repo: true,
+            is_binary,
+            is_untracked: false,
+            additions,
+            deletions,
+            lines,
+            truncated,
+            error: None,
+            commit: Some(sha.chars().take(7).collect()),
+        });
+    }
+
     // Canonicalize to enforce the boundary, but preserve the leaf symlink's
     // identity when asking Git for its changes.
     resolve_workspace_path(&working_dir, &file_path)?;
-    let absolute_path = std::path::Path::new(&working_dir).join(&file_path);
-    let absolute = absolute_path.to_string_lossy();
     let status = run_git_command_raw(
         &working_dir, &["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", &absolute],
     )?;
@@ -4684,6 +4740,7 @@ fn get_workspace_file_diff(
         lines,
         truncated,
         error: None,
+        commit: None,
     })
 }
 
@@ -6605,8 +6662,8 @@ mod tests {
     use super::{
         build_remote_load_args, build_remote_load_stdin_payload,
         collect_environment_router_references, media_kind_for_extension, merge_git_numstat,
-        parse_git_status, prepare_workspace_initial_prompt,
-        RemoteEnvConfig, WorkspaceGitChangedFile,
+        get_workspace_file_diff, parse_git_status, prepare_workspace_initial_prompt,
+        RemoteEnvConfig, WorkspaceDiffLineKind, WorkspaceGitChangedFile,
     };
     use crate::router::{
         rename_router_config_environment, router_config_environment_references, RouterConfig,
@@ -6617,6 +6674,55 @@ mod tests {
         WRITE_TOOL_LIMIT_SYSTEM_TIP,
     };
     use std::collections::HashMap;
+
+    fn run_test_git(dir: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "CCEM Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "CCEM Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn workspace_file_diff_can_read_the_latest_commit_after_the_tree_is_clean() {
+        let dir = tempfile::tempdir().expect("create temp repo");
+        run_test_git(dir.path(), &["init", "-q"]);
+        std::fs::write(dir.path().join("sample.txt"), "before\n").expect("write base file");
+        run_test_git(dir.path(), &["add", "sample.txt"]);
+        run_test_git(dir.path(), &["commit", "-q", "-m", "initial"]);
+        std::fs::write(dir.path().join("sample.txt"), "before\nafter\n").expect("write changed file");
+        run_test_git(dir.path(), &["add", "sample.txt"]);
+        run_test_git(dir.path(), &["commit", "-q", "-m", "update"]);
+
+        let working_dir = dir.path().to_string_lossy().into_owned();
+        let working = get_workspace_file_diff(working_dir.clone(), "sample.txt".into(), None)
+            .expect("read working diff");
+        assert!(working.lines.is_empty(), "the working tree is clean after the commit");
+        assert!(working.commit.is_none());
+
+        let committed =
+            get_workspace_file_diff(working_dir, "sample.txt".into(), Some(true))
+                .expect("read committed diff");
+        assert!(committed.commit.is_some(), "the fallback should name the commit");
+        assert!(
+            committed.lines.iter().any(|line| {
+                matches!(line.kind, WorkspaceDiffLineKind::Addition)
+                    && line.text.contains("after")
+            }),
+            "the latest commit diff should contain the committed edit"
+        );
+    }
 
     #[test]
     fn test_set_current_env_validates_existence() {
