@@ -12,7 +12,7 @@ use std::{
 };
 
 static INDEX_LOCK: Mutex<()> = Mutex::new(());
-const VERSION: u32 = 3;
+pub(super) const VERSION: u32 = 3;
 const MAX_CACHE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

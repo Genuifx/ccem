@@ -739,3 +739,27 @@ test('truncated display-only paths never enter the changes list', async () => {
   const model = buildWorkspaceReviewModel({ session: session(), events, messages: [] });
   assert.deepEqual(model.changedFiles.map((file) => file.path), ['src/real.ts']);
 });
+
+test('build outputs and dev artifacts never pollute the review file list', async () => {
+  const { buildWorkspaceReviewModel } = await importWorkspaceReview();
+  const recentFiles = [
+    { path: '.artifacts/tauri-dev/manifest.json', modified_ms: 1, byte_size: 1 },
+    { path: '.artifacts/hermes-managed/bridge.sqlite3-shm', modified_ms: 2, byte_size: 1 },
+    { path: 'apps/desktop/src-tauri/gen/schemas/acl-manifests.json', modified_ms: 4, byte_size: 1 },
+    { path: 'apps/desktop/src-tauri/resources/native-runtime-helper.mjs', modified_ms: 5, byte_size: 1 },
+    { path: 'src/generated/report.md', modified_ms: 6, byte_size: 1 },
+  ];
+  const gitSnapshot = {
+    is_repo: true, root: '/repo', branch: 'main', sha: 'abc', upstream: null, dirty_count: 2,
+    files: [
+      { path: 'apps/desktop/src-tauri/gen/schemas/acl-manifests.json', status: 'M', additions: 1, deletions: 0 },
+      { path: 'src/real.ts', status: 'M', additions: 1, deletions: 0 },
+    ],
+  };
+  const model = buildWorkspaceReviewModel({ session: session(), events: [], messages: [], gitSnapshot, recentFiles });
+  assert.deepEqual(
+    model.changedFiles.map((file) => file.path),
+    ['src/generated/report.md', 'src/real.ts'],
+    'generated dev artifacts are excluded without hiding real session-written files',
+  );
+});

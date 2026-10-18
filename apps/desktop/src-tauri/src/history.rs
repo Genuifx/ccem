@@ -2510,7 +2510,7 @@ fn supplement_claude_history_from_projects(
             .collect::<Vec<_>>();
         // Fixture/alternate directories never write the user's production cache.
         let cache_path = (projects_dir == agent_home::claude_home().join("projects"))
-            .then(|| crate::config::get_ccem_dir().join("workspace-history-index.json"));
+            .then(|| crate::config::get_ccem_dir().join(format!("workspace-history-index.v{}.json", index_cache::VERSION)));
         for candidate in index_cache::load(
             &paths,
             cache_path.as_deref(),

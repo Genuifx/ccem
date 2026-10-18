@@ -309,6 +309,8 @@ interface WorkspaceNativeSessionViewProps {
     target: { turnPreview: string },
   ) => void;
   onNavigateEnvironments?: () => void;
+  /** Actual working directory for review/diff (worktree-aware for history-backed live sessions). */
+  reviewWorkingDir?: string | null;
 }
 
 const PARTIAL_REPLAY_RETRY_BASE_MS = 2_000;
@@ -1495,8 +1497,14 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
   onLaunchNewSession,
   onForkTurnRequest,
   onNavigateEnvironments,
+  reviewWorkingDir,
 }: WorkspaceNativeSessionViewProps) {
   const { t } = useLocale();
+  const reviewSession = useMemo<NativeSessionSummary>(() => (
+    reviewWorkingDir && reviewWorkingDir !== session.project_dir
+      ? { ...session, project_dir: reviewWorkingDir }
+      : session
+  ), [reviewWorkingDir, session]);
   const environments = useAppStore((state) => state.environments);
   const enabledEnvironments = useAppStore((state) => state.enabledEnvironments);
   const defaultPermissionMode = useAppStore((state) => state.permissionMode);
@@ -2123,7 +2131,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
   const refreshGitSnapshot = useCallback(async () => {
     const requestSeq = gitSnapshotRequestSeqRef.current + 1;
     gitSnapshotRequestSeqRef.current = requestSeq;
-    const projectDir = session.project_dir;
+    const projectDir = reviewSession.project_dir;
 
     if (!projectDir) {
       setGitSnapshot(null);
@@ -2154,7 +2162,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
         setIsRefreshingGitSnapshot(false);
       }
     }
-  }, [getWorkspaceGitSnapshot, session.project_dir]);
+  }, [getWorkspaceGitSnapshot, reviewSession.project_dir]);
 
   // Filesystem truth for the 会话写入 list: files modified at/after session
   // start, regardless of which tool (Write, bash redirection, script) produced
@@ -2162,7 +2170,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
   const refreshRecentFiles = useCallback(async () => {
     const requestSeq = recentFilesRequestSeqRef.current + 1;
     recentFilesRequestSeqRef.current = requestSeq;
-    const projectDir = session.project_dir;
+    const projectDir = reviewSession.project_dir;
     const sinceMs = Date.parse(session.created_at);
 
     if (!projectDir || !Number.isFinite(sinceMs) || sinceMs <= 0) {
@@ -2180,7 +2188,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
         setRecentFiles(null);
       }
     }
-  }, [getWorkspaceRecentFiles, session.created_at, session.project_dir]);
+  }, [getWorkspaceRecentFiles, session.created_at, reviewSession.project_dir]);
 
   useEffect(() => {
     // Flush the outgoing runtime's mirror immediately on session switch
@@ -2467,7 +2475,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
         consumedCount: events.length,
         fold,
       };
-      return buildWorkspaceReviewSummaryFromFold(fold, gitSnapshot, session.project_dir, recentFiles);
+      return buildWorkspaceReviewSummaryFromFold(fold, gitSnapshot, reviewSession.project_dir, recentFiles);
     }
     const selection = selectEventAppendRange(
       events,
@@ -2496,8 +2504,8 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
     // Idle: reuse the fold (pruned head is already accounted for). The git
     // snapshot and recent-file scan only participate in assembly, so their
     // refreshes never refold.
-    return buildWorkspaceReviewSummaryFromFold(fold, gitSnapshot, session.project_dir, recentFiles);
-  }, [events, gitSnapshot, recentFiles, session.project_dir]);
+    return buildWorkspaceReviewSummaryFromFold(fold, gitSnapshot, reviewSession.project_dir, recentFiles);
+  }, [events, gitSnapshot, recentFiles, reviewSession.project_dir]);
   const reviewModel = useMemo(
     () => {
       if (!isReviewPopoverOpen && !isReviewDetailOpen) {
@@ -2505,7 +2513,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
       }
 
       return buildWorkspaceReviewModel({
-        session,
+        session: reviewSession,
         events,
         messages,
         gitSnapshot,
@@ -2513,7 +2521,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
         recentFiles,
       });
     },
-    [events, gitSnapshot, recentFiles, isReviewPopoverOpen, isReviewDetailOpen, messages, session],
+    [events, gitSnapshot, recentFiles, isReviewPopoverOpen, isReviewDetailOpen, messages, reviewSession],
   );
 
   // Publish review summary to the status-strip entry pill while this live session owns the view.
@@ -4452,16 +4460,16 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
       {(isReviewPopoverOpen || isReviewDetailOpen) && reviewModel ? (
         <Suspense fallback={null}>
           <LazyWorkspaceReviewPopover
-            key={`${session.runtime_id}:${session.project_dir}`}
-            session={session}
+            key={`${reviewSession.runtime_id}:${reviewSession.project_dir}`}
+            session={reviewSession}
             model={reviewModel}
             gitSnapshot={gitSnapshot}
             isOpen={isReviewPopoverOpen}
             isRefreshingGit={isRefreshingGitSnapshot}
             onOpenChange={setReviewPanelOpen}
             onRefreshGit={() => { void refreshGitSnapshot(); void refreshRecentFiles(); }}
-            onLoadDiff={(filePath, options) => getWorkspaceFileDiff(session.project_dir, filePath, options?.committed)}
-            onLoadMediaPreview={(filePath) => getWorkspaceMediaPreview(session.project_dir, filePath)}
+            onLoadDiff={(filePath, options) => getWorkspaceFileDiff(reviewSession.project_dir, filePath, options?.committed)}
+            onLoadMediaPreview={(filePath) => getWorkspaceMediaPreview(reviewSession.project_dir, filePath)}
             isLive
             onLoadSubagents={
               session.provider === 'claude' && session.provider_session_id

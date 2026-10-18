@@ -1706,6 +1706,18 @@ export function Workspace({
     [liveSessionEntries, sessions],
   );
 
+  // Live native sessions keep their launch dir in project_dir. When the
+  // transcript moved into a worktree, review/diff surfaces must use the
+  // history row's latest cwd instead.
+  const historyCwdByProviderSessionId = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const session of sessions) {
+      const cwd = session.cwd?.trim();
+      if (cwd) map.set(session.id, cwd);
+    }
+    return map;
+  }, [sessions]);
+
   const liveSessionTreeState = useMemo(
     () => buildLiveSessionTreeState(liveSessionEntries),
     [liveSessionEntries],
@@ -3990,6 +4002,10 @@ export function Workspace({
                           onForkTurnRequest={openForkTurn}
                           onNavigateEnvironments={handleNavigateEnvironments}
                           onStartNew={handleLiveStartNew}
+                          reviewWorkingDir={
+                            historyCwdByProviderSessionId.get(entry.session.provider_session_id ?? '')
+                              || entry.session.project_dir
+                          }
                       />
                       </div>
                     );

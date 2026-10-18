@@ -53,7 +53,7 @@ test('workspace review popover stays lazy and only mounts while open', async () 
   );
   assert.match(
     nativeView,
-    /key=\{`\$\{session\.runtime_id\}:\$\{session\.project_dir\}`\}/,
+    /key=\{`\$\{reviewSession\.runtime_id\}:\$\{reviewSession\.project_dir\}`\}/,
     'live review state should reset when the reviewed session identity changes',
   );
 });

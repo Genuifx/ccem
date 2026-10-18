@@ -69,6 +69,7 @@ export function areHistorySessionItemsEqual(
     && previous.timestamp === next.timestamp
     && previous.project === next.project
     && previous.projectName === next.projectName
+    && previous.cwd === next.cwd
     && previous.envName === next.envName
     && previous.configSource === next.configSource
     && previous.taskStage === next.taskStage
