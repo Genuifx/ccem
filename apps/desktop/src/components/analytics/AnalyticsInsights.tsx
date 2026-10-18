@@ -1,11 +1,12 @@
-import { invoke } from '@tauri-apps/api/core';
-import { Suspense, lazy, memo, useDeferredValue, useEffect, useMemo, useRef, useState, useTransition } from 'react';
+import { Suspense, lazy, memo, useEffect, useMemo, useState } from 'react';
 import { BarChart3, DollarSign, Flame, RefreshCw } from '@/lib/lucide-react';
 import { EmptyState } from '@/components/ui/EmptyState';
+import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { buildWeekBucketKey } from '@/lib/analyticsTimeBuckets';
 import { useLocale } from '@/locales';
 import { getPerformanceMode } from '@/lib/performance';
+import { fetchModelBreakdown, type AnalyticsUsageSource, type TimeGranularity } from '@/lib/analyticsModelBreakdown';
 import type {
   ChartDataPoint,
   Milestone,
@@ -14,25 +15,12 @@ import type {
   UsageStats,
 } from '@/types/analytics';
 
-type TimeGranularity = 'hour' | 'day' | 'week' | 'month';
-type AnalyticsUsageSource = 'all' | 'claude' | 'codex' | 'opencode' | 'dsh';
-const MODEL_BREAKDOWN_CACHE_TTL_MS = 60_000;
-
-interface ModelBreakdownCacheEntry {
-  data?: ModelBreakdownHistory;
-  statsLastUpdated?: string;
-  fetchedAt: number;
-  promise?: Promise<ModelBreakdownHistory>;
-}
-
 interface LoadedModelBreakdown {
   data: ModelBreakdownHistory;
   granularity: TimeGranularity;
   source: AnalyticsUsageSource;
-  statsLastUpdated: string;
+  revision: string;
 }
-
-const modelBreakdownCache = new Map<string, ModelBreakdownCacheEntry>();
 
 interface AnalyticsInsightsProps {
   usageStats: UsageStats;
@@ -40,6 +28,7 @@ interface AnalyticsInsightsProps {
   enableModelBreakdown: boolean;
   milestones: Milestone[];
   isRefreshing: boolean;
+  refreshRevision?: number;
   onRefresh: () => void | Promise<void>;
 }
 
@@ -90,62 +79,6 @@ function toBreakdown(modelUsage: Record<string, TokenUsageWithCost> | undefined)
       .filter((entry): entry is readonly [string, number] => entry[1] > 0)
       .sort(([, left], [, right]) => right - left),
   );
-}
-
-function getModelBreakdownCacheKey(
-  source: AnalyticsUsageSource,
-  granularity: TimeGranularity,
-): string {
-  return `${source}:${granularity}`;
-}
-
-async function fetchModelBreakdown(
-  source: AnalyticsUsageSource,
-  granularity: TimeGranularity,
-  statsLastUpdated: string,
-): Promise<ModelBreakdownHistory> {
-  const cacheKey = getModelBreakdownCacheKey(source, granularity);
-  const cached = modelBreakdownCache.get(cacheKey);
-  const isFresh = cached?.statsLastUpdated === statsLastUpdated
-    && Date.now() - cached.fetchedAt < MODEL_BREAKDOWN_CACHE_TTL_MS;
-
-  if (cached?.data && isFresh) {
-    return cached.data;
-  }
-
-  if (cached?.promise && cached.statsLastUpdated === statsLastUpdated) {
-    return cached.promise;
-  }
-
-  const request = invoke<ModelBreakdownHistory>('get_usage_model_breakdown', {
-    granularity,
-    source: source === 'all' ? null : source,
-  })
-    .then((data) => {
-      modelBreakdownCache.set(cacheKey, {
-        data,
-        statsLastUpdated,
-        fetchedAt: Date.now(),
-      });
-      return data;
-    })
-    .catch((error) => {
-      if (cached) {
-        modelBreakdownCache.set(cacheKey, cached);
-      } else {
-        modelBreakdownCache.delete(cacheKey);
-      }
-      throw error;
-    });
-
-  modelBreakdownCache.set(cacheKey, {
-    data: cached?.statsLastUpdated === statsLastUpdated ? cached.data : undefined,
-    statsLastUpdated,
-    fetchedAt: cached?.fetchedAt ?? 0,
-    promise: request,
-  });
-
-  return request;
 }
 
 function NextMilestone({ milestones }: { milestones: Milestone[] }) {
@@ -237,15 +170,16 @@ export const AnalyticsInsights = memo(function AnalyticsInsights({
   enableModelBreakdown,
   milestones,
   isRefreshing,
+  refreshRevision = 0,
   onRefresh,
 }: AnalyticsInsightsProps) {
   const { t, lang } = useLocale();
   const [granularity, setGranularity] = useState<TimeGranularity>('day');
   const isReducedPerformanceMode = getPerformanceMode() === 'reduced';
-  const [animateTokenChart, setAnimateTokenChart] = useState(true);
   const [loadedBreakdown, setLoadedBreakdown] = useState<LoadedModelBreakdown | null>(null);
-  const breakdownRequestSeqRef = useRef(0);
-  const [, startTransition] = useTransition();
+  const [breakdownStatus, setBreakdownStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [breakdownRetry, setBreakdownRetry] = useState(0);
+  const breakdownRevision = `${usageStats.lastUpdated}:${refreshRevision}:${breakdownRetry}`;
   const dateLocale = lang === 'zh' ? 'zh-CN' : 'en-US';
   const modelBreakdownEnabled = enableModelBreakdown;
   const [showPrimaryChart, setShowPrimaryChart] = useState(() => !isReducedPerformanceMode);
@@ -254,14 +188,16 @@ export const AnalyticsInsights = memo(function AnalyticsInsights({
   useEffect(() => {
     if (!modelBreakdownEnabled || !showPrimaryChart) {
       setLoadedBreakdown(null);
+      setBreakdownStatus('idle');
       return;
     }
 
-    const requestSeq = ++breakdownRequestSeqRef.current;
+    let cancelled = false;
+    setBreakdownStatus('loading');
 
-    void fetchModelBreakdown(usageSource, granularity, usageStats.lastUpdated)
+    void fetchModelBreakdown(usageSource, granularity, breakdownRevision)
       .then((data) => {
-        if (requestSeq !== breakdownRequestSeqRef.current) {
+        if (cancelled) {
           return;
         }
 
@@ -269,18 +205,21 @@ export const AnalyticsInsights = memo(function AnalyticsInsights({
           data,
           granularity,
           source: usageSource,
-          statsLastUpdated: usageStats.lastUpdated,
+          revision: breakdownRevision,
         });
+        setBreakdownStatus('ready');
       })
       .catch((error) => {
-        if (requestSeq !== breakdownRequestSeqRef.current) {
+        if (cancelled) {
           return;
         }
 
         console.debug('Model breakdown not available for analytics tooltip:', error);
         setLoadedBreakdown(null);
+        setBreakdownStatus('error');
       });
-  }, [granularity, modelBreakdownEnabled, showPrimaryChart, usageSource, usageStats.lastUpdated]);
+    return () => { cancelled = true; };
+  }, [granularity, modelBreakdownEnabled, showPrimaryChart, usageSource, breakdownRevision]);
 
   useEffect(() => {
     if (!isReducedPerformanceMode) {
@@ -290,7 +229,7 @@ export const AnalyticsInsights = memo(function AnalyticsInsights({
 
     setShowPrimaryChart(false);
     const revealPrimaryChart = () => {
-      startTransition(() => setShowPrimaryChart(true));
+      setShowPrimaryChart(true);
     };
     const scheduleIdle = window.requestIdleCallback?.bind(window);
     const cancelIdle = window.cancelIdleCallback?.bind(window);
@@ -306,7 +245,7 @@ export const AnalyticsInsights = memo(function AnalyticsInsights({
     return () => {
       globalThis.clearTimeout(timeoutId);
     };
-  }, [granularity, isReducedPerformanceMode, startTransition, usageSource, usageStats.lastUpdated]);
+  }, [isReducedPerformanceMode]);
 
   useEffect(() => {
     setShowSecondaryCharts(false);
@@ -321,7 +260,7 @@ export const AnalyticsInsights = memo(function AnalyticsInsights({
 
   const activeBreakdown = loadedBreakdown?.granularity === granularity
     && loadedBreakdown.source === usageSource
-    && loadedBreakdown.statsLastUpdated === usageStats.lastUpdated
+    && loadedBreakdown.revision === breakdownRevision
     ? loadedBreakdown.data
     : null;
 
@@ -429,9 +368,6 @@ export const AnalyticsInsights = memo(function AnalyticsInsights({
     { key: 'week', label: t('analytics.week') },
     { key: 'month', label: t('analytics.month') },
   ], [t]);
-  const deferredChartData = useDeferredValue(chartData);
-  const deferredByModel = useDeferredValue(usageStats.byModel);
-  const deferredDailyHistory = useDeferredValue(usageStats.dailyHistory);
 
   return (
     <div className="space-y-6">
@@ -456,8 +392,9 @@ export const AnalyticsInsights = memo(function AnalyticsInsights({
                     if (granularity === key) {
                       return;
                     }
-                    setAnimateTokenChart(true);
-                    startTransition(() => setGranularity(key));
+                    // Workspace polling shares this React root. Keep the
+                    // selection and its chart out of interruptible transitions.
+                    setGranularity(key);
                   }}
                   className={cn(
                     'rounded-full px-3 py-1 text-xs transition-all duration-200',
@@ -482,6 +419,16 @@ export const AnalyticsInsights = memo(function AnalyticsInsights({
             </button>
           </div>
         </div>
+        {(breakdownStatus === 'loading' || breakdownStatus === 'error') && (
+          <div role="status" className="mb-3 flex items-center gap-2 text-xs text-muted-foreground">
+            <span>{t(breakdownStatus === 'loading' ? 'analytics.modelBreakdownLoading' : 'analytics.modelBreakdownFailed')}</span>
+            {breakdownStatus === 'error' && (
+              <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" onClick={() => setBreakdownRetry((value) => value + 1)}>
+                {t('common.retry')}
+              </Button>
+            )}
+          </div>
+        )}
         {chartData.length === 0 ? (
           <EmptyState icon={BarChart3} message={t('analytics.noDataYet')} />
         ) : !showPrimaryChart ? (
@@ -489,9 +436,9 @@ export const AnalyticsInsights = memo(function AnalyticsInsights({
         ) : (
           <Suspense fallback={<ChartSkeleton heightClass="h-[300px]" />}>
             <LazyTokenChart
-              data={deferredChartData}
+              data={chartData}
               seriesKeys={['Tokens']}
-              animate={animateTokenChart}
+              animate={!isReducedPerformanceMode}
             />
           </Suspense>
         )}
@@ -508,7 +455,7 @@ export const AnalyticsInsights = memo(function AnalyticsInsights({
           </h3>
           {showSecondaryCharts ? (
             <Suspense fallback={<ChartSkeleton heightClass="h-[160px]" />}>
-              <LazyModelDistribution breakdown={activeBreakdown ?? undefined} byModel={deferredByModel} />
+              <LazyModelDistribution breakdown={activeBreakdown ?? undefined} byModel={usageStats.byModel} />
             </Suspense>
           ) : (
             <ChartSkeleton heightClass="h-[160px]" />
@@ -523,7 +470,7 @@ export const AnalyticsInsights = memo(function AnalyticsInsights({
           </h3>
           {showSecondaryCharts ? (
             <Suspense fallback={<ChartSkeleton heightClass="h-[200px]" />}>
-              <LazyDailyTokenBar dailyHistory={deferredDailyHistory} />
+              <LazyDailyTokenBar dailyHistory={usageStats.dailyHistory} />
             </Suspense>
           ) : (
             <ChartSkeleton heightClass="h-[200px]" />

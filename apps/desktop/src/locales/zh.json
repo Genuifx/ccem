@@ -1110,6 +1110,8 @@
     "demoDataHint": "当前显示的是模拟数据。连接 Tauri 后端后将展示真实统计信息。",
     "noDataYet": "暂无使用数据。启动 Claude Code 开始记录。",
     "failedToLoad": "加载分析数据失败",
+    "modelBreakdownLoading": "正在加载模型明细…",
+    "modelBreakdownFailed": "模型明细加载失败",
     "legendLow": "少量",
     "activityHeatmap": "活跃度",
     "legendHigh": "大量",

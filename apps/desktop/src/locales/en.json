@@ -1110,6 +1110,8 @@
     "demoDataHint": "Currently showing simulated data. Real statistics will be displayed after connecting to the Tauri backend.",
     "noDataYet": "No usage data yet. Launch Claude Code to start tracking.",
     "failedToLoad": "Failed to load analytics data",
+    "modelBreakdownLoading": "Loading model breakdown…",
+    "modelBreakdownFailed": "Model breakdown could not be loaded",
     "legendLow": "Low",
     "activityHeatmap": "Activity",
     "legendHigh": "High",
