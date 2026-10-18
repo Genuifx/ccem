@@ -159,6 +159,126 @@ function annotationMarkClass(
   );
 }
 
+const ACTION_BAR_WIDTH_ESTIMATE = 300;
+const ACTION_BAR_HEIGHT_ESTIMATE = 44;
+const COLOR_BUBBLE_WIDTH_ESTIMATE = 130;
+const COLOR_BUBBLE_HEIGHT_ESTIMATE = 34;
+const FLOATING_GAP = 8;
+const VIEWPORT_PADDING = 12;
+const SELECTION_CLEARANCE = 6;
+
+interface ViewportBox {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
+function unionViewportRects(rects: ViewportRect[]): ViewportBox | null {
+  if (rects.length === 0) {
+    return null;
+  }
+  let left = Number.POSITIVE_INFINITY;
+  let top = Number.POSITIVE_INFINITY;
+  let right = Number.NEGATIVE_INFINITY;
+  let bottom = Number.NEGATIVE_INFINITY;
+  for (const rect of rects) {
+    left = Math.min(left, rect.left);
+    top = Math.min(top, rect.top);
+    right = Math.max(right, rect.right);
+    bottom = Math.max(bottom, rect.bottom);
+  }
+  return { left, top, right, bottom };
+}
+
+function boxesOverlap(left: ViewportBox, right: ViewportBox, clearance = 0): boolean {
+  return left.left < right.right + clearance
+    && left.right > right.left - clearance
+    && left.top < right.bottom + clearance
+    && left.bottom > right.top - clearance;
+}
+
+function boxWithinViewport(box: ViewportBox): boolean {
+  return box.left >= VIEWPORT_PADDING
+    && box.top >= VIEWPORT_PADDING
+    && box.right <= window.innerWidth - VIEWPORT_PADDING
+    && box.bottom <= window.innerHeight - VIEWPORT_PADDING;
+}
+
+function clampBoxToViewport(box: ViewportBox): ViewportBox {
+  const width = box.right - box.left;
+  const height = box.bottom - box.top;
+  const left = Math.max(
+    VIEWPORT_PADDING,
+    Math.min(window.innerWidth - width - VIEWPORT_PADDING, box.left),
+  );
+  const top = Math.max(
+    VIEWPORT_PADDING,
+    Math.min(window.innerHeight - height - VIEWPORT_PADDING, box.top),
+  );
+  return { left, top, right: left + width, bottom: top + height };
+}
+
+function placeActionBar(
+  lastRect: ViewportRect,
+  firstRect: ViewportRect,
+): { top: number; side: 'above' | 'below' } {
+  const belowTop = lastRect.bottom + FLOATING_GAP;
+  if (belowTop + ACTION_BAR_HEIGHT_ESTIMATE <= window.innerHeight - VIEWPORT_PADDING) {
+    return { top: belowTop, side: 'below' };
+  }
+  const aboveTop = firstRect.top - ACTION_BAR_HEIGHT_ESTIMATE - FLOATING_GAP;
+  if (aboveTop >= VIEWPORT_PADDING) {
+    return { top: aboveTop, side: 'above' };
+  }
+  return {
+    top: Math.max(
+      VIEWPORT_PADDING,
+      Math.min(
+        window.innerHeight - ACTION_BAR_HEIGHT_ESTIMATE - VIEWPORT_PADDING,
+        belowTop,
+      ),
+    ),
+    side: 'below',
+  };
+}
+
+/**
+ * Attach the color bubble to the action bar: below, right, left, then the
+ * opposite vertical side. Candidate boxes that intersect the selected text
+ * are skipped first, so the palette never covers the words being annotated.
+ */
+function placeColorBubble(
+  actionCenterX: number,
+  actionTop: number,
+  actionSide: 'above' | 'below',
+  selectionBounds: ViewportBox | null,
+): { left: number; top: number } {
+  const actionLeft = actionCenterX - ACTION_BAR_WIDTH_ESTIMATE / 2;
+  const actionRight = actionCenterX + ACTION_BAR_WIDTH_ESTIMATE / 2;
+  const centeredLeft = actionCenterX - COLOR_BUBBLE_WIDTH_ESTIMATE / 2;
+  const sideTop = actionTop + (ACTION_BAR_HEIGHT_ESTIMATE - COLOR_BUBBLE_HEIGHT_ESTIMATE) / 2;
+  const box = (left: number, top: number): ViewportBox => ({
+    left,
+    top,
+    right: left + COLOR_BUBBLE_WIDTH_ESTIMATE,
+    bottom: top + COLOR_BUBBLE_HEIGHT_ESTIMATE,
+  });
+  const below = box(centeredLeft, actionTop + ACTION_BAR_HEIGHT_ESTIMATE + FLOATING_GAP);
+  const above = box(centeredLeft, actionTop - FLOATING_GAP - COLOR_BUBBLE_HEIGHT_ESTIMATE);
+  const right = box(actionRight + FLOATING_GAP, sideTop);
+  const left = box(actionLeft - FLOATING_GAP - COLOR_BUBBLE_WIDTH_ESTIMATE, sideTop);
+  const candidates = actionSide === 'below'
+    ? [below, right, left, above]
+    : [above, right, left, below];
+  const fitting = candidates.filter(boxWithinViewport);
+  const chosen = fitting.find((candidate) => (
+    !selectionBounds || !boxesOverlap(candidate, selectionBounds, SELECTION_CLEARANCE)
+  )) ?? fitting[0] ?? candidates[0];
+  const clamped = clampBoxToViewport(chosen);
+  return { left: clamped.left, top: clamped.top };
+}
+
 function useAnnotationPlacements(
   rootRef: RefObject<HTMLElement | null>,
   contentRef: RefObject<HTMLElement | null>,
@@ -415,17 +535,28 @@ export function WorkspaceTranscriptSelection({
     if (!quote) {
       if (rawText.trim().length > MAX_WORKSPACE_SELECTION_CHARS && lastRect) {
         // Surface why the panel will not offer "add" instead of vanishing.
-        const colorAnchor = viewportRects[0] ?? lastRect;
+        const firstRect = viewportRects[0] ?? lastRect;
+        const actionCenterX = Math.max(
+          160,
+          Math.min(window.innerWidth - 160, lastRect.left + lastRect.width / 2),
+        );
+        const actionPlacement = placeActionBar(lastRect, firstRect);
+        const colorPosition = placeColorBubble(
+          actionCenterX,
+          actionPlacement.top,
+          actionPlacement.side,
+          unionViewportRects(viewportRects),
+        );
         candidateRangeRef.current = range.cloneRange();
         setCandidate({
           quote: null,
           anchor: null,
           blocked: true,
           rects,
-          left: Math.max(170, Math.min(window.innerWidth - 170, lastRect.left + lastRect.width / 2)),
-          top: Math.max(12, Math.min(window.innerHeight - 80, lastRect.bottom + 8)),
-          colorLeft: Math.max(70, Math.min(window.innerWidth - 70, colorAnchor.left + colorAnchor.width / 2)),
-          colorTop: Math.max(12, colorAnchor.top - 44),
+          left: actionCenterX,
+          top: actionPlacement.top,
+          colorLeft: colorPosition.left,
+          colorTop: colorPosition.top,
           editing: false,
           style: defaultAppearance.style,
           color: defaultAppearance.color,
@@ -440,17 +571,28 @@ export function WorkspaceTranscriptSelection({
     if (!lastRect) {
       return;
     }
-    const colorAnchor = viewportRects[0] ?? lastRect;
+    const firstRect = viewportRects[0] ?? lastRect;
+    const actionCenterX = Math.max(
+      160,
+      Math.min(window.innerWidth - 160, lastRect.left + lastRect.width / 2),
+    );
+    const actionPlacement = placeActionBar(lastRect, firstRect);
+    const colorPosition = placeColorBubble(
+      actionCenterX,
+      actionPlacement.top,
+      actionPlacement.side,
+      unionViewportRects(viewportRects),
+    );
     candidateRangeRef.current = range.cloneRange();
     setCandidate({
       quote,
       anchor,
       blocked: false,
       rects,
-      left: Math.max(170, Math.min(window.innerWidth - 170, lastRect.left + lastRect.width / 2)),
-      top: Math.max(12, Math.min(window.innerHeight - 80, lastRect.bottom + 8)),
-      colorLeft: Math.max(70, Math.min(window.innerWidth - 70, colorAnchor.left + colorAnchor.width / 2)),
-      colorTop: Math.max(12, colorAnchor.top - 44),
+      left: actionCenterX,
+      top: actionPlacement.top,
+      colorLeft: colorPosition.left,
+      colorTop: colorPosition.top,
       editing: false,
       style: defaultAppearance.style,
       color: defaultAppearance.color,
@@ -950,7 +1092,7 @@ export function WorkspaceTranscriptSelection({
                 data-ccem-native-overlay
                 data-workspace-selection-action
                 data-workspace-annotation-color-bubble
-                className="fixed z-50 -translate-x-1/2 rounded-full border border-border/45 bg-popover p-1.5 shadow-xl"
+                className="fixed z-50 rounded-full border border-border/45 bg-popover p-1.5 shadow-xl"
                 style={{ left: candidate.colorLeft, top: candidate.colorTop }}
                 onMouseDown={(event) => event.preventDefault()}
               >
