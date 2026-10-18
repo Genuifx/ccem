@@ -361,6 +361,14 @@ export function execWriteTargets(command: string): string[] {
   return Array.from(targets);
 }
 
+/** Reject display-only or truncated tool summaries that can leak through as "…". */
+function isPlausibleReviewPath(path: string) {
+  const value = path.trim();
+  if (!value || value === '…' || value === '...') return false;
+  if (value.endsWith('…') || value.includes('\n') || value.includes('\r')) return false;
+  return true;
+}
+
 function normalizeReviewPath(path: string, workingDir?: string | null): string {
   const normalize = (value: string) => {
     const absolute = value.startsWith('/');
@@ -395,6 +403,7 @@ export function foldWorkspaceReviewEvents(
     toolUseId: string,
     sourceSeq: number,
   ) => {
+    if (!isPlausibleReviewPath(path)) return;
     const current = fold.sdkFiles.get(path);
     if (current) {
       if (!current.toolUseIds.includes(toolUseId)) {
@@ -540,7 +549,7 @@ function reviewFilesFromFold(
   // event stream cannot see — bash redirection the summary truncated away,
   // script-generated files, gitignored outputs, non-git working dirs.
   for (const file of recentFiles ?? []) {
-    if (!file?.path) continue;
+    if (!file?.path || !isPlausibleReviewPath(file.path)) continue;
     const path = normalizeReviewPath(file.path, workingDir ?? gitSnapshot?.root);
     const current = files.get(path);
     if (current) {

@@ -56,7 +56,7 @@ async function setup(t, invoke, content = '[Open report](ccem-file://preview?pat
         const panel = useWorkspaceSidePanelController(props.session.runtime_id, false);
         currentPanel = panel;
         const [review, setReview] = useState(true);
-        return <LocaleProvider><TooltipProvider><WorkspaceSidePanelContext.Provider value={panel}><WorkspaceFileLinkContext.Provider value={{ workingDir: props.session.project_dir, openFile: path => panel.open('files', path) }}>
+        return <LocaleProvider><TooltipProvider><WorkspaceSidePanelContext.Provider value={panel}><WorkspaceFileLinkContext.Provider value={{ workingDir: props.session.project_dir, openFile: path => panel.open('browse', path) }}>
           <button ref={workspaceReviewTriggerRef} onClick={() => setReview(true)}>Review</button>
           <MarkdownRenderer content={props.content} />
           <WorkspaceReviewPopover {...props} isOpen={review} onOpenChange={setReview} isRefreshingGit={false} onRefreshGit={() => {}} />
@@ -102,31 +102,43 @@ async function setup(t, invoke, content = '[Open report](ccem-file://preview?pat
   return { root, props, click, byText, settle, act, createBrowserActivationController };
 }
 
-test('review details move into the side panel; Markdown, source, diff and local links use the selected file', async (t) => {
+test('changes stays in the side panel; source opens in browse and preserves per-tab files', async (t) => {
   const calls = [];
   const h = await setup(t, async (command, args) => { calls.push({ command, ...args }); return file('# Rendered report\n\n**Ready**\n\n[Next](next.md)'); });
   await h.click(h.byText('改动文件2'));
   assert.equal(Boolean(document.querySelector('[data-ccem-workspace-review-popover]')), false, 'summary closed after navigation');
-  assert.equal(document.querySelector('[data-ccem-workspace-side-panel]').dataset.ccemWorkspaceSidePanel, 'files');
-  await h.click(document.querySelector('[data-review-file-row][title="docs/report.md"]'));
+  assert.equal(document.querySelector('[data-ccem-workspace-side-panel]').dataset.ccemWorkspaceSidePanel, 'changes');
+  // Selecting a changed file opens its diff in place — it must not navigate away.
+  await h.click(document.querySelector('[data-ccem-change-file][title="docs/report.md"]'));
+  await h.settle();
+  assert.equal(document.querySelector('[data-ccem-workspace-side-panel]').dataset.ccemWorkspaceSidePanel, 'changes');
+  assert.match(document.querySelector('[data-review-page="files"]').textContent, /changed text/);
+  // The explicit view-source action is what moves the user into Browse.
+  await h.click(document.querySelector('button[aria-label="查看源文件"]'));
+  await h.settle();
+  assert.equal(document.querySelector('[data-ccem-workspace-side-panel]').dataset.ccemWorkspaceSidePanel, 'browse');
+  assert.match(document.querySelector('[data-ccem-file-source]').textContent, /# Rendered report/, 'view-source opens the raw source');
+  assert.equal(calls.filter((call) => call.command === 'get_workspace_file_preview').at(-1).workingDir, '/project/one');
+  await h.click(h.byText('预览'));
   assert.equal(document.querySelector('[data-ccem-markdown-preview] h1')?.textContent, 'Rendered report');
   assert.equal(document.querySelector('[data-ccem-markdown-preview] strong')?.textContent, 'Ready');
-  assert.equal(calls.at(-1).workingDir, '/project/one');
   await h.click(h.byText('源码'));
   assert.match(document.querySelector('[data-ccem-file-source]').textContent, /# Rendered report/);
-  await h.click(h.byText('Git 差异'));
+  await h.click(h.byText('差异'));
   assert.match(document.querySelector('[data-review-page="files"]').textContent, /changed text/);
   const browser = document.getElementById('retained-browser');
   await h.click(h.byText('浏览器'));
   assert.equal(document.getElementById('retained-browser'), browser);
   assert.equal(browser.hidden, false);
-  await h.click(h.byText('文件'));
-  assert.equal(document.querySelector('[data-ccem-markdown-preview] h1')?.textContent, 'Rendered report', 'file survives a tab round trip');
+  await h.click(h.byText('浏览'));
+  assert.match(document.querySelector('[data-ccem-file-source]').textContent, /# Rendered report/, 'browse source survives a tab round trip');
+  await h.click(h.byText('预览'));
+  assert.equal(document.querySelector('[data-ccem-markdown-preview] h1')?.textContent, 'Rendered report');
   await h.click(document.querySelector('[data-ccem-file-link]'));
   assert.equal(browser.hidden, true);
   assert.equal(document.querySelector('[data-ccem-markdown-preview] h1')?.textContent, 'Rendered report');
   await h.click([...document.querySelectorAll('[data-ccem-markdown-preview] a')].find(a => a.textContent === 'Next'));
-  assert.equal(calls.at(-1).filePath, 'docs/next.md');
+  assert.equal(calls.filter((call) => call.command === 'get_workspace_file_preview').at(-1).filePath, 'docs/next.md');
   assert.equal(document.querySelector('a[href^="javascript:"]'), null);
 });
 
@@ -139,7 +151,7 @@ test('agent-drift preview links still open the files tab with the full untruncat
   const links = [...document.querySelectorAll('[data-ccem-file-link]')];
   assert.equal(links.length, 2, 'only preview-action links are clickable');
   await h.click(links[0]);
-  assert.equal(document.querySelector('[data-ccem-workspace-side-panel]').dataset.ccemWorkspaceSidePanel, 'files');
+  assert.equal(document.querySelector('[data-ccem-workspace-side-panel]').dataset.ccemWorkspaceSidePanel, 'browse');
   assert.equal(calls.find((call) => call.command === 'get_workspace_file_preview').filePath, 'design-demos/natgeo-p1.html');
   await h.settle();
   // .html previews open in source mode; the file still loads end to end.
@@ -151,10 +163,10 @@ test('agent-drift preview links still open the files tab with the full untruncat
 test('browser rollback preserves later manual choices and closing fences pending activation', async (t) => {
   const h = await setup(t, async () => file('# Report'));
   let rollback;
-  await h.act(async () => { h.root.panel().open('files', 'docs/report.md'); });
+  await h.act(async () => { h.root.panel().open('browse', 'docs/report.md'); });
   await h.act(async () => { rollback = h.root.panel().open('browser'); });
   await h.act(async () => { rollback(); });
-  assert.equal(h.root.panel().tab, 'files');
+  assert.equal(h.root.panel().tab, 'browse');
   assert.equal(h.root.panel().filePath, 'docs/report.md');
   await h.act(async () => { rollback = h.root.panel().open('browser'); });
   await h.act(async () => { h.root.panel().open('agents'); rollback(); });
@@ -166,7 +178,7 @@ test('browser rollback preserves later manual choices and closing fences pending
 
 test('two failed native browser requests restore the original file tab', async (t) => {
   const h = await setup(t, async () => file('# Report'));
-  await h.act(async () => { h.root.panel().open('files', 'docs/report.md'); });
+  await h.act(async () => { h.root.panel().open('browse', 'docs/report.md'); });
   const activation = h.createBrowserActivationController({
     claim: async () => ({ ...session, is_active: true }),
     reject: async () => {},
@@ -179,7 +191,7 @@ test('two failed native browser requests restore the original file tab', async (
   await h.act(async () => { activation.complete({ ...one, activated: false }); });
   assert.equal(h.root.panel().tab, 'browser');
   await h.act(async () => { activation.complete({ ...two, activated: false }); });
-  assert.equal(h.root.panel().tab, 'files');
+  assert.equal(h.root.panel().tab, 'browse');
   assert.equal(h.root.panel().filePath, 'docs/report.md');
 });
 
@@ -192,24 +204,31 @@ test('Markdown images resolve next to the document through guarded workspace med
   });
   await h.click(document.querySelector('[data-ccem-file-link]'));
   await h.settle();
-  assert.deepEqual(calls.at(-1), { command: 'get_workspace_media_preview', workingDir: '/project/one', filePath: 'docs/images/diagram.png' });
+  assert.deepEqual(calls.filter((call) => call.command === 'get_workspace_media_preview').at(-1), { command: 'get_workspace_media_preview', workingDir: '/project/one', filePath: 'docs/images/diagram.png' });
   assert.equal(document.querySelector('[data-ccem-markdown-preview] img')?.getAttribute('src'), 'data:image/png;base64,AA==');
 });
 
-test('late file responses and owner switches cannot replace the current preview', async (t) => {
+test('late diff responses and owner switches cannot replace the current preview', async (t) => {
   let resolveSlow;
-  const h = await setup(t, async (command, args) => args.filePath === 'slow.md'
-    ? new Promise(resolve => { resolveSlow = resolve; }) : file('# Current'));
-  await h.click(document.querySelector('[data-ccem-file-link]'));
-  await h.click(document.querySelector('[data-review-file-row][title="slow.md"]'));
-  await h.click(document.querySelector('[data-review-file-row][title="docs/report.md"]'));
-  await h.act(async () => { resolveSlow(file('# Stale')); await tick(); });
-  assert.equal(document.querySelector('[data-ccem-markdown-preview] h1')?.textContent, 'Current');
-  await h.click(document.querySelector('[data-review-file-row][title="slow.md"]'));
+  const h = await setup(t, async () => file('# Current'));
+  const slowDiff = { ...diff, path: 'slow.md', lines: [{ kind: 'addition', text: 'Stale diff', new_line: 1 }] };
+  await h.root.render({
+    ...h.props,
+    onLoadDiff: (filePath) => filePath === 'slow.md'
+      ? new Promise(resolve => { resolveSlow = resolve; })
+      : Promise.resolve(diff),
+  });
+  await h.click(h.byText('改动文件2'));
+  await h.click(document.querySelector('[data-ccem-change-file][title="slow.md"]'));
+  await h.click(document.querySelector('[data-ccem-change-file][title="docs/report.md"]'));
+  await h.act(async () => { resolveSlow(slowDiff); await tick(); });
+  assert.match(document.querySelector('[data-review-page="files"]').textContent, /changed text/);
+  assert.doesNotMatch(document.querySelector('[data-review-page="files"]').textContent, /Stale diff/);
+  await h.click(document.querySelector('[data-ccem-change-file][title="slow.md"]'));
   await h.root.render({ ...h.props, session: { ...session, runtime_id: 'two', project_dir: '/project/two' } });
-  await h.act(async () => { resolveSlow(file('# Old owner')); await tick(); });
+  await h.act(async () => { resolveSlow(slowDiff); await tick(); });
   assert.equal(document.querySelector('[data-ccem-workspace-side-panel]').dataset.ccemWorkspaceSidePanel, 'closed');
-  assert.equal(document.querySelector('[data-ccem-markdown-preview]'), null);
+  assert.equal(document.querySelector('[data-review-page="files"]'), null);
 });
 
 test('subagent detail opens in the same side panel and renders execution history', async (t) => {

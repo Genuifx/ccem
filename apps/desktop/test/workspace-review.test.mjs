@@ -719,3 +719,23 @@ test('filesystem-detected recent files complete the session list', async () => {
   assert.equal(summary.changedFiles, model.changedFiles.length, 'summary and list agree');
   assert.equal(summary.artifacts >= 1, true, 'fs-detected html artifact is counted');
 });
+
+test('truncated display-only paths never enter the changes list', async () => {
+  const { buildWorkspaceReviewModel } = await importWorkspaceReview();
+  const events = [
+    event(1, {
+      type: 'tool_use_started', tool_use_id: 'write-ellipsis', raw_name: 'Write',
+      input_summary: JSON.stringify({ file_path: '…' }), needs_response: false,
+      category: { category: 'file_op', raw_name: 'Write' },
+    }),
+    event(2, { type: 'tool_use_completed', tool_use_id: 'write-ellipsis', raw_name: 'Write', result_summary: 'ok', success: true }),
+    event(3, {
+      type: 'tool_use_started', tool_use_id: 'write-real', raw_name: 'Write',
+      input_summary: 'src/real.ts', needs_response: false,
+      category: { category: 'file_op', raw_name: 'Write' },
+    }),
+    event(4, { type: 'tool_use_completed', tool_use_id: 'write-real', raw_name: 'Write', result_summary: 'ok', success: true }),
+  ];
+  const model = buildWorkspaceReviewModel({ session: session(), events, messages: [] });
+  assert.deepEqual(model.changedFiles.map((file) => file.path), ['src/real.ts']);
+});

@@ -459,6 +459,7 @@ export function WorkspaceReviewPopover({
         isRefreshingGit={isRefreshingGit}
         requestedPath={sidePanel.filePath}
         requestRevision={sidePanel.revision}
+        requestedMode={sidePanel.fileMode}
         isLive={isLive}
         externalScope={externalScope}
       />, sidePanel.target,

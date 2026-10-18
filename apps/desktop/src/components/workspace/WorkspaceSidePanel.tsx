@@ -5,6 +5,7 @@ import { useLocale } from '@/locales';
 import { cn } from '@/lib/utils';
 
 export type WorkspaceSideTab = 'browser' | 'changes' | 'browse' | 'agents';
+export type WorkspaceSideFileMode = 'preview' | 'source' | 'diff';
 
 export function isFileTab(tab: WorkspaceSideTab | null): tab is 'changes' | 'browse' {
   return tab === 'changes' || tab === 'browse';
@@ -13,13 +14,17 @@ export function isFileTab(tab: WorkspaceSideTab | null): tab is 'changes' | 'bro
 interface SidePanelSelection {
   tab: WorkspaceSideTab | null;
   filePath?: string;
+  fileMode?: WorkspaceSideFileMode;
+  /** Per-tab requested file, so switching tabs never re-opens another tab's file. */
+  filePaths?: Partial<Record<WorkspaceSideTab, string>>;
+  fileModes?: Partial<Record<WorkspaceSideTab, WorkspaceSideFileMode>>;
   revision: number;
 }
 export interface WorkspaceSidePanelController extends SidePanelSelection {
   ownerKey: string;
   target: HTMLDivElement | null;
   setTarget: (element: HTMLDivElement | null) => void;
-  open: (tab: WorkspaceSideTab, filePath?: string, owner?: string) => () => void;
+  open: (tab: WorkspaceSideTab, filePath?: string, owner?: string, fileMode?: WorkspaceSideFileMode) => () => void;
   revealBrowser: (owner: string) => () => void;
   close: () => void;
 }
@@ -32,9 +37,25 @@ export function useWorkspaceSidePanelController(ownerKey: string, browserVisible
   const [target, setTarget] = useState<HTMLDivElement | null>(null);
   const selection = selections[ownerKey];
   const tab = selection ? selection.tab : browserVisible ? 'browser' : null;
-  const open = useCallback((nextTab: WorkspaceSideTab, filePath?: string, owner = ownerKey) => {
+  const open = useCallback((nextTab: WorkspaceSideTab, filePath?: string, owner = ownerKey, fileMode?: WorkspaceSideFileMode) => {
     const previous = selectionsRef.current[owner];
-    const next = { tab: nextTab, filePath: filePath ?? previous?.filePath, revision: (previous?.revision ?? 0) + 1 };
+    const filePaths = { ...(previous?.filePaths ?? {}) };
+    const fileModes = { ...(previous?.fileModes ?? {}) };
+    if (filePath !== undefined) {
+      filePaths[nextTab] = filePath;
+      if (fileMode !== undefined) fileModes[nextTab] = fileMode;
+      else delete fileModes[nextTab];
+    }
+    // A requested file belongs to the tab it opened in. Switching tabs restores
+    // that tab's own file instead of re-opening the other tab's selection.
+    const next = {
+      tab: nextTab,
+      filePath: filePaths[nextTab],
+      fileMode: filePaths[nextTab] !== undefined ? fileModes[nextTab] : undefined,
+      filePaths,
+      fileModes,
+      revision: (previous?.revision ?? 0) + 1,
+    };
     selectionsRef.current = { ...selectionsRef.current, [owner]: next };
     setSelections(selectionsRef.current);
     return () => {
@@ -56,7 +77,7 @@ export function useWorkspaceSidePanelController(ownerKey: string, browserVisible
     setSelections(selectionsRef.current);
   }, [ownerKey]);
   return useMemo(() => ({
-    ownerKey, tab, filePath: selection?.filePath, revision: selection?.revision ?? 0,
+    ownerKey, tab, filePath: selection?.filePath, fileMode: selection?.fileMode, revision: selection?.revision ?? 0,
     target, setTarget, open, revealBrowser, close,
   }), [ownerKey, tab, selection, target, open, revealBrowser, close]);
 }
@@ -104,7 +125,7 @@ export function WorkspaceSidePanel({ controller, width, onResizeStart, onSelectB
               <Icon className="h-3 w-3" />
               {label}
               {count !== undefined && count > 0 && (
-                <span className="ml-0.5 tabular-nums text-3xs opacity-60">{count}</span>
+                <span className="ml-0.5 rounded-full bg-muted/60 px-1 text-[9px] leading-4 tabular-nums opacity-80">{count}</span>
               )}
             </button>
           ))}

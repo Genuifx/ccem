@@ -95,7 +95,7 @@ test('review popover stays open as a modeless inspector while users interact wit
 });
 
 test('review detail requests are isolated when users switch files quickly', async () => {
-  const details = await readSource('src', 'components', 'workspace', 'WorkspaceReviewDetails.tsx');
+  const details = await readSource('src', 'components', 'workspace', 'WorkspaceFilesPanel.tsx');
 
   assert.match(details, /fileRequestSeqRef/, 'file preview requests should carry a monotonic request id');
   assert.match(
