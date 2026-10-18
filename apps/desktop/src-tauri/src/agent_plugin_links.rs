@@ -311,6 +311,39 @@ fn matches_install(row: &Value, path: &Path, version: &str) -> bool {
         && row.get("version").and_then(Value::as_str) == Some(version)
 }
 
+fn same_link_target(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::path::Prefix;
+        // read_link can omit the verbatim prefix used by canonicalize. Compare
+        // the spelling without resolving the target: official code may be gone.
+        let mut left = left.components();
+        let mut right = right.components();
+        let (Some(Component::Prefix(a)), Some(Component::Prefix(b))) =
+            (left.next(), right.next())
+        else {
+            return false;
+        };
+        let same_prefix = match (a.kind(), b.kind()) {
+            (
+                Prefix::Disk(a) | Prefix::VerbatimDisk(a),
+                Prefix::Disk(b) | Prefix::VerbatimDisk(b),
+            ) => a == b,
+            (
+                Prefix::UNC(a, b) | Prefix::VerbatimUNC(a, b),
+                Prefix::UNC(c, d) | Prefix::VerbatimUNC(c, d),
+            ) => a == c && b == d,
+            _ => false,
+        };
+        same_prefix && left.eq(right)
+    }
+    #[cfg(not(windows))]
+    false
+}
+
 fn excluded(name: &std::ffi::OsStr) -> bool {
     EXCLUDED
         .iter()
@@ -569,8 +602,10 @@ impl Plan {
                     let metadata =
                         fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
                     if !metadata.file_type().is_symlink()
-                        || fs::read_link(&path).map_err(|error| error.to_string())?
-                            != source.join(name)
+                        || !same_link_target(
+                            &fs::read_link(&path).map_err(|error| error.to_string())?,
+                            &source.join(name),
+                        )
                     {
                         return Err("Plugin link child was changed locally; left unchanged".into());
                     }
@@ -792,7 +827,10 @@ fn owned_children_intact(plan: &mut Plan, path: &Path, source: &Path) -> Result<
             .map_err(|error| error.to_string())?
             .file_type()
             .is_symlink()
-            || fs::read_link(child).map_err(|error| error.to_string())? != source.join(&name)
+            || !same_link_target(
+                &fs::read_link(child).map_err(|error| error.to_string())?,
+                &source.join(&name),
+            )
         {
             return Ok(false);
         }
@@ -1161,6 +1199,24 @@ fn symlink_code(source: &Path, target: &Path) -> Result<(), String> {
     result.map_err(|error| format!("Could not link plugin code: {error}"))
 }
 
+fn remove_code_link(path: &Path) -> Result<(), String> {
+    let kind = fs::symlink_metadata(path)
+        .map_err(|error| error.to_string())?
+        .file_type();
+    if !kind.is_symlink() {
+        return Err("Plugin link child changed during preparation".into());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileTypeExt;
+        // The link retains its directory type even after the source is deleted.
+        if kind.is_symlink_dir() {
+            return fs::remove_dir(path).map_err(|error| error.to_string());
+        }
+    }
+    fs::remove_file(path).map_err(|error| error.to_string())
+}
+
 fn publish_wrapper(wrapper: &Wrapper) -> Result<(), String> {
     validate_no_symlinks(&wrapper.root)?;
     if wrapper.create {
@@ -1200,10 +1256,13 @@ fn publish_wrapper(wrapper: &Wrapper) -> Result<(), String> {
     }
     for name in &wrapper.remove {
         let path = wrapper.root.join(name);
-        if fs::read_link(&path).map_err(|error| error.to_string())? != wrapper.source.join(name) {
+        if !same_link_target(
+            &fs::read_link(&path).map_err(|error| error.to_string())?,
+            &wrapper.source.join(name),
+        ) {
             return Err("Plugin link child changed during preparation".into());
         }
-        fs::remove_file(path).map_err(|error| error.to_string())?;
+        remove_code_link(&path)?;
     }
     for name in &wrapper.add {
         symlink_code(&wrapper.source.join(name), &wrapper.root.join(name))?;

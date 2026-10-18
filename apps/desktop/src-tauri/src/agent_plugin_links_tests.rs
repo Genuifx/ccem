@@ -90,6 +90,68 @@ fn all_state(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)>
     output
 }
 
+#[cfg(windows)]
+#[test]
+fn link_target_spelling_handles_verbatim_paths_without_resolving_missing_code() {
+    for (native, verbatim) in [
+        (r"C:\missing\plugin\skills", r"\\?\C:\missing\plugin\skills"),
+        (
+            r"\\server\share\missing\skills",
+            r"\\?\UNC\server\share\missing\skills",
+        ),
+    ] {
+        assert!(same_link_target(Path::new(native), Path::new(verbatim)));
+        assert!(same_link_target(Path::new(verbatim), Path::new(native)));
+    }
+    for changed in [
+        r"D:\missing\plugin\skills",
+        r"C:\missing\other\skills",
+        r"C:\missing\plugin\skills\child",
+        r"missing\plugin\skills",
+        r"\\other\share\missing\skills",
+    ] {
+        assert!(!same_link_target(
+            Path::new(changed),
+            Path::new(r"\\?\C:\missing\plugin\skills"),
+        ));
+    }
+    assert!(!same_link_target(
+        Path::new(r"\\server\other\missing\skills"),
+        Path::new(r"\\?\UNC\server\share\missing\skills"),
+    ));
+}
+
+#[test]
+fn removing_code_links_preserves_targets_and_refuses_private_files() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    for (name, directory) in [("folder", true), ("file", false)] {
+        let source = root.join(name);
+        if directory {
+            write(&source.join("code.md"), b"official code");
+        } else {
+            write(&source, b"official code");
+        }
+        let link = root.join(format!("{name}-link"));
+        symlink_code(&source, &link).unwrap();
+        remove_code_link(&link).unwrap();
+        assert!(source.exists());
+        assert!(fs::symlink_metadata(&link).is_err());
+        symlink_code(&source, &link).unwrap();
+        if directory {
+            fs::remove_dir_all(&source).unwrap();
+        } else {
+            fs::remove_file(&source).unwrap();
+        }
+        remove_code_link(&link).unwrap();
+        assert!(fs::symlink_metadata(&link).is_err());
+    }
+    let private = root.join("private.md");
+    write(&private, b"private edit");
+    assert!(remove_code_link(&private).is_err());
+    assert_eq!(fs::read(&private).unwrap(), b"private edit");
+}
+
 #[test]
 fn links_code_and_keeps_markers_settings_and_legacy_copies_private() {
     let (_temporary, source, target, code) = fixture(false);
@@ -107,8 +169,8 @@ fn links_code_and_keeps_markers_settings_and_legacy_copies_private() {
         .file_type()
         .is_symlink());
     assert_eq!(
-        fs::read_link(linked.join("skills")).unwrap(),
-        code.join("skills")
+        linked.join("skills").canonicalize().unwrap(),
+        code.join("skills").canonicalize().unwrap()
     );
     assert_eq!(read(&linked.join(MARKER)), marker_value(&code));
     assert_eq!(
@@ -144,8 +206,12 @@ fn links_code_and_keeps_markers_settings_and_legacy_copies_private() {
 #[test]
 fn source_changes_and_new_top_level_children_follow_without_copying() {
     let (_temporary, source, target, code) = fixture(false);
+    // Add a top-level file after the initial import, then refresh its link.
     link_plugins(&source, &target).unwrap();
     let linked = install(&target);
+    write(&code.join("README.md"), b"official readme");
+    link_plugins(&source, &target).unwrap();
+    assert_eq!(fs::read(linked.join("README.md")).unwrap(), b"official readme");
     write(
         &code.join("skills/hello/SKILL.md"),
         b"updated official skill",
@@ -156,6 +222,8 @@ fn source_changes_and_new_top_level_children_follow_without_copying() {
     );
     write(&code.join("commands/new.md"), b"new official command");
     fs::remove_dir_all(code.join("hooks")).unwrap();
+    fs::remove_file(code.join("README.md")).unwrap();
+    let before_source = all_state(&source);
     assert!(links_pending(&source, &target).unwrap());
     link_plugins(&source, &target).unwrap();
     assert_eq!(
@@ -163,6 +231,8 @@ fn source_changes_and_new_top_level_children_follow_without_copying() {
         b"new official command"
     );
     assert!(fs::symlink_metadata(linked.join("hooks")).is_err());
+    assert!(fs::symlink_metadata(linked.join("README.md")).is_err());
+    assert_eq!(all_state(&source), before_source);
     assert!(!links_pending(&source, &target).unwrap());
 }
 
@@ -506,10 +576,14 @@ fn same_version_source_path_changes_follow_and_unimported_scope_stays_local() {
 
 #[test]
 fn replaced_managed_children_are_not_overwritten_even_on_version_update() {
-    let (_temporary, source, target, _code) = fixture(false);
+    let (_temporary, source, target, code) = fixture(false);
     link_plugins(&source, &target).unwrap();
     let linked = install(&target);
+    #[cfg(windows)]
+    fs::remove_dir(linked.join("skills")).unwrap();
+    #[cfg(not(windows))]
     fs::remove_file(linked.join("skills")).unwrap();
+    assert!(code.join("skills/hello/SKILL.md").exists());
     write(&linked.join("skills/private.md"), b"private edit");
     upgrade(&source, "1.1.0");
     let before = fs::read(target.join(INSTALLED)).unwrap();
