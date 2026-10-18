@@ -73,6 +73,19 @@ function enrichTerminalTask(
   return next;
 }
 
+/** Events that can change `deriveWorkspaceBackgroundTasks`. */
+export function isBackgroundTaskEvent(event: SessionEventRecord): boolean {
+  const type = event.payload.type;
+  return type === 'background_task_updated' || type === 'background_tasks_changed';
+}
+
+function isSeqAscending(events: SessionEventRecord[]): boolean {
+  for (let index = 1; index < events.length; index += 1) {
+    if (events[index - 1]!.seq > events[index]!.seq) return false;
+  }
+  return true;
+}
+
 export function deriveWorkspaceBackgroundTasks(
   session: Pick<NativeSessionSummary, 'background_tasks' | 'last_event_seq'>,
   events: SessionEventRecord[],
@@ -91,7 +104,11 @@ export function deriveWorkspaceBackgroundTasks(
     }
   }
 
-  for (const event of [...events].sort((left, right) => left.seq - right.seq)) {
+  // Live event lists are already seq-ascending; only copy+sort when not.
+  const orderedEvents = isSeqAscending(events)
+    ? events
+    : [...events].sort((left, right) => left.seq - right.seq);
+  for (const event of orderedEvents) {
     const payload = event.payload;
     if (payload.type === 'background_task_updated'
       && isTerminalBackgroundTaskStatus(payload.task.status)) {

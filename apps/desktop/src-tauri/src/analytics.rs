@@ -2106,7 +2106,7 @@ fn load_opencode_cache_entries(
         .map(|session| (session.id.clone(), session))
         .collect::<HashMap<_, _>>();
 
-    let session_list_result = opencode::load_session_list_value_from_cli_or_fixture();
+    let session_list_result = opencode::load_session_list_value_cached();
     let Some(session_list) = session_list_result.ok().flatten() else {
         return SourceCacheLoad {
             entries: build_local_opencode_cache_entries(&local_sessions, existing_cache),

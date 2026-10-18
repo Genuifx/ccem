@@ -540,3 +540,20 @@ test('detects local-active and decoration-inactive truth conflicts for reconcili
   }), false);
   assert.equal(hasWorkspaceLiveActivityConflict(activeSessionKeys, {}), false);
 });
+
+test('background refresh reloads the selected transcript only when it differs from the last loaded version', async () => {
+  const { shouldReloadSelectedHistorySession, toLoadedHistorySessionVersion } = await importWorkspaceSidebarSessions();
+  const session = historySession({ id: 'a' });
+  const loaded = toLoadedHistorySessionVersion(session);
+  assert.equal(shouldReloadSelectedHistorySession(loaded, { ...session }), false);
+  assert.equal(
+    shouldReloadSelectedHistorySession(loaded, { ...session, timestamp: session.timestamp + 1 }),
+    true,
+  );
+  assert.equal(shouldReloadSelectedHistorySession(loaded, { ...session, id: 'b' }), true);
+  assert.equal(
+    shouldReloadSelectedHistorySession(loaded, { ...session, source: 'codex', codexIsolated: true }),
+    true,
+  );
+  assert.equal(shouldReloadSelectedHistorySession(null, session), true);
+});
