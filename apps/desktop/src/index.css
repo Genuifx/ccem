@@ -1227,6 +1227,51 @@
   background-color: transparent;
 }
 
+/* Workspace annotation marks. The marks are absolutely positioned line rects
+   inside the transcript content box; these classes only paint the chosen
+   highlight style. */
+.workspace-annotation-mark-selection {
+  background-color: hsl(var(--primary) / 0.22);
+  border-radius: 3px;
+  box-shadow: inset 0 -1.5px 0 hsl(var(--primary) / 0.62);
+}
+
+.workspace-annotation-mark-selection[data-candidate='true'] {
+  background-color: hsl(var(--primary) / 0.3);
+  box-shadow: inset 0 -2px 0 hsl(var(--primary) / 0.75);
+}
+
+.workspace-annotation-mark-wave {
+  border-radius: 3px;
+}
+
+.workspace-annotation-mark-wave[data-candidate='true'] {
+  background-color: hsl(var(--primary) / 0.08);
+}
+
+.workspace-annotation-mark-wave::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 5px;
+  pointer-events: none;
+  background-color: hsl(var(--primary));
+  -webkit-mask-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='12'%20height='5'%20viewBox='0%200%2012%205'%3E%3Cpath%20d='M0%203Q3%200%206%203T12%203'%20fill='none'%20stroke='white'%20stroke-width='2'%20stroke-linecap='round'/%3E%3C/svg%3E");
+  mask-image: url("data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='12'%20height='5'%20viewBox='0%200%2012%205'%3E%3Cpath%20d='M0%203Q3%200%206%203T12%203'%20fill='none'%20stroke='white'%20stroke-width='2'%20stroke-linecap='round'/%3E%3C/svg%3E");
+  -webkit-mask-repeat: repeat-x;
+  mask-repeat: repeat-x;
+  -webkit-mask-size: 12px 5px;
+  mask-size: 12px 5px;
+  -webkit-mask-position: 0 100%;
+  mask-position: 0 100%;
+}
+
+.workspace-annotation-mark-wave[data-candidate='true']::after {
+  background-color: hsl(var(--primary));
+}
+
 .ccem-prompt-area .prompt-area-placeholder {
   color: hsl(var(--muted-foreground) / 0.75);
   font-size: 14px;

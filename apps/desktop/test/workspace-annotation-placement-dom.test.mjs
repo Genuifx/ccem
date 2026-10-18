@@ -38,6 +38,7 @@ async function importHarness() {
         import React, { act, useRef, useState } from 'react';
         import { createRoot } from 'react-dom/client';
         import { WorkspaceTranscriptSelection } from '@/components/workspace/WorkspaceAnnotations';
+        import { WorkspaceAnnotationStyleToggle } from '@/components/workspace/WorkspaceAnnotationStyleToggle';
 
         export function mount(container) {
           let addCalls = 0;
@@ -49,36 +50,45 @@ async function importHarness() {
             const [annotations, setAnnotations] = useState([]);
             flushState = { setAnnotations };
             return React.createElement(
-              'div',
-              { ref: viewportRef, id: 'viewport', style: { overflow: 'auto', height: 600 } },
+              React.Fragment,
+              null,
               React.createElement(
                 'div',
-                { ref: contentRef, id: 'content', style: { position: 'relative', height: 1200 } },
+                { id: 'style-toggle' },
+                React.createElement(WorkspaceAnnotationStyleToggle),
+              ),
+              React.createElement(
+                'div',
+                { ref: viewportRef, id: 'viewport', style: { overflow: 'auto', height: 600 } },
                 React.createElement(
                   'div',
-                  { 'data-transcript-item-key': 'message-a', id: 'item-a' },
-                  'Alpha selected words here.',
+                  { ref: contentRef, id: 'content', style: { position: 'relative', height: 1200 } },
+                  React.createElement(
+                    'div',
+                    { 'data-transcript-item-key': 'message-a', id: 'item-a' },
+                    'Alpha selected words here.',
+                  ),
+                  React.createElement(WorkspaceTranscriptSelection, {
+                    rootRef: viewportRef,
+                    contentRef: contentRef,
+                    scopeKey: 'placement-test',
+                    canAdd: true,
+                    annotations,
+                    onAdd: (quote, note, anchor) => {
+                      addCalls += 1;
+                      setAnnotations((current) => [...current, {
+                        id: 'a-1',
+                        quote,
+                        note,
+                        createdAt: '2026-01-01T00:00:00.000Z',
+                        anchor,
+                      }]);
+                      return true;
+                    },
+                    onUpdate: () => true,
+                    onRemove: () => {},
+                  }),
                 ),
-                React.createElement(WorkspaceTranscriptSelection, {
-                  rootRef: viewportRef,
-                  contentRef: contentRef,
-                  scopeKey: 'placement-test',
-                  canAdd: true,
-                  annotations,
-                  onAdd: (quote, note, anchor) => {
-                    addCalls += 1;
-                    setAnnotations((current) => [...current, {
-                      id: 'a-1',
-                      quote,
-                      note,
-                      createdAt: '2026-01-01T00:00:00.000Z',
-                      anchor,
-                    }]);
-                    return true;
-                  },
-                  onUpdate: () => true,
-                  onRemove: () => {},
-                }),
               ),
             );
           }
@@ -136,6 +146,9 @@ async function importHarness() {
               'workspace.selectionTooLong': 'Selection too long',
               'workspace.composerAnnotationEdit': 'Edit annotation',
               'workspace.composerAnnotationRemove': 'Remove annotation',
+              'workspace.annotationStyleLabel': 'Annotation highlight style',
+              'workspace.annotationStyleSelection': 'Selection',
+              'workspace.annotationStyleWave': 'Wave',
               'workspace.annotationSaveFailed': 'Save failed',
               'common.cancel': 'Cancel',
               'common.save': 'Save',
@@ -327,6 +340,9 @@ test('annotation highlights and markers live in content coordinates and ignore s
     assert.equal(highlight.style.left, '50px');
     assert.equal(highlight.style.top, '150px');
 
+    assert.match(highlight.className, /workspace-annotation-mark-selection/);
+    assert.equal(highlight.getAttribute('data-annotation-style'), 'selection');
+
     const marker = document.querySelector('[data-workspace-annotation-marker]');
     assert.ok(marker, 'numbered marker should render');
     assert.equal(marker.closest('#content'), content);
@@ -334,6 +350,37 @@ test('annotation highlights and markers live in content coordinates and ignore s
     assert.doesNotMatch(marker.className, /\bfixed\b/);
     assert.equal(marker.style.left, '208px');
     assert.equal(marker.style.top, '148px');
+
+    const measurementsBeforeStyleSwitch = rangeMeasurements;
+    const styleButton = (label) => [...document.querySelectorAll('#style-toggle [role="group"] button')]
+      .find((button) => button.textContent.trim() === label);
+    const waveButton = styleButton('Wave');
+    assert.ok(waveButton, 'wave style toggle should exist');
+    harness.run(() => {
+      waveButton.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+    });
+    await harness.flush();
+
+    const waveHighlight = document.querySelector('[data-workspace-selection-highlight="saved"]');
+    assert.match(waveHighlight.className, /workspace-annotation-mark-wave/);
+    assert.equal(waveHighlight.getAttribute('data-annotation-style'), 'wave');
+    assert.equal(
+      window.localStorage.getItem('ccem:workspace-annotation-highlight-style:v1'),
+      'wave',
+    );
+
+    const selectionButton = styleButton('Selection');
+    assert.ok(selectionButton, 'selection style toggle should exist');
+    harness.run(() => {
+      selectionButton.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+    });
+    await harness.flush();
+    assert.match(
+      document.querySelector('[data-workspace-selection-highlight="saved"]').className,
+      /workspace-annotation-mark-selection/,
+    );
+    // Style switching only repaints the marks; it must not recompute ranges.
+    assert.equal(rangeMeasurements, measurementsBeforeStyleSwitch);
 
     const measurementsBeforeScroll = rangeMeasurements;
     // Native scrolling moves the content box. Content-space placements stay

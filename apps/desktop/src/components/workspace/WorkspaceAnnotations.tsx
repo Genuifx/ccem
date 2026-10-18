@@ -29,6 +29,10 @@ import {
   visibleTextRangeRects,
   type ViewportRect,
 } from './workspaceAnnotationRects';
+import {
+  WorkspaceAnnotationStyleToggle,
+  useWorkspaceAnnotationHighlightStyle,
+} from './WorkspaceAnnotationStyleToggle';
 
 interface SelectionCandidate {
   quote: string | null;
@@ -296,6 +300,10 @@ export function WorkspaceTranscriptSelection({
   // Viewport anchor captured when a marker opens the editor; the panel stays
   // put while the transcript scrolls beneath it.
   const [savedEditorAnchor, setSavedEditorAnchor] = useState<{ left: number; top: number } | null>(null);
+  const [highlightStyle] = useWorkspaceAnnotationHighlightStyle();
+  const highlightClass = highlightStyle === 'wave'
+    ? 'workspace-annotation-mark-wave'
+    : 'workspace-annotation-mark-selection';
   const placements = useAnnotationPlacements(rootRef, contentRef, annotations, isActive);
   const hasSelectionCandidate = Boolean(candidate);
 
@@ -614,7 +622,8 @@ export function WorkspaceTranscriptSelection({
           <span
             key={`${placement.annotation.id}:${rectIndex}`}
             data-workspace-selection-highlight="saved"
-            className="absolute rounded-[2px] bg-primary/15 ring-1 ring-inset ring-primary/15"
+            data-annotation-style={highlightStyle}
+            className={cn('absolute', highlightClass)}
             style={{ left: rect.left, top: rect.top, width: rect.width, height: rect.height }}
           />
         )))}
@@ -622,7 +631,9 @@ export function WorkspaceTranscriptSelection({
           <span
             key={`candidate:${index}`}
             data-workspace-selection-highlight="candidate"
-            className="absolute rounded-[2px] bg-primary/20 ring-1 ring-inset ring-primary/25"
+            data-annotation-style={highlightStyle}
+            data-candidate="true"
+            className={cn('absolute', highlightClass)}
             style={{ left: rect.left, top: rect.top, width: rect.width, height: rect.height }}
           />
         )) : null}
@@ -724,7 +735,8 @@ export function WorkspaceTranscriptSelection({
                 >
                   <Trash2 className="h-3.5 w-3.5" />
                 </button>
-                <div className="flex gap-1.5">
+                <div className="flex items-center gap-1.5">
+                  <WorkspaceAnnotationStyleToggle />
                   <Button type="button" size="sm" variant="ghost" className="h-7 rounded-full px-3" onClick={dismissSavedEditor}>
                     {t('common.cancel')}
                   </Button>
@@ -880,12 +892,15 @@ export function WorkspaceComposerAnnotations({
           sideOffset={8}
           className="w-[min(440px,calc(100vw-24px))] rounded-2xl border-border/45 bg-popover p-2 shadow-xl"
         >
-          <div className="mb-1.5 flex items-center justify-between px-1">
-            <span className="text-xs font-semibold">{t('workspace.composerAnnotationsTitle')}</span>
-            <Button type="button" size="sm" variant="ghost" className="h-7 rounded-full px-2 text-[10px]" onClick={onClear}>
-              <Trash2 className="mr-1 h-3 w-3" />
-              {t('workspace.composerAnnotationsClear')}
-            </Button>
+          <div className="mb-1.5 flex items-center justify-between gap-2 px-1">
+            <span className="min-w-0 truncate text-xs font-semibold">{t('workspace.composerAnnotationsTitle')}</span>
+            <div className="flex shrink-0 items-center gap-1">
+              <WorkspaceAnnotationStyleToggle />
+              <Button type="button" size="sm" variant="ghost" className="h-7 rounded-full px-2 text-[10px]" onClick={onClear}>
+                <Trash2 className="mr-1 h-3 w-3" />
+                {t('workspace.composerAnnotationsClear')}
+              </Button>
+            </div>
           </div>
           <ScrollArea className="max-h-[320px] min-h-0">
             <div className="space-y-1.5">
