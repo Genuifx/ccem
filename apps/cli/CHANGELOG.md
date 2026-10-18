@@ -1,5 +1,11 @@
 # ccem
 
+## 2.96.0
+
+### Minor Changes
+
+- Automatically import newly installed official Claude plugins into CCEM and share plugin code through symlinks while retaining independent configuration, login, history, memory, enablement, and standard plugin data. Preserve CCEM disables and uninstalls, retain existing conversation IDs, and refresh shared plugin changes before the next idle prompt without replacing the active session.
+
 ## 2.95.0
 
 ### Minor Changes
