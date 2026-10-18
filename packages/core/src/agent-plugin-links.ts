@@ -10,12 +10,14 @@ import {
 export const CLAUDE_PLUGIN_LINK_LEDGER = '.ccem-plugin-links-v1.json';
 const MARKER = '.ccem-plugin-link-v1.json';
 const BACKUP = '.ccem-plugin-links-backup-v1';
+const METADATA = '.claude-plugin';
+const LAYOUT = '.ccem-layout-v2';
 const IGNORED = new Set(['.git', '.in_use', '.orphaned_at', MARKER]);
 type Managed = Identity & { sourcePath: string; installPath: string; version: string };
 type Choice = Managed | (Identity & { local: true });
 type LinkLedger = { version: 1; plugins: Record<string, Choice[]> };
 type LinkRoot = { source: string; target: string; changed: boolean };
-type Plan = { documents: Document[]; targets: Document[]; roots: LinkRoot[]; changed: boolean };
+type Plan = { documents: Document[]; targets: Document[]; roots: LinkRoot[]; changed: boolean; store?: string; protectedCatalogues?: Set<string> };
 
 function absolute(value: unknown): value is string {
   return typeof value === 'string' && path.isAbsolute(value) && !value.split(/[\\/]/).includes('..');
@@ -58,34 +60,48 @@ function children(root: string): string[] {
   return fs.readdirSync(root).filter((name) => !IGNORED.has(name)).sort();
 }
 
+function metadataChildren(root: string): string[] {
+  return fs.readdirSync(root).filter((name) => name !== 'marketplace.json').sort();
+}
+
+/** The manifest directory is private; only its code entries are linked. */
+function linkChildren(root: string, legacy = false): string[] {
+  return children(root).flatMap((name) => {
+    if (name !== METADATA || (legacy && stat(path.join(root, name))?.isSymbolicLink())) return [name];
+    return metadataChildren(path.join(root, name)).map((child) => path.join(name, child));
+  });
+}
+
 /** Validate the entire code tree, including nested source links, before sharing any part of it. */
-function validateCode(file: string, store: string, protectedCatalogues: Set<string>, ancestors = new Set<string>()): void {
+function validateCode(file: string, store: string, protectedCatalogues: Set<string>, ancestors = new Set<string>(), metadata = false): void {
   const resolved = fs.realpathSync(file);
-  if (!contained(store, resolved)) throw new Error('Linked plugin code escapes the official plugin store');
-  rejectPrivateData(store, resolved);
-  const parts = path.relative(store, resolved).split(path.sep);
-  if (parts.length < 2 || protectedCatalogues.has(resolved) || parts.some((part) => ['.in_use', '.orphaned_at', MARKER].includes(part))) {
-    throw new Error('Linked plugin code cannot expose official plugin metadata or runtime markers');
+  for (const candidate of [path.resolve(file), resolved]) {
+    if (!contained(store, candidate)) throw new Error('Linked plugin code escapes the official plugin store');
+    rejectPrivateData(store, candidate);
+    const parts = path.relative(store, candidate).split(path.sep);
+    if (parts.length < 2 || protectedCatalogues.has(candidate) || parts.some((part) => ['.in_use', '.orphaned_at', MARKER].includes(part))) {
+      throw new Error('Linked plugin code cannot expose official plugin metadata or runtime markers');
+    }
   }
   if (ancestors.has(resolved)) throw new Error('Linked plugin code has a symlink cycle');
   const info = fs.statSync(resolved);
   if (info.isDirectory()) {
     const next = new Set(ancestors).add(resolved);
-    const names = ancestors.size === 0 ? children(resolved) : fs.readdirSync(resolved).sort();
-    for (const name of names) validateCode(path.join(resolved, name), store, protectedCatalogues, next);
+    const names = metadata ? metadataChildren(resolved) : ancestors.size === 0 ? children(resolved) : fs.readdirSync(resolved).sort();
+    for (const name of names) validateCode(path.join(resolved, name), store, protectedCatalogues, next, ancestors.size === 0 && name === METADATA);
   } else if (!info.isFile()) throw new Error('Linked plugin code is not a regular file or directory');
 }
 
 /** Legacy independent copies are adopted only if the user's copy is still identical. */
-function equalCopy(source: string, target: string): boolean {
+function equalCopy(source: string, target: string, top = true, metadata = false): boolean {
   noLinks(target);
   const from = fs.statSync(source);
   const to = stat(target);
   if (!to || from.isDirectory() !== to.isDirectory() || from.isFile() !== to.isFile()) return false;
   if (from.isFile()) return fs.readFileSync(source).equals(fs.readFileSync(target)) && (from.mode & 0o111) === (to.mode & 0o111);
-  const names = children(source);
-  const local = children(target);
-  return JSON.stringify(names) === JSON.stringify(local) && names.every((name) => equalCopy(path.join(source, name), path.join(target, name)));
+  const names = metadata ? metadataChildren(source) : children(source);
+  const local = metadata ? metadataChildren(target) : children(target);
+  return JSON.stringify(names) === JSON.stringify(local) && names.every((name) => equalCopy(path.join(source, name), path.join(target, name), false, top && name === METADATA));
 }
 
 function rootMarker(target: string, source: string): Document {
@@ -108,22 +124,37 @@ function recoverPublished(row: ObjectValue, key: Identity, id: string, sourceRoo
   const suffix = `.ccem-linked-${createHash('sha256').update(marker.value.source).digest('hex').slice(0, 8)}`;
   if (!row.version.endsWith(suffix) || row.version.length === suffix.length) return;
   rootMarker(row.installPath as string, marker.value.source);
+  if (!ownedChildren(row.installPath as string, marker.value.source)) return;
   return { ...key, sourcePath: marker.value.source, installPath: row.installPath as string, version: row.version };
 }
 
 function planRoot(source: string, target: string): LinkRoot {
   const marker = rootMarker(target, source);
   let changed = marker.before === undefined;
-  const wanted = new Set(children(source));
-  if (stat(target)) for (const name of children(target)) {
+  noLinks(path.join(target, METADATA));
+  const wanted = new Set(linkChildren(source));
+  if (stat(target)) for (const name of linkChildren(target)) {
     const child = path.join(target, name);
     if (!stat(child)?.isSymbolicLink() || fs.readlinkSync(child) !== path.join(source, name)) {
       throw new Error('CCEM plugin code was changed locally; keeping it');
     }
     if (!wanted.has(name)) changed = true;
   }
+  if (!stat(path.join(target, METADATA))) changed = true;
   for (const name of wanted) if (!stat(path.join(target, name))) changed = true;
   return { source, target, changed };
+}
+
+function ownedChildren(target: string, source: string): boolean {
+  if (!stat(target)) return false;
+  const legacy = !path.basename(target).includes(`${LAYOUT}.ccem-linked-`);
+  const metadata = stat(path.join(target, METADATA));
+  if (metadata && !(legacy ? metadata.isSymbolicLink() : metadata.isDirectory())) return false;
+  if (!legacy && stat(path.join(target, METADATA, 'marketplace.json'))) return false;
+  return linkChildren(target, legacy).every((name) => {
+    const child = path.join(target, name);
+    return stat(child)?.isSymbolicLink() && fs.readlinkSync(child) === path.join(source, name);
+  });
 }
 
 function publishRoot(root: LinkRoot): void {
@@ -135,8 +166,9 @@ function publishRoot(root: LinkRoot): void {
   privateDirectory(directory);
   try {
     if (fresh) fs.writeFileSync(path.join(directory, MARKER), `${JSON.stringify({ version: 1, source: root.source })}\n`, { flag: 'wx', mode: 0o600 });
-    const wanted = new Set(children(root.source));
-    for (const name of children(directory)) if (!wanted.has(name)) {
+    const wanted = new Set(linkChildren(root.source));
+    privateDirectory(path.join(directory, METADATA));
+    for (const name of linkChildren(directory)) if (!wanted.has(name)) {
       const child = path.join(directory, name);
       if (!stat(child)?.isSymbolicLink() || fs.readlinkSync(child) !== path.join(root.source, name)) throw new Error('Plugin link changed during preparation');
       fs.unlinkSync(child);
@@ -262,7 +294,7 @@ function planLinks(sourceHome: string, targetHome: string): Plan {
       validateCode(code, sourceRoot, protectedCatalogues);
       const sourceVersion = typeof official.version === 'string' ? official.version : path.basename(original.source);
       if (!/^[a-zA-Z0-9][a-zA-Z0-9._+-]*$/.test(sourceVersion)) throw new Error('Invalid plugin version');
-      const version = `${sourceVersion}.ccem-linked-${createHash('sha256').update(code).digest('hex').slice(0, 8)}`;
+      const version = `${sourceVersion}${LAYOUT}.ccem-linked-${createHash('sha256').update(code).digest('hex').slice(0, 8)}`;
       const destination = path.join(targetRoot, 'cache', market, name, version);
       if (registryMoved) {
         if (local.installPath === destination && local.version === version && stat(destination)) rootMarker(destination, code);
@@ -270,10 +302,7 @@ function planLinks(sourceHome: string, targetHome: string): Plan {
       }
       if (old && !registryMoved) {
         rootMarker(old.installPath, old.sourcePath);
-        if (!stat(old.installPath) || children(old.installPath).some((name) => {
-          const child = path.join(old.installPath, name);
-          return !stat(child)?.isSymbolicLink() || fs.readlinkSync(child) !== path.join(old.sourcePath, name);
-        })) { detach(); continue; }
+        if (!ownedChildren(old.installPath, old.sourcePath)) { detach(); continue; }
       }
       if (localSource !== undefined && actualCatalogueSource !== expectedCatalogueSource) {
         // A previous attempt may have published the catalogue but not its registry/ledger yet.
@@ -300,7 +329,7 @@ function planLinks(sourceHome: string, targetHome: string): Plan {
     if (!choices.length) delete ledger.value.plugins[id];
   }
   const targets = [...catalogues.values(), targetRegistry, ledger];
-  return { documents, targets, roots: [...roots.values()], changed: targets.some(changed) || [...roots.values()].some((root) => root.changed) };
+  return { documents, targets, roots: [...roots.values()], changed: targets.some(changed) || [...roots.values()].some((root) => root.changed), store: sourceRoot, protectedCatalogues };
 }
 
 export function claudePluginLinksPending(sourceHome: string, targetHome: string): boolean {
@@ -312,7 +341,10 @@ export function linkClaudePlugins(sourceHome: string, targetHome: string): void 
   const plan = planLinks(sourceHome, targetHome);
   if (!plan.changed) return;
   for (const document of plan.documents) unchanged(document);
-  for (const root of plan.roots) publishRoot(root);
+  for (const root of plan.roots) {
+    validateCode(root.source, plan.store!, plan.protectedCatalogues!);
+    publishRoot(root);
+  }
   for (const document of plan.targets) {
     for (const observed of plan.documents) unchanged(observed);
     publishDocument(document, targetHome, BACKUP);

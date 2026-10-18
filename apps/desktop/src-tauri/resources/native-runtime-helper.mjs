@@ -28301,6 +28301,8 @@ import { createHash, randomUUID as randomUUID2 } from "node:crypto";
 var CLAUDE_PLUGIN_LINK_LEDGER = ".ccem-plugin-links-v1.json";
 var MARKER = ".ccem-plugin-link-v1.json";
 var BACKUP = ".ccem-plugin-links-backup-v1";
+var METADATA = ".claude-plugin";
+var LAYOUT = ".ccem-layout-v2";
 var IGNORED = /* @__PURE__ */ new Set([".git", ".in_use", ".orphaned_at", MARKER]);
 function absolute(value) {
   return typeof value === "string" && path5.isAbsolute(value) && !value.split(/[\\/]/).includes("..");
@@ -28337,31 +28339,42 @@ function readLinks(target) {
 function children(root) {
   return fs4.readdirSync(root).filter((name) => !IGNORED.has(name)).sort();
 }
-function validateCode(file2, store, protectedCatalogues, ancestors = /* @__PURE__ */ new Set()) {
+function metadataChildren(root) {
+  return fs4.readdirSync(root).filter((name) => name !== "marketplace.json").sort();
+}
+function linkChildren(root, legacy = false) {
+  return children(root).flatMap((name) => {
+    if (name !== METADATA || legacy && stat(path5.join(root, name))?.isSymbolicLink()) return [name];
+    return metadataChildren(path5.join(root, name)).map((child) => path5.join(name, child));
+  });
+}
+function validateCode(file2, store, protectedCatalogues, ancestors = /* @__PURE__ */ new Set(), metadata = false) {
   const resolved = fs4.realpathSync(file2);
-  if (!contained(store, resolved)) throw new Error("Linked plugin code escapes the official plugin store");
-  rejectPrivateData(store, resolved);
-  const parts = path5.relative(store, resolved).split(path5.sep);
-  if (parts.length < 2 || protectedCatalogues.has(resolved) || parts.some((part) => [".in_use", ".orphaned_at", MARKER].includes(part))) {
-    throw new Error("Linked plugin code cannot expose official plugin metadata or runtime markers");
+  for (const candidate of [path5.resolve(file2), resolved]) {
+    if (!contained(store, candidate)) throw new Error("Linked plugin code escapes the official plugin store");
+    rejectPrivateData(store, candidate);
+    const parts = path5.relative(store, candidate).split(path5.sep);
+    if (parts.length < 2 || protectedCatalogues.has(candidate) || parts.some((part) => [".in_use", ".orphaned_at", MARKER].includes(part))) {
+      throw new Error("Linked plugin code cannot expose official plugin metadata or runtime markers");
+    }
   }
   if (ancestors.has(resolved)) throw new Error("Linked plugin code has a symlink cycle");
   const info = fs4.statSync(resolved);
   if (info.isDirectory()) {
     const next = new Set(ancestors).add(resolved);
-    const names = ancestors.size === 0 ? children(resolved) : fs4.readdirSync(resolved).sort();
-    for (const name of names) validateCode(path5.join(resolved, name), store, protectedCatalogues, next);
+    const names = metadata ? metadataChildren(resolved) : ancestors.size === 0 ? children(resolved) : fs4.readdirSync(resolved).sort();
+    for (const name of names) validateCode(path5.join(resolved, name), store, protectedCatalogues, next, ancestors.size === 0 && name === METADATA);
   } else if (!info.isFile()) throw new Error("Linked plugin code is not a regular file or directory");
 }
-function equalCopy(source, target) {
+function equalCopy(source, target, top = true, metadata = false) {
   noLinks(target);
   const from = fs4.statSync(source);
   const to2 = stat(target);
   if (!to2 || from.isDirectory() !== to2.isDirectory() || from.isFile() !== to2.isFile()) return false;
   if (from.isFile()) return fs4.readFileSync(source).equals(fs4.readFileSync(target)) && (from.mode & 73) === (to2.mode & 73);
-  const names = children(source);
-  const local = children(target);
-  return JSON.stringify(names) === JSON.stringify(local) && names.every((name) => equalCopy(path5.join(source, name), path5.join(target, name)));
+  const names = metadata ? metadataChildren(source) : children(source);
+  const local = metadata ? metadataChildren(target) : children(target);
+  return JSON.stringify(names) === JSON.stringify(local) && names.every((name) => equalCopy(path5.join(source, name), path5.join(target, name), false, top && name === METADATA));
 }
 function rootMarker(target, source) {
   noLinks(target);
@@ -28380,21 +28393,35 @@ function recoverPublished(row, key, id, sourceRoot, targetRoot) {
   const suffix = `.ccem-linked-${createHash("sha256").update(marker.value.source).digest("hex").slice(0, 8)}`;
   if (!row.version.endsWith(suffix) || row.version.length === suffix.length) return;
   rootMarker(row.installPath, marker.value.source);
+  if (!ownedChildren(row.installPath, marker.value.source)) return;
   return { ...key, sourcePath: marker.value.source, installPath: row.installPath, version: row.version };
 }
 function planRoot(source, target) {
   const marker = rootMarker(target, source);
   let changed2 = marker.before === void 0;
-  const wanted = new Set(children(source));
-  if (stat(target)) for (const name of children(target)) {
+  noLinks(path5.join(target, METADATA));
+  const wanted = new Set(linkChildren(source));
+  if (stat(target)) for (const name of linkChildren(target)) {
     const child = path5.join(target, name);
     if (!stat(child)?.isSymbolicLink() || fs4.readlinkSync(child) !== path5.join(source, name)) {
       throw new Error("CCEM plugin code was changed locally; keeping it");
     }
     if (!wanted.has(name)) changed2 = true;
   }
+  if (!stat(path5.join(target, METADATA))) changed2 = true;
   for (const name of wanted) if (!stat(path5.join(target, name))) changed2 = true;
   return { source, target, changed: changed2 };
+}
+function ownedChildren(target, source) {
+  if (!stat(target)) return false;
+  const legacy = !path5.basename(target).includes(`${LAYOUT}.ccem-linked-`);
+  const metadata = stat(path5.join(target, METADATA));
+  if (metadata && !(legacy ? metadata.isSymbolicLink() : metadata.isDirectory())) return false;
+  if (!legacy && stat(path5.join(target, METADATA, "marketplace.json"))) return false;
+  return linkChildren(target, legacy).every((name) => {
+    const child = path5.join(target, name);
+    return stat(child)?.isSymbolicLink() && fs4.readlinkSync(child) === path5.join(source, name);
+  });
 }
 function publishRoot(root) {
   if (!root.changed) return;
@@ -28405,8 +28432,9 @@ function publishRoot(root) {
   try {
     if (fresh) fs4.writeFileSync(path5.join(directory, MARKER), `${JSON.stringify({ version: 1, source: root.source })}
 `, { flag: "wx", mode: 384 });
-    const wanted = new Set(children(root.source));
-    for (const name of children(directory)) if (!wanted.has(name)) {
+    const wanted = new Set(linkChildren(root.source));
+    privateDirectory(path5.join(directory, METADATA));
+    for (const name of linkChildren(directory)) if (!wanted.has(name)) {
       const child = path5.join(directory, name);
       if (!stat(child)?.isSymbolicLink() || fs4.readlinkSync(child) !== path5.join(root.source, name)) throw new Error("Plugin link changed during preparation");
       fs4.unlinkSync(child);
@@ -28533,7 +28561,7 @@ function planLinks(sourceHome, targetHome) {
       validateCode(code, sourceRoot, protectedCatalogues);
       const sourceVersion = typeof official.version === "string" ? official.version : path5.basename(original.source);
       if (!/^[a-zA-Z0-9][a-zA-Z0-9._+-]*$/.test(sourceVersion)) throw new Error("Invalid plugin version");
-      const version2 = `${sourceVersion}.ccem-linked-${createHash("sha256").update(code).digest("hex").slice(0, 8)}`;
+      const version2 = `${sourceVersion}${LAYOUT}.ccem-linked-${createHash("sha256").update(code).digest("hex").slice(0, 8)}`;
       const destination = path5.join(targetRoot, "cache", market, name, version2);
       if (registryMoved) {
         if (local.installPath === destination && local.version === version2 && stat(destination)) rootMarker(destination, code);
@@ -28544,10 +28572,7 @@ function planLinks(sourceHome, targetHome) {
       }
       if (old && !registryMoved) {
         rootMarker(old.installPath, old.sourcePath);
-        if (!stat(old.installPath) || children(old.installPath).some((name2) => {
-          const child = path5.join(old.installPath, name2);
-          return !stat(child)?.isSymbolicLink() || fs4.readlinkSync(child) !== path5.join(old.sourcePath, name2);
-        })) {
+        if (!ownedChildren(old.installPath, old.sourcePath)) {
           detach();
           continue;
         }
@@ -28584,7 +28609,7 @@ function planLinks(sourceHome, targetHome) {
     if (!choices.length) delete ledger.value.plugins[id];
   }
   const targets = [...catalogues.values(), targetRegistry, ledger];
-  return { documents, targets, roots: [...roots.values()], changed: targets.some(changed) || [...roots.values()].some((root) => root.changed) };
+  return { documents, targets, roots: [...roots.values()], changed: targets.some(changed) || [...roots.values()].some((root) => root.changed), store: sourceRoot, protectedCatalogues };
 }
 function claudePluginLinksPending(sourceHome, targetHome) {
   return planLinks(sourceHome, targetHome).changed;
@@ -28593,7 +28618,10 @@ function linkClaudePlugins(sourceHome, targetHome) {
   const plan = planLinks(sourceHome, targetHome);
   if (!plan.changed) return;
   for (const document2 of plan.documents) unchanged(document2);
-  for (const root of plan.roots) publishRoot(root);
+  for (const root of plan.roots) {
+    validateCode(root.source, plan.store, plan.protectedCatalogues);
+    publishRoot(root);
+  }
   for (const document2 of plan.targets) {
     for (const observed of plan.documents) unchanged(observed);
     publishDocument(document2, targetHome, BACKUP);

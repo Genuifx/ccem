@@ -59,7 +59,7 @@ describe('incremental isolated Claude plugins', () => {
     expect(ensureCcemAgentHome('claude', { HOME: home })).toBe(target);
     const record = read(target, 'plugins/installed_plugins.json').plugins[plugin.id][0];
     expect(record.installPath).toBe(path.join(target, 'plugins/cache/market/sample', record.version));
-    expect(record.version).toMatch(/^1\.0\.0\.ccem-linked-/);
+    expect(record.version).toMatch(/^1\.0\.0\.ccem-layout-v2\.ccem-linked-/);
     expect(fs.lstatSync(record.installPath).isSymbolicLink()).toBe(false);
     expect(fs.lstatSync(path.join(record.installPath, 'bin')).isSymbolicLink()).toBe(true);
     expect(fs.readFileSync(path.join(record.installPath, 'skills/ping/SKILL.md'), 'utf8')).toContain('sample fixture');

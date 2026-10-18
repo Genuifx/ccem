@@ -49,6 +49,57 @@ fn fixture(local: bool) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
     (temporary, source, target, code)
 }
 
+fn add_root_plugin(source: &Path, name: &str, market: &str) -> PathBuf {
+    let cache = source.join(format!("plugins/cache/{market}/{name}/1.0.0"));
+    let code = source.join("plugins/marketplaces").join(market);
+    for root in [&cache, &code] {
+        write(
+            &root.join(".claude-plugin/plugin.json"),
+            json!({"name":name,"version":"1.0.0"}).to_string(),
+        );
+        write(&root.join("skills/hello/SKILL.md"), b"root plugin skill");
+    }
+    let mut installed = if source.join(INSTALLED).exists() {
+        read(&source.join(INSTALLED))
+    } else {
+        empty_registry()
+    };
+    installed["plugins"][format!("{name}@{market}")] = json!([{
+        "scope":"user","projectPath":null,"version":"1.0.0","installPath":cache
+    }]);
+    write(&source.join(INSTALLED), installed.to_string());
+    let mut known = if source.join(KNOWN).exists() {
+        read(&source.join(KNOWN))
+    } else {
+        json!({})
+    };
+    known[market] =
+        json!({"source":{"source":"github","repo":"fixture/plugins"},"installLocation":code});
+    write(&source.join(KNOWN), known.to_string());
+    write(
+        &code.join(".claude-plugin/marketplace.json"),
+        json!({"name":market,"owner":{"name":"fixture"},"plugins":[{
+            "name":name,"source":"./","description":"private marketplace metadata"
+        }]})
+        .to_string(),
+    );
+    code
+}
+
+fn root_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().canonicalize().unwrap();
+    let source = root.join("official");
+    let target = root.join("private");
+    let code = add_root_plugin(&source, "demo", "market");
+    write(
+        &target.join("settings.json"),
+        b"{\"enabledPlugins\":{\"demo@market\":false}}",
+    );
+    super::super::plugins::import_plugins(&source, &target).unwrap();
+    (temporary, source, target, code)
+}
+
 fn install(target: &Path) -> PathBuf {
     PathBuf::from(
         read(&target.join(INSTALLED))["plugins"]["demo@market"][0]["installPath"]
@@ -211,7 +262,10 @@ fn source_changes_and_new_top_level_children_follow_without_copying() {
     let linked = install(&target);
     write(&code.join("README.md"), b"official readme");
     link_plugins(&source, &target).unwrap();
-    assert_eq!(fs::read(linked.join("README.md")).unwrap(), b"official readme");
+    assert_eq!(
+        fs::read(linked.join("README.md")).unwrap(),
+        b"official readme"
+    );
     write(
         &code.join("skills/hello/SKILL.md"),
         b"updated official skill",
@@ -364,6 +418,217 @@ fn local_catalogue_sources_use_linked_code_and_preserve_catalogue_metadata() {
 }
 
 #[test]
+fn root_marketplace_links_code_without_sharing_management_or_runtime_state() {
+    let (_temporary, source, target, code) = root_fixture();
+    let old = install(&target);
+    write(&old.join(".in_use"), b"existing session marker");
+    write(&code.join(".in_use"), b"official session marker");
+    write(
+        &source.join("plugins/data/demo@market/state.json"),
+        b"official state",
+    );
+    write(
+        &target.join("plugins/data/demo@market/state.json"),
+        b"private state",
+    );
+    let source_before = all_state(&source);
+    let old_before = all_state(&old);
+    let settings_before = fs::read(target.join("settings.json")).unwrap();
+    let manifest = target.join("plugins/marketplaces/market/.claude-plugin/marketplace.json");
+    let mut expected_manifest = read(&manifest);
+    assert!(links_pending(&source, &target).unwrap());
+    link_plugins(&source, &target).unwrap();
+    let linked = install(&target);
+    assert_ne!(linked, old);
+    assert!(linked
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("1.0.0.ccem-layout-v2.ccem-linked-"));
+    assert!(fs::symlink_metadata(linked.join(".claude-plugin"))
+        .unwrap()
+        .is_dir());
+    assert!(!fs::symlink_metadata(linked.join(".claude-plugin"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(
+        fs::symlink_metadata(linked.join(".claude-plugin/plugin.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!linked.join(".claude-plugin/marketplace.json").exists());
+    assert!(!linked.join(".in_use").exists());
+    write(&linked.join(".in_use"), b"new private session marker");
+    expected_manifest["plugins"][0]["source"] = json!(linked);
+    assert_eq!(read(&manifest), expected_manifest);
+    assert_eq!(all_state(&source), source_before);
+    assert_eq!(all_state(&old), old_before);
+    assert_eq!(
+        fs::read(target.join("settings.json")).unwrap(),
+        settings_before
+    );
+    assert_eq!(
+        fs::read(target.join("plugins/data/demo@market/state.json")).unwrap(),
+        b"private state"
+    );
+    assert!(!links_pending(&source, &target).unwrap());
+    write(&code.join("skills/hello/SKILL.md"), b"updated root skill");
+    assert_eq!(
+        fs::read(linked.join("skills/hello/SKILL.md")).unwrap(),
+        b"updated root skill"
+    );
+}
+
+#[test]
+fn newly_installed_root_marketplace_is_imported_incrementally_and_stays_disabled() {
+    let (_temporary, source, target, _code) = root_fixture();
+    link_plugins(&source, &target).unwrap();
+    let first = install(&target);
+    let first_before = all_state(&first);
+    let extra = add_root_plugin(&source, "extra", "second");
+    let settings = json!({"enabledPlugins":{"demo@market":false,"extra@second":false}});
+    write(&target.join("settings.json"), settings.to_string());
+    let source_before = all_state(&source);
+    super::super::plugins::import_plugins(&source, &target).unwrap();
+    link_plugins(&source, &target).unwrap();
+    let installed = read(&target.join(INSTALLED));
+    let linked = PathBuf::from(
+        installed["plugins"]["extra@second"][0]["installPath"]
+            .as_str()
+            .unwrap(),
+    );
+    assert_eq!(
+        fs::read_link(linked.join("skills")).unwrap(),
+        extra.join("skills")
+    );
+    assert!(!linked.join(".claude-plugin/marketplace.json").exists());
+    assert_eq!(read(&target.join("settings.json")), settings);
+    assert_eq!(all_state(&source), source_before);
+    assert_eq!(all_state(&first), first_before);
+    assert!(!links_pending(&source, &target).unwrap());
+}
+
+#[test]
+fn legacy_wrapper_layout_is_upgraded_without_changing_its_existing_session_files() {
+    for ledger_exists in [false, true] {
+        let (_temporary, source, target, code) = fixture(false);
+        let suffix = hex::encode(Sha256::digest(code.to_str().unwrap().as_bytes()));
+        let version = format!("1.0.0.ccem-linked-{}", &suffix[..8]);
+        let old = target.join("plugins/cache/market/demo").join(&version);
+        write(&old.join(MARKER), marker_value(&code).to_string());
+        for name in tree_names(&code, true).unwrap() {
+            symlink_code(&code.join(&name), &old.join(name)).unwrap();
+        }
+        write(&old.join(".in_use"), b"running old session");
+        let mut registry = read(&target.join(INSTALLED));
+        registry["plugins"]["demo@market"][0]["installPath"] = json!(old);
+        registry["plugins"]["demo@market"][0]["version"] = json!(version);
+        write(&target.join(INSTALLED), registry.to_string());
+        if ledger_exists {
+            write(&target.join(LEDGER), json!({"version":1,"plugins":{"demo@market":[{
+                "scope":"user","projectPath":null,"sourcePath":code,"installPath":old,"version":version
+            }]}}).to_string());
+        }
+        let before = all_state(&old);
+        assert!(links_pending(&source, &target).unwrap());
+        link_plugins(&source, &target).unwrap();
+        let linked = install(&target);
+        assert_ne!(linked, old);
+        assert!(fs::symlink_metadata(linked.join(".claude-plugin"))
+            .unwrap()
+            .is_dir());
+        assert_eq!(all_state(&old), before);
+        assert!(!links_pending(&source, &target).unwrap());
+    }
+}
+
+#[test]
+fn metadata_child_links_refresh_and_local_metadata_changes_are_preserved() {
+    for local_catalogue in [false, true] {
+        let (_temporary, source, target, code) = root_fixture();
+        link_plugins(&source, &target).unwrap();
+        let linked = install(&target);
+        write(
+            &code.join(".claude-plugin/config.json"),
+            b"official extra manifest",
+        );
+        link_plugins(&source, &target).unwrap();
+        assert_eq!(
+            fs::read_link(linked.join(".claude-plugin/config.json")).unwrap(),
+            code.join(".claude-plugin/config.json")
+        );
+        fs::remove_file(code.join(".claude-plugin/config.json")).unwrap();
+        link_plugins(&source, &target).unwrap();
+        assert!(fs::symlink_metadata(linked.join(".claude-plugin/config.json")).is_err());
+        let edited = if local_catalogue {
+            linked.join(".claude-plugin/marketplace.json")
+        } else {
+            let path = linked.join(".claude-plugin/plugin.json");
+            remove_code_link(&path).unwrap();
+            path
+        };
+        write(&edited, b"private management edit");
+        let before = all_state(&linked);
+        upgrade(&source, "1.1.0");
+        link_plugins(&source, &target).unwrap();
+        assert_eq!(install(&target), linked);
+        assert_eq!(all_state(&linked), before);
+        assert_eq!(
+            read(&target.join(LEDGER))["plugins"]["demo@market"][0]["local"],
+            true
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn root_catalogue_omission_does_not_allow_other_aliases_or_runtime_markers() {
+    for kind in [
+        "alias",
+        "nested-metadata",
+        "metadata-marker",
+        "replaced-private-dir",
+    ] {
+        let (_temporary, source, target, code) = root_fixture();
+        let catalogue = code.join(".claude-plugin/marketplace.json");
+        match kind {
+            "alias" => symlink_code(&catalogue, &code.join(".claude-plugin/alias.json")).unwrap(),
+            "nested-metadata" => {
+                fs::create_dir_all(code.join("nested")).unwrap();
+                symlink_code(
+                    &code.join(".claude-plugin"),
+                    &code.join("nested/.claude-plugin"),
+                )
+                .unwrap();
+            }
+            "metadata-marker" => write(&code.join(".claude-plugin/.in_use"), b"official marker"),
+            _ => {
+                link_plugins(&source, &target).unwrap();
+                let linked = install(&target);
+                fs::remove_dir_all(linked.join(".claude-plugin")).unwrap();
+                symlink_code(&code.join(".claude-plugin"), &linked.join(".claude-plugin")).unwrap();
+                let before = all_state(&linked);
+                upgrade(&source, "1.1.0");
+                link_plugins(&source, &target).unwrap();
+                assert_eq!(all_state(&linked), before);
+                assert_eq!(install(&target), linked);
+                assert_eq!(
+                    read(&target.join(LEDGER))["plugins"]["demo@market"][0]["local"],
+                    true
+                );
+                continue;
+            }
+        }
+        let before = all_state(&target);
+        assert!(link_plugins(&source, &target).is_err());
+        assert_eq!(all_state(&target), before);
+    }
+}
+
+#[test]
 fn recovers_catalogue_and_registry_publications_without_a_ledger() {
     for registry_already_moved in [false, true] {
         let (_temporary, source, target, _code) = fixture(true);
@@ -507,7 +772,7 @@ fn interrupted_owned_version_can_recover_after_official_version_advances_again()
             .unwrap()
             .to_str()
             .unwrap()
-            .starts_with("1.2.0.ccem-linked-"));
+            .starts_with("1.2.0.ccem-layout-v2.ccem-linked-"));
         assert!(read(&target.join(LEDGER))["plugins"]["demo@market"][0]
             .get("local")
             .is_none());
@@ -622,7 +887,7 @@ fn published_registry_recovers_before_an_official_uninstall() {
         .unwrap()
         .to_str()
         .unwrap()
-        .starts_with("1.2.0.ccem-linked-"));
+        .starts_with("1.2.0.ccem-layout-v2.ccem-linked-"));
 }
 
 #[test]

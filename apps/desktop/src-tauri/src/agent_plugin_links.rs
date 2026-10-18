@@ -21,6 +21,9 @@ const BACKUP: &str = ".ccem-plugin-links-backup-v1";
 const INSTALLED: &str = "plugins/installed_plugins.json";
 const KNOWN: &str = "plugins/known_marketplaces.json";
 const EXCLUDED: &[&str] = &[".in_use", ".orphaned_at", MARKER, ".git"];
+const METADATA: &str = ".claude-plugin";
+const CATALOGUE: &str = "marketplace.json";
+const LAYOUT: &str = ".ccem-layout-v2";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -322,8 +325,7 @@ fn same_link_target(left: &Path, right: &Path) -> bool {
         // the spelling without resolving the target: official code may be gone.
         let mut left = left.components();
         let mut right = right.components();
-        let (Some(Component::Prefix(a)), Some(Component::Prefix(b))) =
-            (left.next(), right.next())
+        let (Some(Component::Prefix(a)), Some(Component::Prefix(b))) = (left.next(), right.next())
         else {
             return false;
         };
@@ -402,11 +404,38 @@ fn tree_names(path: &Path, exclude: bool) -> Result<BTreeSet<OsString>, String> 
         .collect()
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum TreeLevel {
+    Root,
+    Metadata,
+    Nested,
+}
+
+impl TreeLevel {
+    fn child(self, name: &std::ffi::OsStr) -> Self {
+        if self == Self::Root && name == std::ffi::OsStr::new(METADATA) {
+            Self::Metadata
+        } else {
+            Self::Nested
+        }
+    }
+
+    fn names(self, path: &Path) -> Result<BTreeSet<OsString>, String> {
+        let mut names = tree_names(path, self == Self::Root)?;
+        if self == Self::Metadata {
+            // This exact slot is omitted from the wrapper. Catalogue aliases
+            // anywhere else must still go through the protected-path guard.
+            names.remove(std::ffi::OsStr::new(CATALOGUE));
+        }
+        Ok(names)
+    }
+}
+
 fn validate_source_tree(
     path: &Path,
     root: &Path,
     ancestors: &mut BTreeSet<PathBuf>,
-    top: bool,
+    level: TreeLevel,
     protected: &BTreeSet<PathBuf>,
 ) -> Result<(), String> {
     let resolved = source_code(path, root)?;
@@ -418,17 +447,23 @@ fn validate_source_tree(
     }
     let metadata = fs::metadata(&resolved).map_err(|error| error.to_string())?;
     if metadata.is_dir() {
-        for name in tree_names(&resolved, top)? {
-            validate_source_tree(&resolved.join(name), root, ancestors, false, protected)?;
+        for name in level.names(&resolved)? {
+            validate_source_tree(
+                &resolved.join(&name),
+                root,
+                ancestors,
+                level.child(&name),
+                protected,
+            )?;
         }
-    } else if !metadata.is_file() || top {
+    } else if !metadata.is_file() || level != TreeLevel::Nested {
         return Err("Plugin code root must be a directory with ordinary code files".into());
     }
     ancestors.remove(&resolved);
     Ok(())
 }
 
-fn same_code(source: &Path, copy: &Path, root: &Path, top: bool) -> Result<bool, String> {
+fn same_code(source: &Path, copy: &Path, root: &Path, level: TreeLevel) -> Result<bool, String> {
     if validate_no_symlinks(copy).is_err() {
         return Ok(false);
     }
@@ -455,12 +490,17 @@ fn same_code(source: &Path, copy: &Path, root: &Path, top: bool) -> Result<bool,
     if !left.is_dir() || !right.is_dir() {
         return Ok(false);
     }
-    let names = tree_names(&source, top)?;
-    if names != tree_names(copy, top)? {
+    let names = level.names(&source)?;
+    if names != level.names(copy)? {
         return Ok(false);
     }
     for name in names {
-        if !same_code(&source.join(&name), &copy.join(name), root, false)? {
+        if !same_code(
+            &source.join(&name),
+            &copy.join(&name),
+            root,
+            level.child(&name),
+        )? {
             return Ok(false);
         }
     }
@@ -502,7 +542,39 @@ fn alias_path(
         .join("cache")
         .join(market)
         .join(name)
-        .join(format!("{version}.ccem-linked-{}", &suffix[..8])))
+        .join(format!("{version}{LAYOUT}.ccem-linked-{}", &suffix[..8])))
+}
+
+fn managed_alias_matches(
+    target_root: &Path,
+    id: &str,
+    version: &str,
+    source: &Path,
+    path: &Path,
+) -> Result<bool, String> {
+    let Some((base, hash)) = version.rsplit_once(".ccem-linked-") else {
+        return Ok(false);
+    };
+    let (name, market) = plugin_parts(id)?;
+    let source = source.to_str().ok_or("Plugin source path must be UTF-8")?;
+    let suffix = hex::encode(Sha256::digest(source.as_bytes()));
+    // Validate both old and current aliases directly. Feeding a published
+    // alias back into alias_path would add the layout suffix a second time.
+    Ok(safe_version(base)
+        && hash == &suffix[..8]
+        && target_root
+            .join("cache")
+            .join(market)
+            .join(name)
+            .join(version)
+            == path)
+}
+
+fn current_layout(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|version| version.rsplit_once(".ccem-linked-"))
+        .is_some_and(|(base, _)| base.ends_with(LAYOUT))
 }
 
 fn marker_value(source: &Path) -> Value {
@@ -514,14 +586,67 @@ struct Wrapper {
     root: PathBuf,
     source: PathBuf,
     create: bool,
-    add: Vec<OsString>,
-    remove: Vec<OsString>,
+    create_metadata: bool,
+    add: Vec<PathBuf>,
+    remove: Vec<PathBuf>,
 }
 
 impl Wrapper {
     fn changed(&self) -> bool {
-        self.create || !self.add.is_empty() || !self.remove.is_empty()
+        self.create || self.create_metadata || !self.add.is_empty() || !self.remove.is_empty()
     }
+}
+
+fn desired_links(source: &Path) -> Result<BTreeSet<PathBuf>, String> {
+    let mut paths = BTreeSet::new();
+    for name in tree_names(source, true)? {
+        if name == std::ffi::OsStr::new(METADATA) {
+            for child in TreeLevel::Metadata.names(&source.join(METADATA))? {
+                paths.insert(Path::new(METADATA).join(child));
+            }
+        } else {
+            paths.insert(PathBuf::from(name));
+        }
+    }
+    Ok(paths)
+}
+
+fn owned_links(path: &Path, source: &Path) -> Result<Option<BTreeSet<PathBuf>>, String> {
+    let mut paths = BTreeSet::new();
+    for name in tree_names(path, true)? {
+        let child = path.join(&name);
+        let metadata = fs::symlink_metadata(&child).map_err(|error| error.to_string())?;
+        if name == std::ffi::OsStr::new(METADATA) && metadata.is_dir() {
+            for nested in tree_names(&child, false)? {
+                if nested == std::ffi::OsStr::new(CATALOGUE) {
+                    // A private catalogue added here is a local choice, not
+                    // imported code. Preserve the whole wrapper unchanged.
+                    return Ok(None);
+                }
+                paths.insert(Path::new(METADATA).join(nested));
+            }
+        } else {
+            if name == std::ffi::OsStr::new(METADATA) && current_layout(path) {
+                return Ok(None);
+            }
+            paths.insert(PathBuf::from(name));
+        }
+    }
+    for relative in &paths {
+        let child = path.join(relative);
+        if !fs::symlink_metadata(&child)
+            .map_err(|error| error.to_string())?
+            .file_type()
+            .is_symlink()
+            || !same_link_target(
+                &fs::read_link(&child).map_err(|error| error.to_string())?,
+                &source.join(relative),
+            )
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(paths))
 }
 
 #[derive(Default)]
@@ -576,10 +701,11 @@ impl Plan {
             root: root.into(),
             source: source.into(),
             create: false,
+            create_metadata: false,
             add: vec![],
             remove: vec![],
         };
-        let desired = tree_names(source, true)?;
+        let desired = desired_links(source)?;
         match fs::symlink_metadata(root) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 wrapper.create = true;
@@ -596,19 +722,14 @@ impl Plan {
                 for name in EXCLUDED.iter().filter(|name| **name != MARKER) {
                     validate_no_symlinks(&root.join(name))?;
                 }
-                let actual = tree_names(root, true)?;
+                let actual = owned_links(root, source)?
+                    .ok_or("Plugin link child was changed locally; left unchanged")?;
+                wrapper.create_metadata = match fs::symlink_metadata(root.join(METADATA)) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                    Err(error) => return Err(error.to_string()),
+                    Ok(_) => false,
+                };
                 for name in &actual {
-                    let path = root.join(name);
-                    let metadata =
-                        fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
-                    if !metadata.file_type().is_symlink()
-                        || !same_link_target(
-                            &fs::read_link(&path).map_err(|error| error.to_string())?,
-                            &source.join(name),
-                        )
-                    {
-                        return Err("Plugin link child was changed locally; left unchanged".into());
-                    }
                     if !desired.contains(name) {
                         wrapper.remove.push(name.clone());
                     }
@@ -777,9 +898,6 @@ fn published_wrapper(
     {
         return Ok(false);
     }
-    let Some((original_version, _)) = version.rsplit_once(".ccem-linked-") else {
-        return Ok(false);
-    };
     let marker = plan.read(path.join(MARKER), Value::Null)?;
     let Some(source) = marker
         .get("source")
@@ -791,7 +909,7 @@ fn published_wrapper(
     if !safe_absolute(&source)
         || reject_private(&source, source_root).is_err()
         || marker != marker_value(&source)
-        || alias_path(target_root, id, original_version, &source)? != path
+        || !managed_alias_matches(target_root, id, version, &source, path)?
         || path.file_name().and_then(|name| name.to_str()) != Some(version)
     {
         return Ok(false);
@@ -821,21 +939,12 @@ fn owned_children_intact(plan: &mut Plan, path: &Path, source: &Path) -> Result<
     if !owned_marker(plan, path, source)? {
         return Ok(false);
     }
-    for name in tree_names(path, true)? {
-        let child = path.join(&name);
-        if !fs::symlink_metadata(&child)
-            .map_err(|error| error.to_string())?
-            .file_type()
-            .is_symlink()
-            || !same_link_target(
-                &fs::read_link(child).map_err(|error| error.to_string())?,
-                &source.join(&name),
-            )
-        {
+    for name in EXCLUDED.iter().filter(|name| **name != MARKER) {
+        if validate_no_symlinks(&path.join(name)).is_err() {
             return Ok(false);
         }
     }
-    Ok(true)
+    Ok(owned_links(path, source)?.is_some())
 }
 
 fn put_entry(ledger: &mut Ledger, id: &str, entry: Entry) {
@@ -884,11 +993,7 @@ fn plan_links(source: &Path, target: &Path) -> Result<Plan, String> {
             {
                 reject_private(source, &source_root)?;
                 reject_private(install, &target_root)?;
-                let original_version = version
-                    .rsplit_once(".ccem-linked-")
-                    .ok_or("Invalid managed plugin version")?
-                    .0;
-                if alias_path(&target_root, id, original_version, source)? != *install
+                if !managed_alias_matches(&target_root, id, version, source, install)?
                     || install.file_name().and_then(|name| name.to_str()) != Some(version.as_str())
                 {
                     return Err("Invalid managed plugin root in ledger".into());
@@ -1004,7 +1109,13 @@ fn plan_links(source: &Path, target: &Path) -> Result<Plan, String> {
                     source_code(original_path, &source_root)?
                 }
             };
-            validate_source_tree(&code, &source_root, &mut BTreeSet::new(), true, &protected)?;
+            validate_source_tree(
+                &code,
+                &source_root,
+                &mut BTreeSet::new(),
+                TreeLevel::Root,
+                &protected,
+            )?;
             let alias = alias_path(&target_root, &id, version, &code)?;
             let linked_version = alias
                 .file_name()
@@ -1031,7 +1142,7 @@ fn plan_links(source: &Path, target: &Path) -> Result<Plan, String> {
                     original_path,
                     &source_root,
                     &mut BTreeSet::new(),
-                    true,
+                    TreeLevel::Root,
                     &protected,
                 )?;
                 if !matches_install(&local_row, &copied, version)
@@ -1039,7 +1150,7 @@ fn plan_links(source: &Path, target: &Path) -> Result<Plan, String> {
                         &source_code(original_path, &source_root)?,
                         &copied,
                         &source_root,
-                        true,
+                        TreeLevel::Root,
                     )?
                 {
                     put_entry(&mut ledger, &id, Entry::Local(identity));
@@ -1072,7 +1183,7 @@ fn plan_links(source: &Path, target: &Path) -> Result<Plan, String> {
                     current == old_alias || owned_current
                 } else {
                     (current == Some(catalogue.copied_path.as_path())
-                        && same_code(&code, &catalogue.copied_path, &source_root, true)?)
+                        && same_code(&code, &catalogue.copied_path, &source_root, TreeLevel::Root)?)
                         || owned_current
                 };
                 if !permitted {
@@ -1149,7 +1260,7 @@ fn link_with_check(
                 &wrapper.source,
                 &root,
                 &mut BTreeSet::new(),
-                true,
+                TreeLevel::Root,
                 &protected,
             )?;
             publish_wrapper(wrapper)?;
@@ -1219,6 +1330,14 @@ fn remove_code_link(path: &Path) -> Result<(), String> {
 
 fn publish_wrapper(wrapper: &Wrapper) -> Result<(), String> {
     validate_no_symlinks(&wrapper.root)?;
+    let current = Plan::default().wrapper(&wrapper.root, &wrapper.source)?;
+    if current.create != wrapper.create
+        || current.create_metadata != wrapper.create_metadata
+        || current.add != wrapper.add
+        || current.remove != wrapper.remove
+    {
+        return Err("Plugin code changed during preparation".into());
+    }
     if wrapper.create {
         if fs::symlink_metadata(&wrapper.root).is_ok() {
             return Err("Plugin link root appeared during preparation".into());
@@ -1237,6 +1356,7 @@ fn publish_wrapper(wrapper: &Wrapper) -> Result<(), String> {
                 &temporary.join(MARKER),
                 &json_bytes(&marker_value(&wrapper.source))?,
             )?;
+            create_private_dir(&temporary.join(METADATA))?;
             for name in &wrapper.add {
                 symlink_code(&wrapper.source.join(name), &temporary.join(name))?;
             }
@@ -1253,6 +1373,9 @@ fn publish_wrapper(wrapper: &Wrapper) -> Result<(), String> {
         != marker_value(&wrapper.source)
     {
         return Err("Plugin link marker changed during preparation".into());
+    }
+    if wrapper.create_metadata {
+        create_private_dir(&wrapper.root.join(METADATA))?;
     }
     for name in &wrapper.remove {
         let path = wrapper.root.join(name);
