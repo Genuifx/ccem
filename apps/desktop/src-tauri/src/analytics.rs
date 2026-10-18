@@ -20,15 +20,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+#[path = "analytics_claude_profiles.rs"]
+mod claude_profiles;
+
 const SOURCE_CLAUDE: &str = "claude";
 const SOURCE_CODEX: &str = "codex";
 const SOURCE_OPENCODE: &str = "opencode";
 const SOURCE_DSH: &str = "dsh";
 // Version 7 stores compact per-source rollups plus one materialized global
 // rollup. Unchanged history is therefore never folded row-by-row when an
-// Analytics view opens. Versions 5 and 6 are migrated once in memory.
-const USAGE_CACHE_VERSION: u32 = 7;
-const USAGE_SUMMARY_VERSION: u32 = 2;
+// Analytics view opens. Version 8 also deduplicates copied Claude profile logs.
+const USAGE_CACHE_VERSION: u32 = 8;
+const USAGE_SUMMARY_VERSION: u32 = 3;
 const USAGE_STATS_MEMO_TTL: Duration = Duration::from_secs(60);
 const OPENCODE_NATIVE_ENV_NAME: &str = opencode::OPENCODE_NATIVE_ENV_NAME;
 /// Shadow-compare gate: when enabled, every incremental parse also runs a
@@ -473,6 +476,8 @@ impl RollupAccumulator {
 struct ClaudeParseState {
     #[serde(default)]
     message_entry_indexes: HashMap<String, usize>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    row_fingerprints: HashMap<usize, String>,
 }
 
 /// Codex parse continuation state persisted in the cache entry (see the
@@ -715,39 +720,9 @@ fn discover_jsonl_files(codex_home: &Path) -> JsonlDiscovery {
     }
 }
 
-/// Scan CCEM's independently persisted Claude transcripts.
+/// Read both profiles; aggregation never prepares or migrates agent homes.
 fn discover_claude_jsonl_files() -> (Vec<DiscoveredFile>, bool) {
-    let mut files = Vec::new();
-    let projects_dir = agent_home::claude_home().join("projects");
-    if !projects_dir.exists() {
-        return (files, true);
-    }
-
-    let projects = match fs::read_dir(&projects_dir) {
-        Ok(entries) => entries,
-        Err(_) => return (files, false),
-    };
-
-    let mut complete = true;
-    for project_entry in projects {
-        let project_entry = match project_entry {
-            Ok(entry) => entry,
-            Err(_) => {
-                complete = false;
-                continue;
-            }
-        };
-        let project_path = project_entry.path();
-        if !project_entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-            continue;
-        }
-        // Depth-limited walk: main transcripts sit directly in the project
-        // dir, while subagent transcripts (Task tool / dynamic routing) live
-        // under `<session-id>/subagents/agent-*.jsonl` — 2 levels deeper.
-        complete &= collect_claude_jsonl_dir(&project_path, 0, 3, &mut files);
-    }
-
-    (files, complete)
+    claude_profiles::discover(&claude_profiles::roots())
 }
 
 fn collect_claude_jsonl_dir(
@@ -968,6 +943,10 @@ fn accumulate_claude_line(
             entries.push(entry);
         }
     } else {
+        state.row_fingerprints.insert(
+            entries.len(),
+            format!("{:x}", Sha256::digest(line.trim().as_bytes())),
+        );
         entries.push(entry);
     }
 }
@@ -1381,6 +1360,15 @@ fn refresh_discovered_entry(
     prices: &HashMap<String, ModelPrice>,
 ) -> CacheFileEntry {
     if let Some(cached) = cached {
+        if discovered.source == UsageSource::Claude
+            && !cached.claude_state.as_ref().is_some_and(|state| {
+                state.message_entry_indexes.len() + state.row_fingerprints.len()
+                    == cached.stats.entries.len()
+            })
+        {
+            // Older caches did not retain identities for idless records.
+            return full_parse_jsonl(discovered.source, &discovered.path, meta, prices);
+        }
         if (cached.meta.mtime - meta.mtime).abs() < 1.0 && cached.meta.size == meta.size {
             let mut entry = cached.clone();
             if entry.append_anchor.is_none() {
@@ -1527,13 +1515,16 @@ fn compact_cache(mut cache: CacheFile) -> CacheFile {
             entry.stats.entries.clear();
         }
     }
+    claude_profiles::deduplicate(&mut cache.files, None, &claude_profiles::roots());
     cache.global_rollup = CacheRollup::from_file_entries(&cache.files);
     cache.version = USAGE_CACHE_VERSION;
+    // Refresh persists this upgraded cache even when no transcript changed.
+    cache.last_updated = None;
     cache
 }
 
-/// Read a usage cache from an explicit path (test seam). Versions 5 and 6
-/// are compacted once into v7. Older versions fail closed.
+/// Read a usage cache from an explicit path (test seam). Versions 5 through 7
+/// are upgraded once into v8. Older versions fail closed.
 fn read_usage_cache_at(path: &Path) -> CacheFile {
     if !path.exists() {
         return CacheFile::default();
@@ -1554,7 +1545,7 @@ fn read_usage_cache_at(path: &Path) -> CacheFile {
                 cache
             }
         }
-        Ok(cache) if matches!(cache.version, 5 | 6) => compact_cache(cache),
+        Ok(cache) if matches!(cache.version, 5..=7) => compact_cache(cache),
         _ => CacheFile::default(),
     }
 }
@@ -2010,16 +2001,12 @@ fn refresh_usage_cache() -> CacheFile {
 }
 
 fn refresh_usage_cache_locked() -> CacheFile {
-    if let Err(error) = agent_home::ensure_agent_homes() {
-        eprintln!("CCEM agent history migration failed; retaining previous usage totals: {error}");
-        return read_usage_cache();
-    }
     let prices = load_model_prices();
     let codex_isolated = agent_home::codex_isolated();
     let discovery = discover_jsonl_files(&agent_home::codex_home_for_mode(codex_isolated));
-    let desktop_cache_exists = usage_cache_path().exists();
     let mut existing_cache = read_usage_cache();
-    let remapped = dirs::home_dir().is_some_and(|home| {
+    let desktop_cache_exists = usage_cache_path().exists() && existing_cache.last_updated.is_some();
+    let remapped = dirs::home_dir().is_some_and(|_| {
         let shared = agent_home::codex_home_for_mode(false).join("sessions");
         let isolated = agent_home::isolated_codex_home().join("sessions");
         let (inactive, active) = if codex_isolated {
@@ -2027,16 +2014,7 @@ fn refresh_usage_cache_locked() -> CacheFile {
         } else {
             (isolated, shared)
         };
-        remap_agent_cache_paths(
-            &mut existing_cache,
-            &[
-                (
-                    home.join(".claude/projects"),
-                    agent_home::claude_home().join("projects"),
-                ),
-                (inactive, active),
-            ],
-        )
+        remap_agent_cache_paths(&mut existing_cache, &[(inactive, active)])
     });
 
     let mut new_cache = CacheFile {
@@ -2100,6 +2078,11 @@ fn refresh_usage_cache_locked() -> CacheFile {
         dsh_result.complete,
     );
 
+    claude_profiles::deduplicate(
+        &mut new_cache.files,
+        Some(&existing_cache.files),
+        &claude_profiles::roots(),
+    );
     new_cache.global_rollup = update_global_rollup(&existing_cache, &new_cache.files).0;
 
     if remapped || should_write_usage_cache(desktop_cache_exists, &existing_cache, &new_cache) {
@@ -4656,6 +4639,7 @@ mod tests {
             }),
             claude_state: Some(ClaudeParseState {
                 message_entry_indexes: HashMap::from([("msg_roundtrip".to_string(), 3)]),
+                ..Default::default()
             }),
             append_anchor: None,
             revision: None,
@@ -4784,7 +4768,7 @@ mod tests {
         let persisted_shape = serde_json::to_value(&migrated).expect("serialize migrated cache");
         let file_shape = &persisted_shape["files"]["/tmp/.codex/sessions/2026/03/06/session.jsonl"];
 
-        assert_eq!(persisted_shape["version"], 7);
+        assert_eq!(persisted_shape["version"], 8);
         assert!(
             file_shape["stats"].get("entries").is_none(),
             "v7 must not retain compactable Codex usage rows"
@@ -5740,13 +5724,13 @@ mod tests {
     }
 
     #[test]
-    fn test_usage_cache_version_is_7() {
-        assert_eq!(USAGE_CACHE_VERSION, 7);
+    fn test_usage_cache_version_is_8() {
+        assert_eq!(USAGE_CACHE_VERSION, 8);
     }
 
     #[test]
-    fn test_usage_summary_version_is_2() {
-        assert_eq!(USAGE_SUMMARY_VERSION, 2);
+    fn test_usage_summary_version_is_3() {
+        assert_eq!(USAGE_SUMMARY_VERSION, 3);
     }
 
     #[test]

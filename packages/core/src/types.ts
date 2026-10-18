@@ -176,6 +176,10 @@ export interface FileMeta {
 export interface FileStatsEntry {
   timestamp: string;
   model: string;
+  /** Claude response identity, scoped to the logical transcript across profiles. */
+  messageId?: string;
+  /** Exact JSONL row fingerprint when the source did not supply a response id. */
+  recordFingerprint?: string;
   usage: TokenUsageWithCost;
 }
 

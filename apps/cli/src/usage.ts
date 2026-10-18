@@ -2,10 +2,11 @@ import * as fs from 'fs';
 import * as fsPromises from 'fs/promises';
 import * as path from 'path';
 import * as os from 'os';
-import * as readline from 'readline';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'url';
 import type { TokenUsage, TokenUsageWithCost, UsageStats, ModelPrice, UsageCache, FileMeta, FileStats, FileStatsEntry } from '@ccem/core';
-import { ensureCcemAgentHome, getCcemAgentHome } from '@ccem/core';
+import { getCcemAgentHome } from '@ccem/core';
+import { discoverClaudeUsageFiles, mergeClaudeUsage } from './usage-profiles.js';
 
 // ESM 兼容：获取 __dirname
 const __filename = fileURLToPath(import.meta.url);
@@ -14,13 +15,16 @@ const __dirname = path.dirname(__filename);
 // ... (保持前面的 import 和常量定义不变) ...
 
 // Claude 项目数据目录
-const CLAUDE_PROJECTS_DIR = path.join(getCcemAgentHome('claude'), 'projects');
+const CLAUDE_PROJECTS_DIRS = [
+  path.join(getCcemAgentHome('claude'), 'projects'),
+  path.join(os.homedir(), '.claude', 'projects'),
+];
 
 // ccem 数据目录
 const CCEM_DIR = path.join(os.homedir(), '.ccem');
 
 // 缓存版本号（修改缓存结构或统计口径时递增）
-const CACHE_VERSION = 3;
+const CACHE_VERSION = 4;
 
 // 缓存文件路径
 const getCachePath = () => path.join(CCEM_DIR, 'usage-cache.json');
@@ -227,8 +231,8 @@ function loadCacheSync(): UsageCache | null {
 
     const data = JSON.parse(fs.readFileSync(cachePath, 'utf-8')) as UsageCache;
 
-    // 检查缓存版本
-    if (data.version !== CACHE_VERSION) return null;
+    // v3 totals remain valid; live files are reparsed to recover response identities.
+    if (data.version !== 3 && data.version !== CACHE_VERSION) return null;
 
     return data;
   } catch {
@@ -243,8 +247,7 @@ async function loadCacheAsync(): Promise<UsageCache | null> {
     const content = await fsPromises.readFile(cachePath, 'utf-8');
     const data = JSON.parse(content) as UsageCache;
 
-    // 检查缓存版本
-    if (data.version !== CACHE_VERSION) return null;
+    if (data.version !== 3 && data.version !== CACHE_VERSION) return null;
 
     return data;
   } catch {
@@ -272,32 +275,30 @@ export function getUsageStatsFromCache(): UsageStats | null {
     lastUpdated: now.toISOString(),
   };
 
-  for (const fileData of Object.values(cache.files)) {
-    for (const entry of fileData.stats.entries) {
-      const entryTime = new Date(entry.timestamp);
-      const dateKey = entry.timestamp.split('T')[0]; // YYYY-MM-DD
+  for (const entry of mergeClaudeUsage(cache.files, CLAUDE_PROJECTS_DIRS)) {
+    const entryTime = new Date(entry.timestamp);
+    const dateKey = entry.timestamp.split('T')[0]; // YYYY-MM-DD
 
-      stats.total = mergeUsage(stats.total, entry.usage);
+    stats.total = mergeUsage(stats.total, entry.usage);
 
-      // Daily History
-      if (!stats.dailyHistory[dateKey]) {
-        stats.dailyHistory[dateKey] = emptyUsage();
-      }
-      stats.dailyHistory[dateKey] = mergeUsage(stats.dailyHistory[dateKey], entry.usage);
+    // Daily History
+    if (!stats.dailyHistory[dateKey]) {
+      stats.dailyHistory[dateKey] = emptyUsage();
+    }
+    stats.dailyHistory[dateKey] = mergeUsage(stats.dailyHistory[dateKey], entry.usage);
 
-      const normalizedModel = normalizeModelName(entry.model);
-      if (!stats.byModel[normalizedModel]) {
-        stats.byModel[normalizedModel] = emptyUsage();
-      }
-      stats.byModel[normalizedModel] = mergeUsage(stats.byModel[normalizedModel], entry.usage);
+    const normalizedModel = normalizeModelName(entry.model);
+    if (!stats.byModel[normalizedModel]) {
+      stats.byModel[normalizedModel] = emptyUsage();
+    }
+    stats.byModel[normalizedModel] = mergeUsage(stats.byModel[normalizedModel], entry.usage);
 
-      if (entryTime >= todayStart) {
-        stats.today = mergeUsage(stats.today, entry.usage);
-      }
+    if (entryTime >= todayStart) {
+      stats.today = mergeUsage(stats.today, entry.usage);
+    }
 
-      if (entryTime >= weekStart) {
-        stats.week = mergeUsage(stats.week, entry.usage);
-      }
+    if (entryTime >= weekStart) {
+      stats.week = mergeUsage(stats.week, entry.usage);
     }
   }
 
@@ -330,28 +331,40 @@ interface JSONLEntry {
   };
 }
 
-async function parseJSONLFileAsync(filePath: string, prices: Record<string, ModelPrice>, signal?: AbortSignal): Promise<FileStats> {
+// A running Claude process can stop at any byte. Count only committed JSONL lines.
+async function* completeLines(stream: fs.ReadStream): AsyncGenerator<string> {
+  let pending = '';
+  try {
+    for await (const chunk of stream) {
+      pending += chunk.toString();
+      let newline: number;
+      while ((newline = pending.indexOf('\n')) >= 0) {
+        yield pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+      }
+    }
+  } finally {
+    stream.destroy();
+  }
+}
+
+async function parseJSONLFileAsync(filePath: string, prices: Record<string, ModelPrice>, signal?: AbortSignal): Promise<FileStats | null> {
   const entries: FileStatsEntry[] = [];
   const messageEntryIndexes = new Map<string, number>();
 
   try {
     // 使用流式读取，避免一次性读取大文件占用过多内存和阻塞事件循环
     const fileStream = fs.createReadStream(filePath, { encoding: 'utf-8' });
-    const rl = readline.createInterface({
-      input: fileStream,
-      crlfDelay: Infinity
-    });
 
     let lineCount = 0;
 
     // 使用 for await...of 遍历每一行
-    for await (const line of rl) {
+    for await (const line of completeLines(fileStream)) {
       lineCount++;
 
       // 每处理 100 行检查一次 abort 信号，避免检查过于频繁
       if (lineCount % 100 === 0) {
         if (signal?.aborted) {
-          rl.close();
           fileStream.destroy();
           throw new Error('Aborted');
         }
@@ -385,6 +398,9 @@ async function parseJSONLFileAsync(filePath: string, prices: Record<string, Mode
         const statsEntry: FileStatsEntry = {
           timestamp: entry.timestamp || new Date().toISOString(),
           model,
+          ...(typeof entry.message.id === 'string' && entry.message.id
+            ? { messageId: entry.message.id }
+            : { recordFingerprint: createHash('sha256').update(line.trim()).digest('hex') }),
           usage: { ...usage, cost },
         };
 
@@ -410,57 +426,21 @@ async function parseJSONLFileAsync(filePath: string, prices: Record<string, Mode
     if ((err as Error).message === 'Aborted') {
       throw err;
     }
-    // 其他错误忽略（文件读取失败等）
+    // An unavailable source must not replace its last successful contribution.
+    return null;
   }
 
   return { entries };
 }
 
-// 获取所有 JSONL 文件 (Async)
-async function getAllJSONLFilesAsync(): Promise<string[]> {
-// ... (保持不变) ...
-  const files: string[] = [];
-
-  try {
-    const projectsDirExists = await fsPromises.access(CLAUDE_PROJECTS_DIR).then(() => true).catch(() => false);
-    if (!projectsDirExists) return files;
-
-    const projects = await fsPromises.readdir(CLAUDE_PROJECTS_DIR);
-
-    for (const project of projects) {
-      const projectPath = path.join(CLAUDE_PROJECTS_DIR, project);
-      try {
-        const stat = await fsPromises.lstat(projectPath);
-
-        if (stat.isDirectory()) {
-          const projectFiles = await fsPromises.readdir(projectPath);
-          for (const file of projectFiles) {
-            const filePath = path.join(projectPath, file);
-            if (file.endsWith('.jsonl') && (await fsPromises.lstat(filePath)).isFile()) {
-              files.push(filePath);
-            }
-          }
-        }
-      } catch {
-        // 忽略无法访问的目录
-      }
-    }
-  } catch {
-    // 目录读取失败
-  }
-
-  return files;
-}
-
 // 获取使用统计（带增量缓存）- 完全 Async
 export async function getUsageStats(signal?: AbortSignal): Promise<UsageStats> {
   if (signal?.aborted) throw new Error('Aborted');
-  ensureCcemAgentHome('claude');
 
   const prices = await loadPrices();
   if (signal?.aborted) throw new Error('Aborted');
 
-  const files = await getAllJSONLFilesAsync();
+  const files = await discoverClaudeUsageFiles(CLAUDE_PROJECTS_DIRS);
   if (signal?.aborted) throw new Error('Aborted');
 
   const cache = await loadCacheAsync();
@@ -468,12 +448,9 @@ export async function getUsageStats(signal?: AbortSignal): Promise<UsageStats> {
   // 构建新的缓存
   const newCache: UsageCache = {
     version: CACHE_VERSION,
-    files: {},
+    files: { ...cache?.files },
     lastUpdated: new Date().toISOString(),
   };
-
-  // 收集所有 entries（从缓存或重新解析）
-  const allEntries: FileStatsEntry[] = [];
 
   // 限制并发数，避免阻塞事件循环
   const CONCURRENCY_LIMIT = 5;
@@ -498,10 +475,11 @@ export async function getUsageStats(signal?: AbortSignal): Promise<UsageStats> {
       // 检查缓存是否有效
       const cachedFile = cache?.files[file];
       const cacheValid = cachedFile &&
+        cachedFile.stats.entries.every(entry => entry.messageId || entry.recordFingerprint) &&
         cachedFile.meta.mtime === meta.mtime &&
         cachedFile.meta.size === meta.size;
 
-      let fileStats: FileStats;
+      let fileStats: FileStats | null;
 
       if (cacheValid) {
         // 使用缓存
@@ -509,6 +487,7 @@ export async function getUsageStats(signal?: AbortSignal): Promise<UsageStats> {
       } else {
         // 重新解析
         fileStats = await parseJSONLFileAsync(file, prices, signal);
+        if (!fileStats) return null;
         // 让出时间片，避免 JSON.parse 连续占用 CPU
         await new Promise(resolve => setTimeout(resolve, 0));
       }
@@ -531,8 +510,6 @@ export async function getUsageStats(signal?: AbortSignal): Promise<UsageStats> {
         meta: result.meta,
         stats: result.stats,
       };
-
-      allEntries.push(...result.stats.entries);
     }
   }
 
@@ -556,7 +533,7 @@ export async function getUsageStats(signal?: AbortSignal): Promise<UsageStats> {
     lastUpdated: now.toISOString(),
   };
 
-  for (const entry of allEntries) {
+  for (const entry of mergeClaudeUsage(newCache.files, CLAUDE_PROJECTS_DIRS)) {
     const entryTime = new Date(entry.timestamp);
     const dateKey = entry.timestamp.split('T')[0]; // YYYY-MM-DD
 
