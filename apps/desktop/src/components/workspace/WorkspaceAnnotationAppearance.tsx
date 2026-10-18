@@ -121,6 +121,104 @@ const COLOR_LABEL_KEYS: Record<WorkspaceAnnotationColor, string> = {
   amber: 'workspace.annotationColorAmber',
 };
 
+interface WorkspaceAnnotationColorPaletteProps {
+  color: WorkspaceAnnotationColor;
+  onColorChange: (color: WorkspaceAnnotationColor) => void;
+  className?: string;
+}
+
+export function WorkspaceAnnotationColorPalette({
+  color,
+  onColorChange,
+  className,
+}: WorkspaceAnnotationColorPaletteProps) {
+  const { t } = useLocale();
+  return (
+    <div
+      role="group"
+      aria-label={t('workspace.annotationColorPalette')}
+      className={cn('flex items-center gap-1.5', className)}
+    >
+      {WORKSPACE_ANNOTATION_COLORS.map((option) => {
+        const active = option === color;
+        return (
+          <button
+            key={option}
+            type="button"
+            data-workspace-annotation-color={option}
+            aria-label={t(COLOR_LABEL_KEYS[option])}
+            aria-pressed={active}
+            onClick={() => onColorChange(option)}
+            className={cn(
+              `workspace-annotation-color-${option}`,
+              'flex h-[18px] w-[18px] items-center justify-center rounded-full border transition-transform',
+              active
+                ? 'scale-110 border-foreground/50'
+                : 'border-transparent hover:scale-110',
+            )}
+            style={{ backgroundColor: 'hsl(var(--annotation-hsl))' }}
+          >
+            {active ? (
+              <Check className="h-3 w-3" style={{ color: 'var(--annotation-fg)' }} />
+            ) : null}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+interface WorkspaceAnnotationStyleToggleProps {
+  style: WorkspaceAnnotationHighlightStyle;
+  onStyleChange: (style: WorkspaceAnnotationHighlightStyle) => void;
+  className?: string;
+}
+
+export function WorkspaceAnnotationStyleToggle({
+  style,
+  onStyleChange,
+  className,
+}: WorkspaceAnnotationStyleToggleProps) {
+  const { t } = useLocale();
+  const styleOptions = useMemo(() => STYLE_OPTIONS.map((option) => ({
+    value: option.value,
+    label: t(option.labelKey),
+  })), [t]);
+
+  return (
+    <div
+      role="group"
+      aria-label={t('workspace.annotationStyleToggle')}
+      className={cn(
+        'flex items-center gap-0.5 rounded-full border border-border/40 bg-surface p-0.5',
+        className,
+      )}
+    >
+      {styleOptions.map((option) => {
+        const active = option.value === style;
+        return (
+          <button
+            key={option.value}
+            type="button"
+            data-workspace-annotation-style={option.value}
+            aria-pressed={active}
+            title={option.label}
+            onClick={() => onStyleChange(option.value)}
+            className={cn(
+              'h-5 rounded-full px-2 text-[10px] font-medium transition-colors',
+              active
+                ? 'bg-primary/15 text-primary'
+                : 'text-muted-foreground hover:bg-muted/60 hover:text-foreground',
+            )}
+          >
+            {option.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 interface WorkspaceAnnotationAppearanceControlsProps {
   style: WorkspaceAnnotationHighlightStyle;
   color: WorkspaceAnnotationColor;
@@ -136,71 +234,13 @@ export function WorkspaceAnnotationAppearanceControls({
   onColorChange,
   className,
 }: WorkspaceAnnotationAppearanceControlsProps) {
-  const { t } = useLocale();
-  const styleOptions = useMemo(() => STYLE_OPTIONS.map((option) => ({
-    value: option.value,
-    label: t(option.labelKey),
-  })), [t]);
-
   return (
     <div
-      role="group"
-      aria-label={t('workspace.annotationAppearance')}
       className={cn('flex flex-wrap items-center gap-1.5', className)}
     >
-      <div className="flex items-center gap-1">
-        {WORKSPACE_ANNOTATION_COLORS.map((option) => {
-          const active = option === color;
-          return (
-            <button
-              key={option}
-              type="button"
-              data-workspace-annotation-color={option}
-              aria-label={t(COLOR_LABEL_KEYS[option])}
-              aria-pressed={active}
-              onClick={() => onColorChange(option)}
-              className={cn(
-                `workspace-annotation-color-${option}`,
-                'flex h-4 w-4 items-center justify-center rounded-full border transition-transform',
-                active
-                  ? 'scale-110 border-foreground/50'
-                  : 'border-transparent hover:scale-110',
-              )}
-              style={{ backgroundColor: 'hsl(var(--annotation-hsl))' }}
-            >
-              {active ? (
-                <Check className="h-2.5 w-2.5" style={{ color: 'var(--annotation-fg)' }} />
-              ) : null}
-            </button>
-          );
-        })}
-      </div>
-
+      <WorkspaceAnnotationColorPalette color={color} onColorChange={onColorChange} />
       <div className="mx-0.5 h-3 w-px bg-border/60" aria-hidden="true" />
-
-      <div className="flex items-center gap-0.5 rounded-full border border-border/40 bg-surface p-0.5">
-        {styleOptions.map((option) => {
-          const active = option.value === style;
-          return (
-            <button
-              key={option.value}
-              type="button"
-              data-workspace-annotation-style={option.value}
-              aria-pressed={active}
-              title={option.label}
-              onClick={() => onStyleChange(option.value)}
-              className={cn(
-                'h-5 rounded-full px-2 text-[10px] font-medium transition-colors',
-                active
-                  ? 'bg-primary/15 text-primary'
-                  : 'text-muted-foreground hover:bg-muted/60 hover:text-foreground',
-              )}
-            >
-              {option.label}
-            </button>
-          );
-        })}
-      </div>
+      <WorkspaceAnnotationStyleToggle style={style} onStyleChange={onStyleChange} />
     </div>
   );
 }

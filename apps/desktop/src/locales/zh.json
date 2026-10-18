@@ -744,6 +744,8 @@
     "composerAnnotationEdit": "编辑注释",
     "composerAnnotationRemove": "移除注释",
     "annotationAppearance": "注释样式",
+    "annotationColorPalette": "注释颜色",
+    "annotationStyleToggle": "注释线型",
     "annotationStyleMarker": "马克笔",
     "annotationStyleWave": "波浪线",
     "annotationCopy": "复制",

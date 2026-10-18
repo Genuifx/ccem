@@ -34,6 +34,8 @@ import {
 } from './workspaceAnnotationRects';
 import {
   WorkspaceAnnotationAppearanceControls,
+  WorkspaceAnnotationColorPalette,
+  WorkspaceAnnotationStyleToggle,
   useWorkspaceAnnotationAppearance,
 } from './WorkspaceAnnotationAppearance';
 
@@ -44,6 +46,9 @@ interface SelectionCandidate {
   rects: ViewportRect[];
   left: number;
   top: number;
+  /** Separate color capsule anchored above the selection. */
+  colorLeft: number;
+  colorTop: number;
   editing: boolean;
   style: WorkspaceAnnotationHighlightStyle;
   color: WorkspaceAnnotationColor;
@@ -410,14 +415,17 @@ export function WorkspaceTranscriptSelection({
     if (!quote) {
       if (rawText.trim().length > MAX_WORKSPACE_SELECTION_CHARS && lastRect) {
         // Surface why the panel will not offer "add" instead of vanishing.
+        const colorAnchor = viewportRects[0] ?? lastRect;
         candidateRangeRef.current = range.cloneRange();
         setCandidate({
           quote: null,
           anchor: null,
           blocked: true,
           rects,
-          left: Math.max(220, Math.min(window.innerWidth - 220, lastRect.left + lastRect.width / 2)),
-          top: Math.max(12, Math.min(window.innerHeight - 160, lastRect.bottom + 8)),
+          left: Math.max(170, Math.min(window.innerWidth - 170, lastRect.left + lastRect.width / 2)),
+          top: Math.max(12, Math.min(window.innerHeight - 80, lastRect.bottom + 8)),
+          colorLeft: Math.max(70, Math.min(window.innerWidth - 70, colorAnchor.left + colorAnchor.width / 2)),
+          colorTop: Math.max(12, colorAnchor.top - 44),
           editing: false,
           style: defaultAppearance.style,
           color: defaultAppearance.color,
@@ -432,14 +440,17 @@ export function WorkspaceTranscriptSelection({
     if (!lastRect) {
       return;
     }
+    const colorAnchor = viewportRects[0] ?? lastRect;
     candidateRangeRef.current = range.cloneRange();
     setCandidate({
       quote,
       anchor,
       blocked: false,
       rects,
-      left: Math.max(220, Math.min(window.innerWidth - 220, lastRect.left + lastRect.width / 2)),
-      top: Math.max(12, Math.min(window.innerHeight - 160, lastRect.bottom + 8)),
+      left: Math.max(170, Math.min(window.innerWidth - 170, lastRect.left + lastRect.width / 2)),
+      top: Math.max(12, Math.min(window.innerHeight - 80, lastRect.bottom + 8)),
+      colorLeft: Math.max(70, Math.min(window.innerWidth - 70, colorAnchor.left + colorAnchor.width / 2)),
+      colorTop: Math.max(12, colorAnchor.top - 44),
       editing: false,
       style: defaultAppearance.style,
       color: defaultAppearance.color,
@@ -867,117 +878,138 @@ export function WorkspaceTranscriptSelection({
             </div>
           ) : null}
 
-          {candidate ? (
+          {candidate?.editing ? (
             <div
               ref={panelRef}
               data-ccem-native-overlay
               data-workspace-selection-action
-              className={cn(
-                'fixed z-50 -translate-x-1/2 rounded-2xl border border-border/45 bg-popover shadow-xl',
-                candidate.editing
-                  ? 'w-[min(420px,calc(100vw-24px))] p-3'
-                  : 'w-[min(440px,calc(100vw-24px))] p-2',
-              )}
+              className="fixed z-50 w-[min(420px,calc(100vw-24px))] -translate-x-1/2 rounded-2xl border border-border/45 bg-popover p-3 shadow-xl"
               style={{ left: candidate.left, top: candidate.top }}
-              onMouseDown={(event) => {
-                if (!candidate.editing) {
-                  event.preventDefault();
-                }
-              }}
             >
-              {candidate.editing ? (
-                <div className="space-y-2.5">
-                  <div className="flex items-start gap-2">
-                    <MessageSquareQuote className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-                    <p className="line-clamp-3 text-xs leading-5 text-foreground/80">
-                      {candidate.quote}
-                    </p>
-                  </div>
-                  <WorkspaceAnnotationAppearanceControls
-                    style={candidate.style}
-                    color={candidate.color}
-                    onStyleChange={updateCandidateStyle}
-                    onColorChange={updateCandidateColor}
-                  />
-                  <textarea
-                    autoFocus
-                    maxLength={4_000}
-                    value={note}
-                    onChange={(event) => setNote(event.target.value)}
-                    onKeyDown={(event) => {
-                      if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
-                        event.preventDefault();
-                        save();
-                      }
-                    }}
-                    placeholder={t('workspace.selectionAnnotationPlaceholder')}
-                    className="min-h-[72px] w-full resize-none overflow-x-hidden rounded-xl border border-input bg-transparent px-3 py-2 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring/40"
-                  />
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-[10px] text-muted-foreground">
-                      {t('workspace.selectionAnnotationSubmitHint')}
-                    </span>
-                    <div className="flex gap-1.5">
-                      <Button type="button" size="sm" variant="ghost" className="h-7 rounded-full px-3" onClick={dismiss}>
-                        {t('common.cancel')}
-                      </Button>
-                      <Button type="button" size="sm" className="h-7 rounded-full px-3" disabled={!note.trim()} onClick={save}>
-                        <Check className="mr-1 h-3.5 w-3.5" />
-                        {t('workspace.selectionAnnotationAdd')}
-                      </Button>
-                    </div>
-                  </div>
+              <div className="space-y-2.5">
+                <div className="flex items-start gap-2">
+                  <MessageSquareQuote className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+                  <p className="line-clamp-3 text-xs leading-5 text-foreground/80">
+                    {candidate.quote}
+                  </p>
                 </div>
-              ) : candidate.blocked ? (
-                <span className="px-2 py-1 text-xs text-muted-foreground">
-                  {t('workspace.selectionTooLong')}
-                </span>
-              ) : (
-                <div className="space-y-2">
-                  <WorkspaceAnnotationAppearanceControls
-                    style={candidate.style}
-                    color={candidate.color}
-                    onStyleChange={updateCandidateStyle}
-                    onColorChange={updateCandidateColor}
-                  />
-                  <div className="flex items-center justify-between gap-2">
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="ghost"
-                      className="h-7 rounded-full px-2.5 text-[11px]"
-                      onClick={() => void copySelection()}
-                    >
-                      {copied
-                        ? <Check className="mr-1 h-3.5 w-3.5" />
-                        : <Copy className="mr-1 h-3.5 w-3.5" />}
-                      {t(copied ? 'workspace.annotationCopied' : 'workspace.annotationCopy')}
+                <WorkspaceAnnotationAppearanceControls
+                  style={candidate.style}
+                  color={candidate.color}
+                  onStyleChange={updateCandidateStyle}
+                  onColorChange={updateCandidateColor}
+                />
+                <textarea
+                  autoFocus
+                  maxLength={4_000}
+                  value={note}
+                  onChange={(event) => setNote(event.target.value)}
+                  onKeyDown={(event) => {
+                    if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
+                      event.preventDefault();
+                      save();
+                    }
+                  }}
+                  placeholder={t('workspace.selectionAnnotationPlaceholder')}
+                  className="min-h-[72px] w-full resize-none overflow-x-hidden rounded-xl border border-input bg-transparent px-3 py-2 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring/40"
+                />
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[10px] text-muted-foreground">
+                    {t('workspace.selectionAnnotationSubmitHint')}
+                  </span>
+                  <div className="flex gap-1.5">
+                    <Button type="button" size="sm" variant="ghost" className="h-7 rounded-full px-3" onClick={dismiss}>
+                      {t('common.cancel')}
                     </Button>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="ghost"
-                      className="h-8 rounded-xl px-3"
-                      disabled={!canAdd}
-                      onClick={() => {
-                        setCandidate((current) => current ? {
-                          ...current,
-                          editing: true,
-                          // The note editor is taller and wider; keep it fully
-                          // on screen when the selection sits near an edge.
-                          left: Math.max(220, Math.min(window.innerWidth - 220, current.left)),
-                          top: Math.max(12, Math.min(current.top, window.innerHeight - 250)),
-                        } : current);
-                        window.getSelection()?.removeAllRanges();
-                      }}
-                    >
-                      <Plus className="mr-1.5 h-3.5 w-3.5" />
-                      {t(canAdd ? 'workspace.selectionAddToTask' : 'workspace.selectionAnnotationLimit')}
+                    <Button type="button" size="sm" className="h-7 rounded-full px-3" disabled={!note.trim()} onClick={save}>
+                      <Check className="mr-1 h-3.5 w-3.5" />
+                      {t('workspace.selectionAnnotationAdd')}
                     </Button>
                   </div>
                 </div>
-              )}
+              </div>
             </div>
+          ) : null}
+
+          {candidate?.blocked ? (
+            <div
+              data-ccem-native-overlay
+              data-workspace-selection-action
+              data-workspace-annotation-blocked
+              className="fixed z-50 -translate-x-1/2 rounded-full border border-border/45 bg-popover px-3 py-1.5 text-xs text-muted-foreground shadow-xl"
+              style={{ left: candidate.left, top: candidate.top }}
+              onMouseDown={(event) => event.preventDefault()}
+            >
+              {t('workspace.selectionTooLong')}
+            </div>
+          ) : null}
+
+          {candidate && !candidate.editing && !candidate.blocked ? (
+            <>
+              <div
+                data-ccem-native-overlay
+                data-workspace-selection-action
+                data-workspace-annotation-color-bubble
+                className="fixed z-50 -translate-x-1/2 rounded-full border border-border/45 bg-popover p-1.5 shadow-xl"
+                style={{ left: candidate.colorLeft, top: candidate.colorTop }}
+                onMouseDown={(event) => event.preventDefault()}
+              >
+                <WorkspaceAnnotationColorPalette
+                  color={candidate.color}
+                  onColorChange={updateCandidateColor}
+                />
+              </div>
+
+              <div
+                data-ccem-native-overlay
+                data-workspace-selection-action
+                data-workspace-annotation-action-bar
+                className="fixed z-50 -translate-x-1/2 rounded-full border border-border/45 bg-popover p-1 shadow-xl"
+                style={{ left: candidate.left, top: candidate.top }}
+                onMouseDown={(event) => event.preventDefault()}
+              >
+                <div className="flex items-center gap-1">
+                  <WorkspaceAnnotationStyleToggle
+                    style={candidate.style}
+                    onStyleChange={updateCandidateStyle}
+                  />
+                  <div className="mx-0.5 h-4 w-px bg-border/60" aria-hidden="true" />
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    className="h-8 w-8 shrink-0 rounded-full p-0"
+                    aria-label={t(copied ? 'workspace.annotationCopied' : 'workspace.annotationCopy')}
+                    title={t(copied ? 'workspace.annotationCopied' : 'workspace.annotationCopy')}
+                    onClick={() => void copySelection()}
+                  >
+                    {copied
+                      ? <Check className="h-3.5 w-3.5" />
+                      : <Copy className="h-3.5 w-3.5" />}
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    className="h-8 rounded-full px-3 text-[11px]"
+                    disabled={!canAdd}
+                    onClick={() => {
+                      setCandidate((current) => current ? {
+                        ...current,
+                        editing: true,
+                        // The note editor is taller and wider; keep it fully
+                        // on screen when the selection sits near an edge.
+                        left: Math.max(220, Math.min(window.innerWidth - 220, current.left)),
+                        top: Math.max(12, Math.min(current.top, window.innerHeight - 250)),
+                      } : current);
+                      window.getSelection()?.removeAllRanges();
+                    }}
+                  >
+                    <Plus className="mr-1 h-3.5 w-3.5" />
+                    {t(canAdd ? 'workspace.selectionAddToTask' : 'workspace.selectionAnnotationLimit')}
+                  </Button>
+                </div>
+              </div>
+            </>
           ) : null}
         </>,
         document.body,

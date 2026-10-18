@@ -744,6 +744,8 @@
     "composerAnnotationEdit": "Edit annotation",
     "composerAnnotationRemove": "Remove annotation",
     "annotationAppearance": "Annotation style",
+    "annotationColorPalette": "Annotation color",
+    "annotationStyleToggle": "Annotation line style",
     "annotationStyleMarker": "Marker",
     "annotationStyleWave": "Wave",
     "annotationCopy": "Copy",

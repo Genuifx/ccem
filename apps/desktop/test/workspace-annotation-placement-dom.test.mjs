@@ -324,16 +324,22 @@ test('annotation highlights and markers live in content coordinates and ignore s
     });
     await harness.flush();
 
-    const pill = document.querySelector('[data-workspace-selection-action].fixed');
-    assert.ok(pill, 'selection action pill should be portaled');
-    assert.equal(pill.parentElement, document.body);
-    assert.match(pill.className, /\bz-50\b/);
-    assert.doesNotMatch(pill.className, /z-\[100\]/);
+    const colorBubble = document.querySelector('[data-workspace-annotation-color-bubble]');
+    const actionBar = document.querySelector('[data-workspace-annotation-action-bar]');
+    assert.ok(colorBubble, 'color palette should float in its own bubble');
+    assert.ok(actionBar, 'annotation actions should share one toolbar');
+    assert.equal(colorBubble.parentElement, document.body);
+    assert.equal(actionBar.parentElement, document.body);
+    assert.match(colorBubble.className, /\bz-50\b/);
+    assert.match(actionBar.className, /\bz-50\b/);
+    assert.doesNotMatch(actionBar.className, /z-\[100\]/);
 
-    const roseSwatch = pill.querySelector('[data-workspace-annotation-color="rose"]');
-    const waveStyle = pill.querySelector('[data-workspace-annotation-style="wave"]');
-    assert.ok(roseSwatch, 'color swatches should be in the selection toolbar');
-    assert.ok(waveStyle, 'wave style should be in the selection toolbar');
+    const roseSwatch = colorBubble.querySelector('[data-workspace-annotation-color="rose"]');
+    const waveStyle = actionBar.querySelector('[data-workspace-annotation-style="wave"]');
+    assert.ok(roseSwatch, 'color swatches should live in the color bubble');
+    assert.ok(waveStyle, 'wave style should live in the action bar');
+    assert.equal(actionBar.contains(roseSwatch), false, 'colors must not be inlined into the action bar');
+    assert.equal(colorBubble.contains(waveStyle), false, 'styles must not be inlined into the color bubble');
     harness.run(() => {
       roseSwatch.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
       waveStyle.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
@@ -349,21 +355,21 @@ test('annotation highlights and markers live in content coordinates and ignore s
       '{"style":"wave","color":"rose"}',
     );
 
-    const copyButton = [...pill.querySelectorAll('button')]
-      .find((button) => button.textContent.trim() === 'Copy');
-    assert.ok(copyButton, 'copy action should be in the selection toolbar');
+    const copyButton = actionBar.querySelector('button[aria-label="Copy"]');
+    assert.ok(copyButton, 'copy action should be in the action bar');
     harness.run(() => {
       copyButton.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
     });
     await harness.flush();
     assert.equal(copiedText, 'selected words');
-    assert.ok(
-      [...pill.querySelectorAll('button')].some((button) => button.textContent.trim() === 'Copied'),
+    assert.equal(
+      copyButton.getAttribute('aria-label'),
+      'Copied',
       'copy action should acknowledge the clipboard write',
     );
 
     // Ask for a note, then submit the annotation.
-    const addToTask = [...pill.querySelectorAll('button')]
+    const addToTask = [...actionBar.querySelectorAll('button')]
       .find((button) => button.textContent.trim() === 'Add to task');
     assert.ok(addToTask, 'add-to-task action should exist');
     harness.run(() => {
@@ -371,16 +377,19 @@ test('annotation highlights and markers live in content coordinates and ignore s
     });
     await harness.flush();
 
+    const editingPanel = [...document.querySelectorAll('[data-workspace-selection-action].fixed')]
+      .find((panel) => panel.querySelector('textarea'));
+    assert.ok(editingPanel, 'note editor should open');
     assert.equal(
-      pill.querySelector('[data-workspace-annotation-color="rose"]').getAttribute('aria-pressed'),
+      editingPanel.querySelector('[data-workspace-annotation-color="rose"]').getAttribute('aria-pressed'),
       'true',
     );
     assert.equal(
-      pill.querySelector('[data-workspace-annotation-style="wave"]').getAttribute('aria-pressed'),
+      editingPanel.querySelector('[data-workspace-annotation-style="wave"]').getAttribute('aria-pressed'),
       'true',
     );
 
-    const textarea = document.querySelector('textarea');
+    const textarea = editingPanel.querySelector('textarea');
     assert.ok(textarea);
     harness.run(() => {
       const setter = Object.getOwnPropertyDescriptor(
