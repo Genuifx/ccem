@@ -360,9 +360,9 @@ fn import_with_check(
             .get("extraKnownMarketplaces")
             .and_then(|extra| extra.get(market))
         {
-            if !target_settings_value
+            if target_settings_value
                 .get("extraKnownMarketplaces")
-                .is_some_and(|extra| extra.get(market).is_some())
+                .is_none_or(|extra| extra.get(market).is_none())
             {
                 let mut extra = extra.clone();
                 rebase_marketplace(&mut extra, &source_root, &target_root, &mut assets)?;
