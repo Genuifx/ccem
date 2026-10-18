@@ -4,6 +4,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { assertNoLegacyAgentWriters } from './agent-migration-processes';
 import { claudePluginImportPending, importClaudePlugins } from './agent-plugins';
+import { claudePluginLinksPending, linkClaudePlugins } from './agent-plugin-links';
 
 export type IsolatedAgentProvider = 'claude' | 'codex';
 type AgentEnvironment = Record<string, string | undefined>;
@@ -341,7 +342,7 @@ function acquireMigrationLock(base: string): () => void {
   throw new Error('Could not acquire CCEM agent migration lock');
 }
 
-/** Snapshot history once and import newly installed plugins as independent copies. */
+/** Snapshot history once; import plugin choices and share only their code. */
 export function ensureCcemAgentHome(
   provider: IsolatedAgentProvider,
   env: AgentEnvironment = process.env,
@@ -357,7 +358,7 @@ export function ensureCcemAgentHome(
   const historyReady = migrationComplete(marker);
   if (historyReady) {
     if (provider !== 'claude') return root;
-    try { if (!claudePluginImportPending(source, root)) return root; } catch (error) {
+    try { if (!claudePluginImportPending(source, root) && !claudePluginLinksPending(source, root)) return root; } catch (error) {
       console.warn(`CCEM plugin import deferred: ${(error as Error).message}`);
       return root;
     }
@@ -391,7 +392,7 @@ export function ensureCcemAgentHome(
       syncDirectory(root);
     }
     if (provider === 'claude') {
-      try { importClaudePlugins(source, root); } catch (error) {
+      try { importClaudePlugins(source, root); linkClaudePlugins(source, root); } catch (error) {
         // A broken plugin must not prevent an existing conversation from resuming.
         console.warn(`CCEM plugin import deferred: ${(error as Error).message}`);
       }

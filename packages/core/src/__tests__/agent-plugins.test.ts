@@ -58,7 +58,10 @@ describe('incremental isolated Claude plugins', () => {
     const sourceSettings = fs.readFileSync(path.join(source, 'settings.json'), 'utf8');
     expect(ensureCcemAgentHome('claude', { HOME: home })).toBe(target);
     const record = read(target, 'plugins/installed_plugins.json').plugins[plugin.id][0];
-    expect(record.installPath).toBe(path.join(target, 'plugins/cache/market/sample/1.0.0'));
+    expect(record.installPath).toBe(path.join(target, 'plugins/cache/market/sample', record.version));
+    expect(record.version).toMatch(/^1\.0\.0\.ccem-linked-/);
+    expect(fs.lstatSync(record.installPath).isSymbolicLink()).toBe(false);
+    expect(fs.lstatSync(path.join(record.installPath, 'bin')).isSymbolicLink()).toBe(true);
     expect(fs.readFileSync(path.join(record.installPath, 'skills/ping/SKILL.md'), 'utf8')).toContain('sample fixture');
     expect(read(target, 'settings.json')).toEqual({ enabledPlugins: { [plugin.id]: true } });
     expect(fs.readFileSync(history, 'utf8')).toBe('existing-session-id');
@@ -66,7 +69,7 @@ describe('incremental isolated Claude plugins', () => {
     expect(fs.existsSync(path.join(target, '.credentials.json'))).toBe(false);
     expect(fs.readFileSync(path.join(source, 'settings.json'), 'utf8')).toBe(sourceSettings);
     expect(fs.readFileSync(path.join(target, '.ccem-plugins-backup-v1/plugins/installed_plugins.json'), 'utf8')).toBe(originalRegistry);
-    expect(fs.statSync(path.join(record.installPath, 'bin/ping')).ino).not.toBe(fs.statSync(path.join(plugin.installPath, 'bin/ping')).ino);
+    expect(fs.statSync(path.join(record.installPath, 'bin/ping')).ino).toBe(fs.statSync(path.join(source, 'plugins/marketplaces/market/plugins/sample/bin/ping')).ino);
     if (process.platform !== 'win32') expect(fs.statSync(path.join(record.installPath, 'bin/ping')).mode & 0o100).toBeTruthy();
   });
 

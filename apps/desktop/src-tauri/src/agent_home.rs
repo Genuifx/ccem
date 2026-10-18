@@ -1,5 +1,7 @@
 //! CCEM-owned agent state. Official homes are read only for snapshots and imports.
 
+#[path = "agent_plugin_links.rs"]
+mod plugin_links;
 #[path = "agent_plugins.rs"]
 mod plugins;
 
@@ -222,6 +224,14 @@ fn ensure_agent_homes_for_mode_with_guard(
             false
         }
     };
+    let links_pending =
+        match plugin_links::links_pending(&home.join(".claude"), &base.join("claude")) {
+            Ok(pending) => pending,
+            Err(error) => {
+                eprintln!("Claude plugin links warning: {error}");
+                false
+            }
+        };
     if isolated && !migration_complete(&base.join("codex"))? {
         let source = resolve_existing_parent(codex_source)?;
         let target = resolve_existing_parent(base)?;
@@ -251,7 +261,7 @@ fn ensure_agent_homes_for_mode_with_guard(
             "config.toml"
         }))?;
     }
-    if history_complete && !plugin_pending {
+    if history_complete && !plugin_pending && !links_pending {
         return Ok(());
     }
     create_private_dir(base)?;
@@ -295,6 +305,14 @@ fn ensure_agent_homes_for_mode_with_guard(
     if plugin_pending {
         if let Err(error) = plugins::import_plugins(&home.join(".claude"), &base.join("claude")) {
             eprintln!("Claude plugin import warning: {error}");
+        }
+    }
+    // The independent importer bootstraps metadata and preserves compatibility.
+    // Linking then adopts only its unchanged code copies under the same lock.
+    if plugin_pending || links_pending {
+        if let Err(error) = plugin_links::link_plugins(&home.join(".claude"), &base.join("claude"))
+        {
+            eprintln!("Claude plugin links warning: {error}");
         }
     }
     Ok(())

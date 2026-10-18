@@ -462,6 +462,31 @@ fn preserves_destination_identities_and_keeps_project_scopes_out_of_user_setting
 
 #[test]
 fn initialized_history_and_session_identity_are_unchanged_by_incremental_import() {
+    fn linked_state(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)> {
+        fn visit(path: &Path, result: &mut BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)>) {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            let bytes = if metadata.file_type().is_symlink() {
+                fs::read_link(path)
+                    .unwrap()
+                    .to_string_lossy()
+                    .as_bytes()
+                    .to_vec()
+            } else if metadata.is_file() {
+                fs::read(path).unwrap()
+            } else {
+                vec![]
+            };
+            result.insert(path.to_path_buf(), (bytes, metadata.modified().unwrap()));
+            if metadata.is_dir() {
+                for entry in fs::read_dir(path).unwrap() {
+                    visit(&entry.unwrap().path(), result);
+                }
+            }
+        }
+        let mut result = BTreeMap::new();
+        visit(root, &mut result);
+        result
+    }
     let (_temp, source, target) = fixture();
     add_plugin(&source, "demo@fixture", "user", None, "1");
     write(
@@ -505,7 +530,7 @@ fn initialized_history_and_session_identity_are_unchanged_by_incremental_import(
         );
     }
     assert!(target.join(INSTALLED).exists());
-    let before = file_state(&target);
+    let before = linked_state(&target);
     super::super::ensure_agent_homes_for_mode_with_guard(
         source.parent().unwrap(),
         target.parent().unwrap(),
@@ -514,7 +539,7 @@ fn initialized_history_and_session_identity_are_unchanged_by_incremental_import(
         |_, _, _, _| panic!("history is already initialized"),
     )
     .unwrap();
-    assert_eq!(file_state(&target), before);
+    assert_eq!(linked_state(&target), before);
 }
 
 #[test]

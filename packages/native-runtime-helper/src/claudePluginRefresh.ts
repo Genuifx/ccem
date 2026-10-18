@@ -1,7 +1,5 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import { ensureCcemAgentHome } from '../../core/src/agent-home';
-import { CLAUDE_PLUGIN_IMPORT_LEDGER } from '../../core/src/agent-plugins';
+import { claudePluginRevision } from '../../core/src/agent-plugin-links';
 
 type Revision = string | null | undefined;
 type PluginQuery = {
@@ -11,14 +9,7 @@ type PluginQuery = {
 
 function preparePlugins(): Revision {
   const home = ensureCcemAgentHome('claude');
-  const ledger = path.join(home, CLAUDE_PLUGIN_IMPORT_LEDGER);
-  try {
-    if (!fs.lstatSync(ledger).isFile()) throw new Error('Plugin import ledger is not a regular file');
-    return fs.readFileSync(ledger, 'utf8');
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
-    throw error;
-  }
+  return claudePluginRevision(home);
 }
 
 /** Each query keeps its own disk baseline; imports never interrupt or replace it. */

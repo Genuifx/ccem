@@ -204,13 +204,13 @@ function unchanged(document: Document): void {
   if (current !== document.before) throw new Error('Plugin metadata changed during import; retry later');
 }
 
-function publishDocument(document: Document, target: string): void {
+function publishDocument(document: Document, target: string, backupDirectory = '.ccem-plugins-backup-v1'): void {
   const contents = `${JSON.stringify(document.value, null, 2)}\n`;
   if (document.before !== undefined && JSON.stringify(JSON.parse(document.before)) === JSON.stringify(document.value)) return;
   unchanged(document);
   privateDirectory(path.dirname(document.file));
   if (document.before !== undefined) {
-    const backup = path.join(target, '.ccem-plugins-backup-v1', path.relative(target, document.file));
+    const backup = path.join(target, backupDirectory, path.relative(target, document.file));
     privateDirectory(path.dirname(backup));
     noLinks(backup);
     const existing = stat(backup);
@@ -381,3 +381,8 @@ export function importClaudePlugins(sourceHome: string, targetHome: string): { i
   }
   return { imported, observed: pending.length };
 }
+
+// Shared only with the linked-code upgrade; application entry points remain in agent-home.
+export { object, stat, noLinks, readDocument, pluginId, identity, same, registry, readLedger,
+  readSource, contained, rejectPrivateData, relocated, privateDirectory, unchanged, publishDocument };
+export type { ObjectValue, Identity, Document };

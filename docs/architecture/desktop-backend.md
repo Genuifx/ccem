@@ -11,6 +11,7 @@ Source: `apps/desktop/src-tauri/src/`
 | `proxy_debug.rs` | ~2300 | Local HTTP proxy for API traffic recording |
 | `agent_home.rs` / `agent_profile.rs` | — | CCEM-owned Claude/Codex state roots, one-time legacy snapshot, launch environment and independent login |
 | `agent_plugins.rs` | — | Incremental import of official Claude plugins into the independent CCEM profile |
+| `agent_plugin_links.rs` | — | Shared plugin code with independent CCEM installation records and runtime data |
 | `history.rs` | ~1700 | Claude/Codex history projection from `~/.ccem/agents/{claude,codex}`, `/compact` segmentation |
 | `terminal.rs` | ~1450 | Terminal detection (iTerm2/Terminal.app), launch/focus/close/arrange |
 | `analytics.rs` | ~1400 | JSONL log parsing, incremental cache, LiteLLM pricing |
@@ -42,27 +43,47 @@ Preparing the Claude profile imports newly observed plugin IDs from the official
 in `packages/core/src/agent-plugins.ts`. The two paths share the profile migration
 lock and `.ccem-plugins-import-v1.json` ledger.
 
-- Each plugin ID is observed once, across all initially installed scopes. Later
-  official version changes, removals, reinstalls, or scope changes do not replace
-  CCEM's copy. CCEM disables, uninstalls, and updates remain local.
+- Each plugin ID is observed once, across all initially installed scopes. Newly
+  installed IDs are added automatically; CCEM disables and uninstalls stay local.
+  Scope changes do not silently enable an existing plugin in another project.
 - Import includes independent plugin files, required marketplace files and
   catalogue entries, registry paths, and missing plugin enablement settings.
   Existing CCEM entries win. Project/local installs retain their scope.
-- Source links confined to the official plugin store are materialized as files;
-  target links and escaping source paths are rejected. The launch environment
-  pins `CLAUDE_CODE_PLUGIN_CACHE_DIR` and clears external seed/ZIP overrides.
+- The compatibility importer first preserves independent copies. The matching
+  Rust/TypeScript link layer then adopts only unchanged imported copies. It keeps
+  old paths for existing sessions and creates real CCEM version directories with
+  direct code children symlinked to the official cache or local marketplace source.
+  `.in_use`, `.orphaned_at`, and ownership markers stay local. Whole version/store
+  symlinks are unsafe: the actual CLI writes bookkeeping into version roots.
+- `.ccem-plugin-links-v1.json` records managed paths or a local-choice tombstone.
+  Managed plugins follow official version/path changes; CCEM-owned updates or
+  replaced code stop following. Local catalogue paths are rebased while catalogue
+  files remain independent. Source paths escaping the store or exposing private
+  data, official registry/catalogue files, or runtime markers are rejected.
+  The launch environment pins `CLAUDE_CODE_PLUGIN_CACHE_DIR` and clears external
+  seed/ZIP overrides.
+- Official uninstall can retain cached files, so CCEM may keep using them until
+  they are removed. Actual source edits/deletions affect shared code. This is file
+  sharing, not synchronization of official enablement/uninstall state. Standard
+  `CLAUDE_PLUGIN_DATA` remains private; arbitrary writes into shared code are shared.
 - Credentials, plugin private data, other settings, and existing transcripts are
   not imported by this path. Metadata uses byte checks, atomic replacement, and
-  first-write backups in `.ccem-plugins-backup-v1`. A conflict defers the import
+  first-write backups in `.ccem-plugins-backup-v1` and
+  `.ccem-plugin-links-backup-v1`. A conflict defers the import
   without blocking an existing conversation; the next preparation can retry.
-- Native Claude sessions check again before an idle prompt. A changed ledger
+- Native Claude sessions check again before an idle prompt. Changed metadata or
+  a shared-code file fingerprint (excluding runtime bookkeeping)
   refreshes SDK settings and plugins on the same query/session. Foreground or
   background work defers refresh until a later idle prompt. Terminal sessions
   get imports on their next launch; Claude's `/reload-plugins` can reload an
   already running terminal session after files have been imported.
 
-An unchanged ledger/source registry takes a read-only fast path. Codex's optional
-isolation and project-local shared instructions/files are unchanged.
+Unchanged preparations perform no writes. Claude's cache lookup requires the
+private registry version to match the wrapper directory name (including its
+`.ccem-linked-<source hash>` suffix); the plugin's own manifest keeps its version.
+Windows needs permission to create symlinks; failure preserves independent copies
+and defers linking. Codex's optional isolation and project-local shared
+instructions/files are unchanged.
 
 ## Managed State (Arc-wrapped in main)
 
