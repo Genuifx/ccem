@@ -378,6 +378,15 @@ test('anchored annotations never fall back to first-match quote search', async (
 
   // Failed saves are reported instead of silently keeping stale state.
   assert.match(annotationsSource, /workspace\.annotationSaveFailed/);
+
+  // WKWebView page zoom inflates a textarea's scrollWidth, so annotation
+  // editors must clip horizontal overflow instead of surfacing a spurious
+  // scrollbar on selection.
+  const annotationTextareas = annotationsSource.match(/<textarea[\s\S]*?className="[^"]*"/g) ?? [];
+  assert.ok(annotationTextareas.length > 0, 'annotation textareas must be found');
+  for (const textarea of annotationTextareas) {
+    assert.match(textarea, /overflow-x-hidden/);
+  }
 });
 
 test('sent annotations persist within the turn and are evicted by the next accepted turn', async () => {

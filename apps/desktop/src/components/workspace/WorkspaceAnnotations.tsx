@@ -625,7 +625,7 @@ export function WorkspaceTranscriptSelection({
                 }
               }
             }}
-            className="min-h-[72px] w-full resize-none rounded-xl border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+            className="min-h-[72px] w-full resize-none overflow-x-hidden rounded-xl border border-input bg-transparent px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
           />
           <div className="mt-2 flex items-center justify-between gap-2">
             <button
@@ -699,7 +699,7 @@ export function WorkspaceTranscriptSelection({
                   }
                 }}
                 placeholder={t('workspace.selectionAnnotationPlaceholder')}
-                className="min-h-[72px] w-full resize-none rounded-xl border border-input bg-transparent px-3 py-2 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring/40"
+                className="min-h-[72px] w-full resize-none overflow-x-hidden rounded-xl border border-input bg-transparent px-3 py-2 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring/40"
               />
               <div className="flex items-center justify-between gap-2">
                 <span className="text-[10px] text-muted-foreground">
@@ -817,7 +817,7 @@ export function WorkspaceComposerAnnotations({
                           maxLength={4_000}
                           value={editingNote}
                           onChange={(event) => setEditingNote(event.target.value)}
-                          className="min-h-[64px] w-full resize-none rounded-lg border border-input bg-transparent px-2.5 py-2 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+                          className="min-h-[64px] w-full resize-none overflow-x-hidden rounded-lg border border-input bg-transparent px-2.5 py-2 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
                         />
                         <div className="flex justify-end gap-1">
                           <Button type="button" size="sm" variant="ghost" className="h-6 px-2 text-[10px]" onClick={() => setEditingId(null)}>
