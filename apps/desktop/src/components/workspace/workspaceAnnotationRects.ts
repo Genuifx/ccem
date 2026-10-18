@@ -97,18 +97,28 @@ function selectedTextSlices(range: Range, root: HTMLElement): SelectedTextSlice[
   return slices.filter((slice) => slice.startOffset < slice.endOffset);
 }
 
-export function visibleTextRangeRects(range: Range, root: HTMLElement): ViewportRect[] {
-  const rootRect = root.getBoundingClientRect();
+/**
+ * Rectangles for the selected text, clipped to the visible scroll viewport by
+ * default. Pass `clipBounds` to clip against another box — the annotation
+ * overlay passes the transcript content box so offscreen lines keep their
+ * highlight and scroll with the content instead of being dropped.
+ */
+export function visibleTextRangeRects(
+  range: Range,
+  root: HTMLElement,
+  clipBounds?: Pick<ViewportRect, 'left' | 'top' | 'right' | 'bottom'>,
+): ViewportRect[] {
+  const bounds = clipBounds ?? root.getBoundingClientRect();
   return selectedTextSlices(range, root).flatMap((slice) => {
     const textRange = root.ownerDocument.createRange();
     textRange.setStart(slice.node, slice.startOffset);
     textRange.setEnd(slice.node, slice.endOffset);
 
     return Array.from(textRange.getClientRects()).flatMap<ViewportRect>((rect) => {
-      const left = Math.max(rect.left, rootRect.left);
-      const top = Math.max(rect.top, rootRect.top);
-      const right = Math.min(rect.right, rootRect.right);
-      const bottom = Math.min(rect.bottom, rootRect.bottom);
+      const left = Math.max(rect.left, bounds.left);
+      const top = Math.max(rect.top, bounds.top);
+      const right = Math.min(rect.right, bounds.right);
+      const bottom = Math.min(rect.bottom, bounds.bottom);
       if (right <= left || bottom <= top) {
         return [];
       }

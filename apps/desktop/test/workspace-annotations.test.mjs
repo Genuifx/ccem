@@ -108,6 +108,67 @@ test('annotation highlights use selected text boxes instead of broad layout boxe
   assert.equal(visitedNodes.includes(unselectedTail), false);
 });
 
+test('annotation rects can clip to the content box so offscreen lines keep their highlight', async () => {
+  const { visibleTextRangeRects } = await importWorkspaceAnnotationRects();
+  const text = { nodeType: 3, data: 'selected text' };
+  const ownerDocument = {
+    defaultView: { NodeFilter: { SHOW_TEXT: 4 } },
+    createTreeWalker() {
+      let done = false;
+      return {
+        currentNode: null,
+        nextNode() {
+          if (done) return false;
+          done = true;
+          return true;
+        },
+      };
+    },
+    createRange() {
+      return {
+        setStart() {},
+        setEnd() {},
+        getClientRects() {
+          return [
+            { left: 10, top: -40, right: 110, bottom: -22, width: 100, height: 18 },
+            { left: 10, top: 200, right: 110, bottom: 218, width: 100, height: 18 },
+          ];
+        },
+      };
+    },
+  };
+  const root = {
+    nodeType: 1,
+    ownerDocument,
+    getBoundingClientRect() {
+      return { left: 0, top: 0, right: 300, bottom: 120, width: 300, height: 120 };
+    },
+  };
+  const range = {
+    commonAncestorContainer: text,
+    startContainer: text,
+    startOffset: 0,
+    endContainer: text,
+    endOffset: text.data.length,
+    intersectsNode: () => true,
+  };
+
+  // The default viewport clip drops both lines: one is above the scroll
+  // viewport, the other is below it.
+  assert.deepEqual(visibleTextRangeRects(range, root), []);
+
+  // Content-space clipping keeps them so the overlay can scroll natively.
+  assert.deepEqual(visibleTextRangeRects(range, root, {
+    left: 0,
+    top: -500,
+    right: 300,
+    bottom: 1_000,
+  }), [
+    { left: 10, top: -40, right: 110, bottom: -22, width: 100, height: 18 },
+    { left: 10, top: 200, right: 110, bottom: 218, width: 100, height: 18 },
+  ]);
+});
+
 test('normalizes selected transcript text without destroying meaningful line breaks', async () => {
   const { normalizeWorkspaceSelection } = await importWorkspaceAnnotations();
 
