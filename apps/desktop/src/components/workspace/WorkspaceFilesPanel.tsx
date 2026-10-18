@@ -238,6 +238,21 @@ export function WorkspaceFilesPanel({
       if (nextMode === 'diff') {
         const next = await loaders.current.onLoadDiff(path);
         if (requestSeq !== fileRequestSeqRef.current) return;
+        // A clean working tree hides committed session edits entirely. When the
+        // file has no uncommitted diff, fall through to its latest commit so
+        // selecting a changed file still produces a diff view.
+        if (scope === 'changes' && next.is_repo && !next.is_binary && next.lines.length === 0) {
+          try {
+            const committed = await loaders.current.onLoadDiff(path, { committed: true });
+            if (requestSeq !== fileRequestSeqRef.current) return;
+            if (committed.commit || committed.lines.length > 0) {
+              setDiff(committed);
+              return;
+            }
+          } catch {
+            // Keep the explicit clean-tree state and its source/commit actions.
+          }
+        }
         setDiff(next);
       } else if (mediaKindForPath(path) && loaders.current.onLoadMediaPreview) {
         const next = await loaders.current.onLoadMediaPreview(path);
