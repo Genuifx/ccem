@@ -277,6 +277,7 @@
     "sidePanelBrowser": "Browser",
     "sidePanelFiles": "Files",
     "sidePanelAgents": "Agents",
+    "sidePanelChanges": "Changes",
     "scopeSessionShort": "Session",
     "scopeBrowseShort": "Browse",
     "fileSources": "File sources",

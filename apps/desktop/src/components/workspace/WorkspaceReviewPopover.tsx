@@ -204,12 +204,11 @@ export function WorkspaceReviewPopover({
   const gatedOpen = useNativeSurfaceOcclusion(isOpen);
   const sidePanel = useWorkspaceSidePanel();
   const sidePanelTab = sidePanel?.tab ?? null;
-  const isFileScopeTab = sidePanelTab === 'git' || sidePanelTab === 'session' || sidePanelTab === 'browse';
+  const isFileScopeTab = sidePanelTab === 'changes' || sidePanelTab === 'browse';
   const detailPage = isFileScopeTab ? 'files' as const : sidePanelTab === 'agents' ? 'agents' as const : null;
   const externalScope = isFileScopeTab ? sidePanelTab : undefined;
   const openDetail = (page: WorkspaceReviewDetailPage) => {
-    // 'files' → default to 'git' scope; 'agents' stays as-is
-    sidePanel?.open(page === 'files' ? 'git' : page);
+    sidePanel?.open(page === 'files' ? 'changes' : page);
     onOpenChange(false);
   };
   const envColor = getEnvColorVar(session.env_name);

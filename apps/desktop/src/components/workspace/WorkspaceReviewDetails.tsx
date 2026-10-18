@@ -37,7 +37,7 @@ import type {
   SubagentMeta,
 } from '@/features/conversations/types';
 import { WorkspaceTranscriptList } from './WorkspaceTranscriptList';
-import type { WorkspaceReviewModel } from './workspaceReview';
+import type { ReviewSource, WorkspaceReviewModel } from './workspaceReview';
 import { getSubagentDisplayMeta, resolveSubagentSelection } from './workspaceSubagents';
 
 export type WorkspaceReviewDetailPage = 'files' | 'agents';
@@ -56,7 +56,7 @@ interface WorkspaceReviewDetailsProps {
   onRefreshGit?: () => void;
   isRefreshingGit?: boolean;
   /** When provided, the internal scope tab bar is hidden and this scope is used directly. */
-  externalScope?: 'git' | 'session' | 'browse';
+  externalScope?: 'changes' | 'browse';
 }
 
 const MEDIA_EXTENSION_KIND: Record<string, WorkspaceMediaKind> = {
@@ -116,6 +116,13 @@ function statusMark(status: string) {
     return { letter: 'R', className: 'text-primary' };
   }
   return { letter: 'M', className: 'text-warning' };
+}
+
+function sourceBadge(source: ReviewSource) {
+  if (source === 'git') return { label: 'G', className: 'bg-orange-500/10 text-orange-500' };
+  if (source === 'sdk') return { label: 'S', className: 'bg-blue-500/10 text-blue-500' };
+  // matched = both git and session
+  return { label: 'G·S', className: 'bg-purple-500/10 text-purple-500' };
 }
 
 function DiffPreview({
@@ -264,9 +271,9 @@ function FilesDetail({
   const fileLinks = useWorkspaceFileLinks();
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [mode, setMode] = useState<'preview' | 'source' | 'diff'>('preview');
-  const [internalScope, setInternalScope] = useState('git');
+  const [internalScope, setInternalScope] = useState('changes');
   const scope = externalScope ?? internalScope;
-  const [showList, setShowList] = useState(true);
+  const [showList, setShowList] = useState(!requestedPath);
   const [query, setQuery] = useState('');
   const [suggestions, setSuggestions] = useState<WorkspaceFileSuggestion[]>([]);
   const [searchError, setSearchError] = useState<string | null>(null);
@@ -287,6 +294,20 @@ function FilesDetail({
   const markdown = (path: string) => /\.(md|markdown|mdown)$/i.test(path);
 
   useEffect(() => () => { fileRequestSeqRef.current += 1; }, []);
+
+  // Reset view state when scope (tab) changes
+  const prevScopeRef = useRef(scope);
+  useEffect(() => {
+    if (prevScopeRef.current === scope) return;
+    prevScopeRef.current = scope;
+    setSelectedPath(null);
+    setShowList(true);
+    setQuery('');
+    setDiff(null);
+    setTextPreview(null);
+    setMediaPreview(null);
+    setError(null);
+  }, [scope]);
 
   const selectFile = useCallback(async (path: string, requestedMode?: 'preview' | 'source' | 'diff') => {
     const nextMode = requestedMode ?? (markdown(path) || mediaKindForPath(path) ? 'preview' : 'source');
@@ -366,8 +387,12 @@ function FilesDetail({
       else toast.error(message);
     }
   };
-  const files = model.changedFiles.filter((file) => scope === 'session' ? file.source !== 'git' : file.source !== 'sdk');
-  const gitSessionRows = files.filter((file) => file.path.toLowerCase().includes(query.toLowerCase())).map((file) => ({ ...file, isDir: false }));
+  // "changes" scope: show all changed files; "browse" scope: search/directory listing
+  const changesRows = scope === 'changes'
+    ? model.changedFiles
+        .filter((file) => file.path.toLowerCase().includes(query.toLowerCase()))
+        .map((file) => ({ ...file, isDir: false }))
+    : [];
   // For browse: show search results if query present, otherwise directory listing
   const browseHasQuery = scope === 'browse' && query.trim().length > 0;
   const browseListItems = browseHasQuery ? suggestions : browseDirEntries;
@@ -384,8 +409,7 @@ function FilesDetail({
         <div className="flex items-center gap-2 border-b border-border-subtle/50 px-3 py-2">
           <Tabs value={scope} onValueChange={setInternalScope} className="min-w-0 flex-1">
             <TabsList className="h-8 bg-transparent p-0" aria-label={t('workspace.fileSources')}>
-              <TabsTrigger value="git" className="px-2 text-[11px]">{t('workspace.filesGit')} {model.changedFiles.filter((file) => file.source !== 'sdk').length}</TabsTrigger>
-              <TabsTrigger value="session" className="px-2 text-[11px]">{t('workspace.filesSession')} {model.changedFiles.filter((file) => file.source !== 'git').length}</TabsTrigger>
+              <TabsTrigger value="changes" className="px-2 text-[11px]">{t('workspace.sidePanelChanges')} {model.changedFiles.length}</TabsTrigger>
               <TabsTrigger value="browse" className="px-2 text-[11px]">{t('workspace.filesBrowse')}</TabsTrigger>
             </TabsList>
           </Tabs>
@@ -413,7 +437,7 @@ function FilesDetail({
             </div>
           )}
           <ScrollArea className="min-h-0 flex-1">
-            {scope === 'git' && gitSnapshot?.error ? <p className="px-3 py-3 text-xs text-muted-foreground">{gitSnapshot.error}</p> : null}
+            {scope === 'changes' && gitSnapshot?.error ? <p className="px-3 py-3 text-xs text-muted-foreground">{gitSnapshot.error}</p> : null}
             {browseError && scope === 'browse' ? <p className="px-3 py-3 text-xs text-destructive">{browseError}</p> : null}
             {scope === 'browse' ? (
               browseIsLoading ? <p className="px-3 py-4 text-xs text-muted-foreground">{t('workspace.reviewLoading')}</p>
@@ -436,19 +460,22 @@ function FilesDetail({
                 </button>
               ))
             ) : (
-              gitSessionRows.length === 0 ? <p className="px-3 py-4 text-xs text-muted-foreground">{t('workspace.filesEmpty')}</p> : gitSessionRows.map((file) => (
+              changesRows.length === 0 ? <p className="px-3 py-4 text-xs text-muted-foreground">{t('workspace.filesEmpty')}</p> : changesRows.map((file) => (
                 <button key={file.path} type="button" data-review-file-row title={file.path} onClick={() => {
                   if (fileLinks) fileLinks.openFile(file.path);
                   else void selectFile(file.path, file.status === 'deleted' ? 'diff' : undefined);
-                }} className={cn('flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs', selectedPath === file.path ? 'bg-primary/10 text-primary' : 'hover:bg-surface-raised/55')}>
-                  <FileText className="h-3.5 w-3.5 shrink-0 opacity-50" /><span className="min-w-0 flex-1 truncate">{file.path}</span>
-                  {file.status ? <span className={cn('font-mono text-[10px]', statusMark(file.status).className)}>{statusMark(file.status).letter}</span> : null}
+                }} className={cn('flex w-full items-center gap-1.5 px-2 py-1.5 text-left text-xs', selectedPath === file.path ? 'bg-primary/10 text-primary' : 'hover:bg-surface-raised/55')}>
+                  <FileText className="h-3.5 w-3.5 shrink-0 opacity-50" />
+                  <span className="min-w-0 flex-1 truncate">{file.path}</span>
+                  <span className={cn('shrink-0 rounded px-1 py-px font-mono text-[9px] leading-none', sourceBadge(file.source).className)}>{sourceBadge(file.source).label}</span>
+                  {file.status ? <span className={cn('shrink-0 font-mono text-[10px]', statusMark(file.status).className)}>{statusMark(file.status).letter}</span> : null}
                 </button>
               ))
             )}
           </ScrollArea>
         </div> : null}
         <div className="flex min-w-0 flex-1 flex-col">
+          {/* Unified header: breadcrumb + mode tabs + actions in one bar */}
           <div className="flex h-9 shrink-0 items-center gap-1 border-b border-border-subtle/40 px-2">
             <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.filesToggleList')} aria-pressed={showList} onClick={() => setShowList(!showList)}><PanelLeft className="h-3.5 w-3.5" /></Button>
             {selectedPath ? (
@@ -468,22 +495,15 @@ function FilesDetail({
             ) : (
               <p className="min-w-0 flex-1 truncate text-xs text-muted-foreground">{t('workspace.sidePanelFiles')}</p>
             )}
-            {selectedPath ? <>
+            {selectedPath ? <div className="flex shrink-0 items-center gap-0.5 pl-2">
+              {(markdown(selectedPath) || mediaKindForPath(selectedPath)) && mode !== 'preview' ? <button type="button" onClick={() => void selectFile(selectedPath, 'preview')} className="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-surface-raised/60 hover:text-foreground">{t('workspace.filesPreview')}</button> : null}
+              {!mediaKindForPath(selectedPath) && mode !== 'source' ? <button type="button" onClick={() => void selectFile(selectedPath, 'source')} className="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-surface-raised/60 hover:text-foreground">{t('workspace.filesSource')}</button> : null}
+              {mode !== 'diff' ? <button type="button" onClick={() => void selectFile(selectedPath, 'diff')} className="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-surface-raised/60 hover:text-foreground">{t('workspace.filesDiff')}</button> : null}
               <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.filesRefreshPreview')} onClick={() => void selectFile(selectedPath, mode)}><RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} /></Button>
               <Button variant="ghost" size="icon" className="h-7 w-7 shrink-0" aria-label={t('workspace.reviewOpenInEditor')} onClick={() => void openInEditor(selectedPath)}><ExternalLink className="h-3.5 w-3.5" /></Button>
-            </> : null}
+            </div> : null}
           </div>
           {selectedPath ? <>
-            <div className="border-b border-border-subtle/40 px-3 py-1.5">
-              <p className="mb-1 truncate font-mono text-[10px] text-muted-foreground" title={selectedPath}>{selectedPath}</p>
-              <Tabs value={mode} onValueChange={(value) => void selectFile(selectedPath, value as typeof mode)}>
-                <TabsList className="h-7 bg-transparent p-0" aria-label={t('workspace.filesView')}>
-                  {markdown(selectedPath) || mediaKindForPath(selectedPath) ? <TabsTrigger className="px-2 py-1 text-[11px]" value="preview">{t('workspace.filesPreview')}</TabsTrigger> : null}
-                  {!mediaKindForPath(selectedPath) ? <TabsTrigger className="px-2 py-1 text-[11px]" value="source">{t('workspace.filesSource')}</TabsTrigger> : null}
-                  <TabsTrigger className="px-2 py-1 text-[11px]" value="diff">{t('workspace.filesDiff')}</TabsTrigger>
-                </TabsList>
-              </Tabs>
-            </div>
             <ScrollArea className="min-h-0 flex-1">
               {mode === 'diff' ? <DiffPreview diff={diff} loading={loading} error={error} />
                 : mediaKindForPath(selectedPath) ? <MediaPreview preview={mediaPreview} loading={loading} error={error} />

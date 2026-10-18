@@ -1,13 +1,13 @@
 import { createContext, useCallback, useContext, useMemo, useRef, useState, type PointerEventHandler, type ReactNode } from 'react';
-import { Bot, FolderSearch, GitBranch, FilePenLine, Globe, X } from '@/lib/lucide-react';
+import { Bot, FileDiff, FolderSearch, Globe, X } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { useLocale } from '@/locales';
 import { cn } from '@/lib/utils';
 
-export type WorkspaceSideTab = 'browser' | 'git' | 'session' | 'browse' | 'agents';
+export type WorkspaceSideTab = 'browser' | 'changes' | 'browse' | 'agents';
 
-export function isFileTab(tab: WorkspaceSideTab | null): tab is 'git' | 'session' | 'browse' {
-  return tab === 'git' || tab === 'session' || tab === 'browse';
+export function isFileTab(tab: WorkspaceSideTab | null): tab is 'changes' | 'browse' {
+  return tab === 'changes' || tab === 'browse';
 }
 
 interface SidePanelSelection {
@@ -61,19 +61,18 @@ export function useWorkspaceSidePanelController(ownerKey: string, browserVisible
   }), [ownerKey, tab, selection, target, open, revealBrowser, close]);
 }
 
-export function WorkspaceSidePanel({ controller, width, onResizeStart, onSelectBrowser, fileCounts, children }: {
+export function WorkspaceSidePanel({ controller, width, onResizeStart, onSelectBrowser, changeCount, children }: {
   controller: WorkspaceSidePanelController;
   width: number;
   onResizeStart: PointerEventHandler<HTMLDivElement>;
   onSelectBrowser: () => void;
-  fileCounts?: { git: number; session: number };
+  changeCount?: number;
   children: ReactNode;
 }) {
   const { t } = useLocale();
   const tabs: { key: WorkspaceSideTab; icon: typeof Globe; label: string; count?: number }[] = [
     { key: 'browser', icon: Globe, label: t('workspace.sidePanelBrowser') },
-    { key: 'git', icon: GitBranch, label: 'Git', count: fileCounts?.git },
-    { key: 'session', icon: FilePenLine, label: t('workspace.scopeSessionShort'), count: fileCounts?.session },
+    { key: 'changes', icon: FileDiff, label: t('workspace.sidePanelChanges'), count: changeCount },
     { key: 'browse', icon: FolderSearch, label: t('workspace.scopeBrowseShort') },
     { key: 'agents', icon: Bot, label: t('workspace.sidePanelAgents') },
   ];

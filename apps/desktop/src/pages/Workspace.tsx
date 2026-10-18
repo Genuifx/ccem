@@ -4005,10 +4005,7 @@ export function Workspace({
           width={browserPanelWidthPercent}
           onResizeStart={handleBrowserPanelResizeStart}
           onSelectBrowser={() => selectActiveBrowser(skillsContext.workingDir)}
-          fileCounts={workspaceReviewModel ? {
-            git: workspaceReviewModel.changedFiles.filter((f) => f.source !== 'sdk').length,
-            session: workspaceReviewModel.changedFiles.filter((f) => f.source !== 'git').length,
-          } : undefined}
+          changeCount={workspaceReviewModel?.changedFiles.length}
         >
         {Object.entries(browserTargetBySessionId).map(([sessionId, target]) => {
           if (!target) return null;
