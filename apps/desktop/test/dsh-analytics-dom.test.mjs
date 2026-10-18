@@ -183,7 +183,14 @@ const externalStubPlugin = {
         return {
           loader: 'js',
           contents: `
-            export function AnalyticsInsights() { return null; }
+            import { createElement } from 'react';
+            export function AnalyticsInsights({ refreshRevision, onRefresh }) {
+              return createElement('button', {
+                'data-testid': 'test-insights-refresh',
+                'data-refresh-revision': refreshRevision,
+                onClick: onRefresh,
+              }, 'Refresh chart');
+            }
             export function SharePosterDialog() { return null; }
             export function HeatmapCalendar() { return null; }
             export function AnalyticsSkeleton() { return null; }
@@ -335,6 +342,31 @@ test('Analytics hydrates cached summary before a slow fresh refresh resolves', a
 });
 
 // PLACEHOLDER_TESTS
+
+test('both refresh buttons retry model details even when the summary timestamp is unchanged', async () => {
+  const stats = makeUsageStats();
+  globalThis.__testInvokeHandler = (command) => Promise.resolve(command === 'get_usage_stats' ? stats : null);
+  const { dom, mod, React, ReactDOM, act } = await createTestEnv();
+  globalThis.__analyticsStore._reset();
+  globalThis.__analyticsStore._setState({ usageStats: stats });
+  globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+  const root = ReactDOM.createRoot(dom.window.document.getElementById('root'));
+  try {
+    await act(async () => { root.render(React.createElement(mod.Analytics)); await flush(); });
+    const chartRefresh = dom.window.document.querySelector('[data-testid="test-insights-refresh"]');
+    assert.ok(chartRefresh);
+    assert.equal(chartRefresh.dataset.refreshRevision, '0');
+    const headerRefresh = dom.window.document.querySelector('button[aria-label="Refresh"]');
+    for (const [index, button] of [headerRefresh, chartRefresh].entries()) {
+      await act(async () => { button.click(); await flush(); });
+      assert.equal(chartRefresh.dataset.refreshRevision, String(index + 1));
+    }
+  } finally {
+    await act(async () => root.unmount());
+    dom.window.close();
+    delete globalThis.__testInvokeHandler;
+  }
+});
 
 // ── Test: DSH filter button exists in filter list ──────────────────────────
 test('Analytics page includes DSH source filter button', async () => {

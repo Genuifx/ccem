@@ -1,5 +1,5 @@
 // apps/desktop/src/pages/Analytics.tsx
-import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react';
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Flame, RefreshCw, Share2, TrendingDown, TrendingUp } from '@/lib/lucide-react';
 import { ErrorBanner } from '@/components/ui/EmptyState';
@@ -151,13 +151,13 @@ export function Analytics() {
   const [isUsingMockData, setIsUsingMockData] = useState(() => isMockUsageStats(useAppStore.getState().usageStats));
   const [loadError, setLoadError] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [refreshRevision, setRefreshRevision] = useState(0);
   const [usageSource, setUsageSource] = useState<UsageSourceFilter>('all');
   const [localViewStats, setLocalViewStats] = useState<UsageStats | null>(null);
   const [showSharePoster, setShowSharePoster] = useState(false);
   const requestSeqRef = useRef(0);
   const analyticsMotionRef = useRef<HTMLDivElement>(null);
   const hasHydratedAnalyticsMotionRef = useRef(false);
-  const [, startTransition] = useTransition();
 
   const buildMilestones = useCallback((stats: UsageStats, streakDays: number) => {
     const totalTokens = stats.total.inputTokens + stats.total.outputTokens + stats.total.cacheReadTokens + stats.total.cacheCreationTokens;
@@ -271,6 +271,9 @@ export function Analytics() {
   const handleRefresh = useCallback(async () => {
     setIsRefreshing(true);
     await loadRealData(true);
+    // A refresh must also retry model details when the summary is unchanged
+    // (or failed), rather than relying solely on its lastUpdated timestamp.
+    setRefreshRevision((value) => value + 1);
     setIsRefreshing(false);
   }, [loadRealData]);
 
@@ -487,7 +490,7 @@ export function Analytics() {
                 type="button"
                 role="radio"
                 aria-checked={usageSource === source}
-                onClick={() => startTransition(() => setUsageSource(source))}
+                onClick={() => setUsageSource(source)}
                 className={cn(
                   'shrink-0 rounded-full px-4 py-1.5 text-sm transition-all duration-200',
                   'tracking-[-0.01em]',
@@ -580,6 +583,7 @@ export function Analytics() {
             enableModelBreakdown={!isUsingMockData}
             milestones={milestones}
             isRefreshing={isRefreshing}
+            refreshRevision={refreshRevision}
             onRefresh={handleRefresh}
           />
         </Suspense>
