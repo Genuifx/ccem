@@ -1,4 +1,7 @@
-//! CCEM-owned agent state. Official homes are read only during the first snapshot.
+//! CCEM-owned agent state. Official homes are read only for snapshots and imports.
+
+#[path = "agent_plugins.rs"]
+mod plugins;
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -209,6 +212,16 @@ fn ensure_agent_homes_for_mode_with_guard(
         .lock()
         .map_err(|_| "Agent home preparation lock poisoned")?;
     validate_agent_base(home, base)?;
+    let history_complete = migration_complete(&base.join("claude"))?
+        && (!isolated || migration_complete(&base.join("codex"))?);
+    let plugin_pending = match plugins::import_pending(&home.join(".claude"), &base.join("claude"))
+    {
+        Ok(pending) => pending,
+        Err(error) => {
+            eprintln!("Claude plugin import warning: {error}");
+            false
+        }
+    };
     if isolated && !migration_complete(&base.join("codex"))? {
         let source = resolve_existing_parent(codex_source)?;
         let target = resolve_existing_parent(base)?;
@@ -216,7 +229,6 @@ fn ensure_agent_homes_for_mode_with_guard(
             return Err("Shared Codex home must not overlap the CCEM isolated profile".into());
         }
     }
-    create_private_dir(base)?;
     let providers = if isolated {
         &["claude", "codex"][..]
     } else {
@@ -225,7 +237,6 @@ fn ensure_agent_homes_for_mode_with_guard(
     for provider in providers {
         let root = base.join(provider);
         validate_no_symlinks(&root)?;
-        create_private_dir(&root)?;
         let paths = if *provider == "claude" {
             CLAUDE_SNAPSHOT_PATHS
         } else {
@@ -240,13 +251,21 @@ fn ensure_agent_homes_for_mode_with_guard(
             "config.toml"
         }))?;
     }
-    if migration_complete(&base.join("claude"))?
-        && (!isolated || migration_complete(&base.join("codex"))?)
-    {
+    if history_complete && !plugin_pending {
         return Ok(());
     }
-
-    let _process_lock = MigrationLock::acquire(base)?;
+    create_private_dir(base)?;
+    for provider in providers {
+        create_private_dir(&base.join(provider))?;
+    }
+    let _process_lock = match MigrationLock::acquire(base) {
+        Ok(lock) => lock,
+        Err(error) if history_complete => {
+            eprintln!("Claude plugin import warning: {error}");
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     let pending = providers
         .iter()
         .copied()
@@ -272,6 +291,11 @@ fn ensure_agent_homes_for_mode_with_guard(
             CODEX_SNAPSHOT_PATHS,
             false,
         )?;
+    }
+    if plugin_pending {
+        if let Err(error) = plugins::import_plugins(&home.join(".claude"), &base.join("claude")) {
+            eprintln!("Claude plugin import warning: {error}");
+        }
     }
     Ok(())
 }

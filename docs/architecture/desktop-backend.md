@@ -10,6 +10,7 @@ Source: `apps/desktop/src-tauri/src/`
 | `runtime.rs` | ~2400 | `HeadlessRuntimeManager` — `claude -p` subprocess with stream-json |
 | `proxy_debug.rs` | ~2300 | Local HTTP proxy for API traffic recording |
 | `agent_home.rs` / `agent_profile.rs` | — | CCEM-owned Claude/Codex state roots, one-time legacy snapshot, launch environment and independent login |
+| `agent_plugins.rs` | — | Incremental import of official Claude plugins into the independent CCEM profile |
 | `history.rs` | ~1700 | Claude/Codex history projection from `~/.ccem/agents/{claude,codex}`, `/compact` segmentation |
 | `terminal.rs` | ~1450 | Terminal detection (iTerm2/Terminal.app), launch/focus/close/arrange |
 | `analytics.rs` | ~1400 | JSONL log parsing, incremental cache, LiteLLM pricing |
@@ -33,6 +34,35 @@ Source: `apps/desktop/src-tauri/src/`
 | `telegram/channel.rs` | — | Telegram channel message routing |
 | `weixin/mod.rs` | — | WeChat bridge, QR login |
 | `weixin/channel.rs` | — | WeChat channel message routing |
+
+## Claude plugin imports
+
+Preparing the Claude profile imports newly observed plugin IDs from the official
+`~/.claude` profile into `~/.ccem/agents/claude`. The CLI uses the matching importer
+in `packages/core/src/agent-plugins.ts`. The two paths share the profile migration
+lock and `.ccem-plugins-import-v1.json` ledger.
+
+- Each plugin ID is observed once, across all initially installed scopes. Later
+  official version changes, removals, reinstalls, or scope changes do not replace
+  CCEM's copy. CCEM disables, uninstalls, and updates remain local.
+- Import includes independent plugin files, required marketplace files and
+  catalogue entries, registry paths, and missing plugin enablement settings.
+  Existing CCEM entries win. Project/local installs retain their scope.
+- Source links confined to the official plugin store are materialized as files;
+  target links and escaping source paths are rejected. The launch environment
+  pins `CLAUDE_CODE_PLUGIN_CACHE_DIR` and clears external seed/ZIP overrides.
+- Credentials, plugin private data, other settings, and existing transcripts are
+  not imported by this path. Metadata uses byte checks, atomic replacement, and
+  first-write backups in `.ccem-plugins-backup-v1`. A conflict defers the import
+  without blocking an existing conversation; the next preparation can retry.
+- Native Claude sessions check again before an idle prompt. A changed ledger
+  refreshes SDK settings and plugins on the same query/session. Foreground or
+  background work defers refresh until a later idle prompt. Terminal sessions
+  get imports on their next launch; Claude's `/reload-plugins` can reload an
+  already running terminal session after files have been imported.
+
+An unchanged ledger/source registry takes a read-only fast path. Codex's optional
+isolation and project-local shared instructions/files are unchanged.
 
 ## Managed State (Arc-wrapped in main)
 

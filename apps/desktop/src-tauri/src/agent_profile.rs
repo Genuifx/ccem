@@ -51,6 +51,8 @@ fn is_codex_auth_key(key: &str) -> bool {
 }
 
 pub const AUTH_OVERRIDE_KEYS: &[&str] = &[
+    "CLAUDE_CODE_PLUGIN_SEED_DIR",
+    "CLAUDE_CODE_PLUGIN_USE_ZIP_CACHE",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
     "CLAUDE_CODE_OAUTH_CLIENT_ID",
@@ -143,6 +145,13 @@ pub fn apply_env(client: &str, env: &mut HashMap<String, String>) {
         );
     }
     env.insert("CLAUDE_CONFIG_DIR".into(), claude.clone());
+    env.insert(
+        "CLAUDE_CODE_PLUGIN_CACHE_DIR".into(),
+        agent_home::claude_home()
+            .join("plugins")
+            .to_string_lossy()
+            .into_owned(),
+    );
     env.insert("CLAUDE_SECURESTORAGE_CONFIG_DIR".into(), claude);
     env.insert("CODEX_HOME".into(), codex.clone());
     env.insert(
@@ -166,6 +175,8 @@ fn is_identity_override(key: &str) -> bool {
         || matches!(
             key,
             "CLAUDE_CODE_SESSION_ACCESS_TOKEN"
+                | "CLAUDE_CODE_PLUGIN_SEED_DIR"
+                | "CLAUDE_CODE_PLUGIN_USE_ZIP_CACHE"
                 | "CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR"
                 | "CLAUDE_CODE_ORGANIZATION_UUID"
                 | "CLAUDE_CODE_USER_EMAIL"
@@ -318,9 +329,18 @@ mod tests {
         let mut env = HashMap::from([
             (CODEX_ISOLATED_ENV.into(), "1".into()),
             ("CLAUDE_CONFIG_DIR".into(), "/official/claude".into()),
+            (
+                "CLAUDE_CODE_PLUGIN_CACHE_DIR".into(),
+                "/official/plugins".into(),
+            ),
             ("CODEX_HOME".into(), "/official/codex".into()),
             ("ANTHROPIC_AUTH_TOKEN".into(), "selected-token".into()),
             ("CLAUDE_CODE_OAUTH_TOKEN".into(), "inherited-oauth".into()),
+            (
+                "CLAUDE_CODE_PLUGIN_SEED_DIR".into(),
+                "/official/plugins".into(),
+            ),
+            ("CLAUDE_CODE_PLUGIN_USE_ZIP_CACHE".into(), "1".into()),
         ]);
         apply_env("claude", &mut env);
         assert_eq!(
@@ -332,12 +352,18 @@ mod tests {
             env["CLAUDE_CONFIG_DIR"]
         );
         assert_eq!(
+            env["CLAUDE_CODE_PLUGIN_CACHE_DIR"],
+            agent_home::claude_home().join("plugins").to_string_lossy()
+        );
+        assert_eq!(
             env["CODEX_HOME"],
             agent_home::isolated_codex_home().to_string_lossy()
         );
         assert_eq!(env["CODEX_SQLITE_HOME"], env["CODEX_HOME"]);
         assert_eq!(env["ANTHROPIC_AUTH_TOKEN"], "selected-token");
         assert_eq!(env["CLAUDE_CODE_OAUTH_TOKEN"], "");
+        assert_eq!(env["CLAUDE_CODE_PLUGIN_SEED_DIR"], "");
+        assert_eq!(env["CLAUDE_CODE_PLUGIN_USE_ZIP_CACHE"], "");
         assert_eq!(env["OPENAI_API_KEY"], "");
     }
 

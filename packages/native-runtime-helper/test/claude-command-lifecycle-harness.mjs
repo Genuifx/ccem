@@ -62,13 +62,16 @@ async function buildHelperWithWireMock(options = {}) {
             const resultDelayMs = ${JSON.stringify(resultDelayMs)};
             const terminalDelayMs = ${JSON.stringify(terminalDelayMs)};
             const idleDelayMs = ${JSON.stringify(idleDelayMs)};
+            const omitSessionStateNotifications = ${JSON.stringify(options.omitSessionStateNotifications ?? false)};
             const usageHangs = ${JSON.stringify(usageHangs)};
             const terminalState = ${JSON.stringify(terminalState)};
             const permissionModeDelays = ${JSON.stringify(permissionModeDelays)};
             const permissionCapabilityProbe = ${JSON.stringify(options.permissionCapabilityProbe ?? false)};
             const assistantUuidPrefix = ${JSON.stringify(assistantUuidPrefix)};
             const probe = (value) => { if (permissionCapabilityProbe) process.stdout.write(JSON.stringify({type:'permission_probe',...value})+'\\n'); };
+            const pluginProbe = (value) => { if (${JSON.stringify(options.pluginRefreshProbe ?? false)}) process.stdout.write(JSON.stringify({type:'plugin_probe',...value})+String.fromCharCode(10)); };
             let queryCount = 0;
+            let pluginReloadCount = 0;
             const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
             const fullCapabilities = ['msg_lifecycle_v1', 'interrupt_receipt_v1'];
             function initFrame(session_id, capabilities) {
@@ -103,6 +106,7 @@ async function buildHelperWithWireMock(options = {}) {
             }
             export function query({ prompt, options }) {
               const thisQuery = ++queryCount;
+              pluginProbe({stage:'created',query:thisQuery});
               probe({stage:'query',query:thisQuery,mode:options.permissionMode,allowBypass:options.allowDangerouslySkipPermissions});
               let closed = false;
               let localTurn = 0;
@@ -110,11 +114,19 @@ async function buildHelperWithWireMock(options = {}) {
               const interruptSignal = new Promise((resolve) => { signalInterrupt = resolve; });
               return {
                 close() {
+                  pluginProbe({stage:'closed',query:thisQuery});
                   probe({stage:'close',query:thisQuery});
                   closed = true;
                 },
                 async interrupt() { signalInterrupt(); },
                 async setModel() {},
+                async applyFlagSettings(settings) {
+                  pluginProbe({stage:'settings',query:thisQuery,settings});
+                },
+                async reloadPlugins() {
+                  pluginProbe({stage:'reload',query:thisQuery,attempt:++pluginReloadCount});
+                  if (pluginReloadCount <= ${JSON.stringify(options.pluginReloadFailures ?? 0)}) throw new Error('fixture plugin reload failure');
+                },
                 async setPermissionMode(mode) {
                   probe({stage:'set_mode',query:thisQuery,mode});
                   if (permissionCapabilityProbe && mode === 'bypassPermissions' && !options.allowDangerouslySkipPermissions) {
@@ -209,7 +221,9 @@ async function buildHelperWithWireMock(options = {}) {
                     }
 
                     yield { ...userMessage, session_id };
-                    yield { type: 'system', subtype: 'session_state_changed', state: 'running', session_id };
+                    if (!omitSessionStateNotifications) {
+                      yield { type: 'system', subtype: 'session_state_changed', state: 'running', session_id };
+                    }
                     if (assistantUuidPrefix) {
                       yield {
                         type: 'assistant',
@@ -239,6 +253,9 @@ async function buildHelperWithWireMock(options = {}) {
                     }
                     if (scenario === 'permission_background') {
                       yield {type:'system',subtype:'background_tasks_changed',tasks:[{task_id:'live-bg',description:'live tool'}]};
+                    }
+                    if (scenario === 'plugin_background') {
+                      yield {type:'system',subtype:'background_tasks_changed',tasks:localTurn===1?[{task_id:'live-bg',description:'live tool'}]:[]};
                     }
                     if (scenario === 'full_interrupt') {
                       await interruptSignal;
@@ -376,7 +393,11 @@ async function buildHelperWithWireMock(options = {}) {
                         session_id,
                       };
                     }
-                    yield { type: 'system', subtype: 'session_state_changed', state: 'idle', session_id };
+                    if (!omitSessionStateNotifications) {
+                      const state = scenario === 'plugin_requires_action' && localTurn === 1 ? 'requires_action' : 'idle';
+                      yield { type: 'system', subtype: 'session_state_changed', state, session_id };
+                    }
+                    pluginProbe({stage:'idle',query:thisQuery,turn:localTurn});
                   }
                   if (thisQuery === 1 && ${JSON.stringify(options.closedLoopDelayMs ?? 0)} > 0) {
                     await sleep(${JSON.stringify(options.closedLoopDelayMs ?? 0)});

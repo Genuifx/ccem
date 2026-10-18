@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { assertNoLegacyAgentWriters } from './agent-migration-processes';
+import { claudePluginImportPending, importClaudePlugins } from './agent-plugins';
 
 export type IsolatedAgentProvider = 'claude' | 'codex';
 type AgentEnvironment = Record<string, string | undefined>;
@@ -22,6 +23,7 @@ const IDENTITY_ENV_KEYS = [
   'CLAUDE_CODE_HFI_BEARER_TOKEN', 'CLAUDE_CODE_ENABLE_PROXY_AUTH_HELPER',
   'CLAUDE_CODE_CUSTOM_OAUTH_URL', 'CLAUDE_CODE_DESIGN_OAUTH_CLIENT_ID',
   'CLAUDE_CODE_REMOTE_SETTINGS_PATH', 'CLAUDE_CODE_MOCK_REMOTE_SETTINGS',
+  'CLAUDE_CODE_PLUGIN_SEED_DIR', 'CLAUDE_CODE_PLUGIN_USE_ZIP_CACHE',
   'USE_LOCAL_OAUTH', 'USE_STAGING_OAUTH', 'CLAUDE_LOCAL_OAUTH_API_BASE',
   'CODEX_ACCESS_TOKEN',
 ] as const;
@@ -47,6 +49,7 @@ export const INHERITED_AGENT_ENV_KEYS = [
   'CLAUDE_CODE_USE_ANTHROPIC_AWS', 'CLAUDE_CODE_USE_MANTLE',
   'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD', 'CLAUDE_CODE_USE_GATEWAY',
   'CLAUDE_CODE_API_KEY_HELPER_TTL_MS', 'CLAUDE_CONFIG_DIR', 'CLAUDE_SECURESTORAGE_CONFIG_DIR',
+  'CLAUDE_CODE_PLUGIN_CACHE_DIR',
   'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'CODEX_API_KEY', 'CODEX_HOME', 'CODEX_SQLITE_HOME',
   'AWS_BEARER_TOKEN_BEDROCK', 'ANTHROPIC_AWS_API_KEY', 'ANTHROPIC_FOUNDRY_API_KEY',
   'ANTHROPIC_FOUNDRY_AUTH_TOKEN', 'ANTHROPIC_FOUNDRY_RESOURCE',
@@ -119,6 +122,7 @@ export function getCcemAgentEnv(env: AgentEnvironment = process.env): Record<str
   return {
     CLAUDE_CONFIG_DIR: claude,
     CLAUDE_SECURESTORAGE_CONFIG_DIR: claude,
+    CLAUDE_CODE_PLUGIN_CACHE_DIR: path.join(claude, 'plugins'),
     CODEX_HOME: codex,
     CCEM_CODEX_ISOLATED: isolated ? '1' : '0',
     ...(isolated ? { CODEX_SQLITE_HOME: codex } : {}),
@@ -337,7 +341,7 @@ function acquireMigrationLock(base: string): () => void {
   throw new Error('Could not acquire CCEM agent migration lock');
 }
 
-/** Import session data once. Official settings, credentials, plugins and databases stay untouched. */
+/** Snapshot history once and import newly installed plugins as independent copies. */
 export function ensureCcemAgentHome(
   provider: IsolatedAgentProvider,
   env: AgentEnvironment = process.env,
@@ -346,33 +350,52 @@ export function ensureCcemAgentHome(
   const base = getCcemAgentBase(env);
   const root = getCcemIsolatedAgentHome(provider, env);
   validateAgentBase(base, env);
-  ensureRealDirectory(base);
-  ensureRealDirectory(root);
   for (const entry of LEGACY_ENTRIES[provider]) validateNoSymlinks(path.join(root, entry));
   validateNoSymlinks(path.join(root, provider === 'claude' ? '.claude.json' : 'config.toml'));
   const marker = path.join(root, AGENT_MIGRATION_MARKER);
-  if (migrationComplete(marker)) return root;
+  const source = provider === 'codex' ? getOfficialCodexHome(env) : path.join(userHome(env), '.claude');
+  const historyReady = migrationComplete(marker);
+  if (historyReady) {
+    if (provider !== 'claude') return root;
+    try { if (!claudePluginImportPending(source, root)) return root; } catch (error) {
+      console.warn(`CCEM plugin import deferred: ${(error as Error).message}`);
+      return root;
+    }
+  }
 
-  const unlock = acquireMigrationLock(base);
+  ensureRealDirectory(base);
+  ensureRealDirectory(root);
+  let unlock: () => void;
+  try { unlock = acquireMigrationLock(base); } catch (error) {
+    if (!historyReady) throw error;
+    console.warn(`CCEM plugin import deferred: ${(error as Error).message}`);
+    return root;
+  }
   try {
-    if (migrationComplete(marker)) return root;
-    const source = provider === 'codex' ? getOfficialCodexHome(env) : path.join(userHome(env), '.claude');
-    if (provider === 'codex') {
-      const resolvedBase = resolveExistingParent(base);
-      const resolvedSource = resolveExistingParent(source);
-      if (resolvedBase === resolvedSource || resolvedBase.startsWith(`${resolvedSource}${path.sep}`)
-        || resolvedSource.startsWith(`${resolvedBase}${path.sep}`)) {
-        throw new Error('CCEM Codex migration source must not overlap its isolated agent directory');
+    if (!migrationComplete(marker)) {
+      if (provider === 'codex') {
+        const resolvedBase = resolveExistingParent(base);
+        const resolvedSource = resolveExistingParent(source);
+        if (resolvedBase === resolvedSource || resolvedBase.startsWith(`${resolvedSource}${path.sep}`)
+          || resolvedSource.startsWith(`${resolvedBase}${path.sep}`)) {
+          throw new Error('CCEM Codex migration source must not overlap its isolated agent directory');
+        }
+      }
+      assertNoLegacyAgentWriters(provider, userHome(env), source, root);
+      const sourceStat = statIfPresent(source);
+      if (sourceStat?.isDirectory() && !sourceStat.isSymbolicLink()) {
+        for (const entry of LEGACY_ENTRIES[provider]) copyLegacyEntry(path.join(source, entry), path.join(root, entry));
+      }
+      if (provider === 'claude') writeNewFile(path.join(root, '.claude.json'), JSON.stringify({ hasCompletedOnboarding: true }));
+      writeNewFile(marker, JSON.stringify({ version: 1 }));
+      syncDirectory(root);
+    }
+    if (provider === 'claude') {
+      try { importClaudePlugins(source, root); } catch (error) {
+        // A broken plugin must not prevent an existing conversation from resuming.
+        console.warn(`CCEM plugin import deferred: ${(error as Error).message}`);
       }
     }
-    assertNoLegacyAgentWriters(provider, userHome(env), source, root);
-    const sourceStat = statIfPresent(source);
-    if (sourceStat?.isDirectory() && !sourceStat.isSymbolicLink()) {
-      for (const entry of LEGACY_ENTRIES[provider]) copyLegacyEntry(path.join(source, entry), path.join(root, entry));
-    }
-    if (provider === 'claude') writeNewFile(path.join(root, '.claude.json'), JSON.stringify({ hasCompletedOnboarding: true }));
-    writeNewFile(marker, JSON.stringify({ version: 1 }));
-    syncDirectory(root);
     return root;
   } finally {
     unlock();

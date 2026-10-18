@@ -10,6 +10,7 @@ import { buildIsolatedAgentEnv, getCcemAgentEnv, getCcemAgentHome } from '../../
 import { buildClaudeQueryEnv } from './claudeEnv';
 import { generateWorkspaceTitle } from './workspaceTitleQuery';
 import { resolveClaudeInterruptTimeoutMs } from './claudeInterruptTimeout';
+import { ClaudePluginRefresh } from './claudePluginRefresh';
 import { applyClaudePermissionModeToQuery } from './claudePermissionControl';
 import { resolveClaudePermissionRequestId, type ClaudeToolPermissionOptions } from './claudePermissionRequests';
 import { QuerySnapshotSlot, type QuerySnapshot } from './claudeQuerySnapshotSlot';
@@ -293,9 +294,13 @@ const claudeQuerySlot = new QuerySnapshotSlot<
   ReturnType<typeof query>,
   AsyncMessageQueue<SDKUserMessage>
 >();
+const claudePluginRefresh = new ClaudePluginRefresh({
+  warn: (line) => emitEvent({ type: 'stderr_line', line }),
+});
 let claudeConsumeLoop: Promise<void> | null = null;
 let claudeIdleCloseTimer: ReturnType<typeof setTimeout> | null = null;
 let claudeLastSessionState: 'idle' | 'running' | 'requires_action' | null = null;
+let claudeSessionStateObserved = false;
 let claudeInterruptRequested = false;
 let claudeInterruptCompletionEmitted = false;
 let runtimeTeardownPreparationId: string | null = null;
@@ -596,6 +601,7 @@ function beginClaudeLifecycleGeneration() {
   }
   clearClaudeLifecycleTerminalTimer();
   claudeLifecycleMode = 'negotiating';
+  claudeSessionStateObserved = false;
   claudeSdkCapabilities = undefined;
   claudePreInitLifecycleFrames = [];
   claudeLifecycleProtocolErrorKey = null;
@@ -3206,10 +3212,12 @@ async function consumeClaudeMessages() {
   const inputQueue = new AsyncMessageQueue<SDKUserMessage>();
   const handoffOwner: { snapshot: ClaudeQuerySnapshot | null } = { snapshot: null };
   const options = buildClaudeQueryOptions(handoffOwner);
+  const pluginRevision = claudePluginRefresh.prepareQuery();
   const claudeQuery = withSuppressedClaudeBypassShadowWarning(options, () => query({
     prompt: inputQueue,
     options,
   }));
+  claudePluginRefresh.trackQuery(claudeQuery, pluginRevision);
   claudeQueryBypassCapabilities.set(claudeQuery, {
     allowBypass: options.allowDangerouslySkipPermissions === true,
     admitted: false,
@@ -3625,6 +3633,7 @@ async function consumeClaudeMessages() {
           }
         }
 
+        claudeSessionStateObserved = true;
         claudeLastSessionState = message.state;
         if (
           message.state === 'idle'
@@ -3922,6 +3931,26 @@ async function ensureClaudePromptQueueReady() {
   await ensureClaudeSession();
 
   if (!claudeInputQueue) {
+    await ensureClaudeSession();
+  }
+
+  const snapshot = captureCurrentClaudeQuerySnapshot();
+  if (snapshot) {
+    await claudePluginRefresh.beforePrompt(snapshot.query, () =>
+      initCommand?.provider === 'claude'
+      && isCurrentClaudeQuerySnapshot(snapshot)
+      && !stopped && !runtimeTeardownPreparationId && !claudeInterruptRequested
+      && isClaudeForegroundAndSdkIdle()
+      // Some CLI versions emit command terminals without a session-state
+      // stream. Once a stream is observed, its explicit idle signal wins.
+      && (claudeSessionStateObserved
+        ? claudeLastSessionState === 'idle'
+        : claudeAuthoritativeTerminalCommandId !== null)
+      && !hasUnsettledClaudeBackgroundTasks());
+  }
+  // A settings/stop command can retire the captured query while refresh awaits.
+  // Reuse the replacement, or prepare its normal resume without closing anything.
+  if (!claudeInputQueue && !stopped && !runtimeTeardownPreparationId) {
     await ensureClaudeSession();
   }
 }

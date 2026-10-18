@@ -5859,7 +5859,7 @@ var sd = v(function(iB) {
     if (o.$async) r.throw(Ae._`new ${e.ValidationError}(${t})`);
     else r.assign(Ae._`${n}.errors`, t), r.return(false);
   }
-  var fs7 = { keyword: new Ae.Name("keyword"), schemaPath: new Ae.Name("schemaPath"), params: new Ae.Name("params"), propertyName: new Ae.Name("propertyName"), message: new Ae.Name("message"), schema: new Ae.Name("schema"), parentSchema: new Ae.Name("parentSchema") };
+  var fs10 = { keyword: new Ae.Name("keyword"), schemaPath: new Ae.Name("schemaPath"), params: new Ae.Name("params"), propertyName: new Ae.Name("propertyName"), message: new Ae.Name("message"), schema: new Ae.Name("schema"), parentSchema: new Ae.Name("parentSchema") };
   function oB(e, t, r) {
     let { createErrors: n } = e.it;
     if (n === false) return Ae._`{}`;
@@ -5876,13 +5876,13 @@ var sd = v(function(iB) {
   function XAe({ keyword: e, it: { errSchemaPath: t } }, { schemaPath: r, parentSchema: n }) {
     let o = n ? t : Ae.str`${t}/${e}`;
     if (r) o = Ae.str`${o}${(0, H_.getErrorPath)(r, H_.Type.Str)}`;
-    return [fs7.schemaPath, o];
+    return [fs10.schemaPath, o];
   }
   function QAe(e, { params: t, message: r }, n) {
     let { keyword: o, data: i, schemaValue: s, it: a } = e, { opts: c, propertyName: u, topSchemaRef: d, schemaPath: f } = a;
-    if (n.push([fs7.keyword, o], [fs7.params, typeof t == "function" ? t(e) : t || Ae._`{}`]), c.messages) n.push([fs7.message, typeof r == "function" ? r(e) : r]);
-    if (c.verbose) n.push([fs7.schema, s], [fs7.parentSchema, Ae._`${d}${f}`], [rr.default.data, i]);
-    if (u) n.push([fs7.propertyName, u]);
+    if (n.push([fs10.keyword, o], [fs10.params, typeof t == "function" ? t(e) : t || Ae._`{}`]), c.messages) n.push([fs10.message, typeof r == "function" ? r(e) : r]);
+    if (c.verbose) n.push([fs10.schema, s], [fs10.parentSchema, Ae._`${d}${f}`], [rr.default.data, i]);
+    if (u) n.push([fs10.propertyName, u]);
   }
 });
 var uB = v(function(cB) {
@@ -27740,15 +27740,568 @@ var Codex = class {
 };
 
 // src/index.ts
-import { randomUUID as randomUUID4 } from "node:crypto";
+import { randomUUID as randomUUID6 } from "node:crypto";
 import { createInterface } from "node:readline";
 import process5 from "node:process";
 
 // ../core/src/agent-home.ts
-import fs2 from "node:fs";
+import fs4 from "node:fs";
 import os2 from "node:os";
+import path5 from "node:path";
+import { randomUUID as randomUUID2 } from "node:crypto";
+
+// ../core/src/agent-migration-processes.ts
+import fs2 from "node:fs";
 import path3 from "node:path";
+import { execFileSync } from "node:child_process";
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error48) {
+    return error48.code !== "ESRCH";
+  }
+}
+function samePath(left, right) {
+  const normalize2 = (value) => {
+    try {
+      value = fs2.realpathSync(value);
+    } catch {
+      value = path3.resolve(value);
+    }
+    return process.platform === "win32" ? value.toLowerCase() : value;
+  };
+  return normalize2(left) === normalize2(right);
+}
+function providerCommand(provider, executable, command) {
+  const name = path3.basename(executable).toLowerCase().replace(/\.exe$/, "");
+  if (name === provider) return true;
+  if (!["node", "bun", "ccem-node"].includes(name) && !name.startsWith("ccem-node-")) return false;
+  if (/(?:^|[\\/\s])native-runtime-helper\.mjs(?:[\s"']|$)/.test(command)) return true;
+  return provider === "claude" ? /@anthropic-ai[\\/]claude-code[\\/]cli\.js(?:[\s"']|$)/.test(command) : /@openai[\\/]codex[\\/]bin[\\/]codex\.js(?:[\s"']|$)/.test(command);
+}
+function candidateExecutable(executable) {
+  const name = path3.basename(executable).toLowerCase().replace(/\.exe$/, "");
+  return ["claude", "codex", "node", "bun", "ccem-node"].includes(name) || name.startsWith("ccem-node-");
+}
+function ps2(args) {
+  return execFileSync("ps", args, {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: 5e3,
+    maxBuffer: 16 * 1024 * 1024
+  }).trimEnd();
+}
+function parseEnvironment(value) {
+  const result = {};
+  const boundaries = [...value.matchAll(/(?:^|\s)([A-Za-z_][A-Za-z0-9_]*)=/g)];
+  for (let i = 0; i < boundaries.length; i += 1) {
+    const entry = boundaries[i];
+    if (!["HOME", "USERPROFILE", "CCEM_RUNTIME_ID", "CCEM_SESSION_ID", "CLAUDE_CONFIG_DIR", "CODEX_HOME"].includes(entry[1])) continue;
+    const start = entry.index + entry[0].length;
+    const end = i + 1 < boundaries.length ? boundaries[i + 1].index : value.length;
+    result[entry[1]] = value.slice(start, end).trim();
+  }
+  return result;
+}
+function migrationBlocked(provider, pid, unknownHome = false) {
+  const reason = unknownHome ? `Cannot verify the agent home of a live CCEM ${provider} session (PID ${pid}).` : `A live CCEM ${provider} session (PID ${pid}) is still writing legacy history.`;
+  throw new Error(`${reason} Finish that session and retry to preserve its latest messages before isolation.`);
+}
+function persistedProcesses(home) {
+  const result = [];
+  for (const name of ["sessions.json", "runtime-state.json"]) {
+    const file2 = path3.join(home, ".ccem", name);
+    let value;
+    try {
+      const stat2 = fs2.lstatSync(file2);
+      if (!stat2.isFile() || stat2.isSymbolicLink()) continue;
+      value = JSON.parse(fs2.readFileSync(file2, "utf8"));
+    } catch (error48) {
+      if (error48.code === "ENOENT") continue;
+      throw new Error("Cannot inspect saved CCEM sessions before migration; retry when their state is available");
+    }
+    const rows = Array.isArray(value) ? value : value?.sessions;
+    for (const raw of Array.isArray(rows) ? rows : []) {
+      if (!raw || typeof raw !== "object") continue;
+      const row = raw;
+      if (!Number.isSafeInteger(row.pid) || row.pid <= 0 || row.pid === process.pid) continue;
+      if (typeof row.status === "string" && row.status !== "running") continue;
+      if (row.summary) continue;
+      result.push({
+        pid: row.pid,
+        client: typeof row.client === "string" ? row.client : void 0,
+        jsonlPath: typeof row.jsonl_path === "string" ? row.jsonl_path : void 0
+      });
+    }
+  }
+  return result;
+}
+function persistedPathIsLegacy(record3, provider, source) {
+  if (record3.client && record3.client !== provider) return false;
+  if (!record3.jsonlPath) return true;
+  const roots = provider === "claude" ? ["projects"] : ["sessions", "archived_sessions"];
+  const candidate = path3.resolve(record3.jsonlPath);
+  return roots.some((name) => {
+    const directory = path3.resolve(source, name);
+    const relative = path3.relative(directory, candidate);
+    return relative !== "" && relative !== ".." && !relative.startsWith(`..${path3.sep}`) && !path3.isAbsolute(relative);
+  });
+}
+function assertWindowsProcesses(provider, home, source) {
+  for (const record3 of persistedProcesses(home)) {
+    if (!persistedPathIsLegacy(record3, provider, source) || !processAlive(record3.pid)) continue;
+    let command;
+    try {
+      const output = execFileSync(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          `Get-CimInstance Win32_Process -Filter 'ProcessId = ${record3.pid}' | Select-Object Name,CommandLine | ConvertTo-Json -Compress`
+        ],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5e3 }
+      );
+      command = JSON.parse(output);
+    } catch {
+      if (processAlive(record3.pid)) migrationBlocked(provider, record3.pid, true);
+      continue;
+    }
+    if (!command || !providerCommand(provider, command.Name || "", command.CommandLine || "")) continue;
+    migrationBlocked(provider, record3.pid, !record3.jsonlPath);
+  }
+}
+function assertNoLegacyAgentWriters(provider, home, source, destination) {
+  if (process.platform === "win32") {
+    assertWindowsProcesses(provider, home, source);
+    return;
+  }
+  let listing;
+  try {
+    listing = ps2(["-ax", "-o", "pid=,comm="]);
+  } catch {
+    throw new Error("Cannot inspect running CCEM sessions before migration; finish legacy sessions and retry");
+  }
+  const candidates = /* @__PURE__ */ new Map();
+  for (const row of listing.split("\n")) {
+    const match = row.match(/^\s*(\d+)\s+(.+)$/);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    const executable = match[2];
+    if (pid === process.pid || !candidateExecutable(executable)) continue;
+    candidates.set(pid, executable);
+  }
+  if (candidates.size === 0) return;
+  const commands = /* @__PURE__ */ new Map();
+  try {
+    const rows = ps2(["ww", "-p", [...candidates.keys()].join(","), "-o", "pid=,command="]);
+    for (const row of rows.split("\n")) {
+      const match = row.match(/^\s*(\d+)\s+(.+)$/);
+      if (match) commands.set(Number(match[1]), match[2]);
+    }
+  } catch {
+  }
+  for (const [pid, executable] of candidates) {
+    const command = commands.get(pid);
+    if (!command) {
+      if (processAlive(pid) && persistedProcesses(home).some((record3) => record3.pid === pid && persistedPathIsLegacy(record3, provider, source))) {
+        migrationBlocked(provider, pid, true);
+      }
+      continue;
+    }
+    if (!providerCommand(provider, executable, command)) continue;
+    let withEnvironment;
+    try {
+      withEnvironment = ps2(["eww", "-p", String(pid), "-o", "command="]);
+    } catch {
+      if (processAlive(pid) && persistedProcesses(home).some((record3) => record3.pid === pid && persistedPathIsLegacy(record3, provider, source))) {
+        migrationBlocked(provider, pid, true);
+      }
+      continue;
+    }
+    const env = withEnvironment.startsWith(command) ? parseEnvironment(withEnvironment.slice(command.length).trimStart()) : {};
+    if (Object.keys(env).length === 0 && processAlive(pid) && persistedProcesses(home).some((record3) => record3.pid === pid && persistedPathIsLegacy(record3, provider, source))) {
+      migrationBlocked(provider, pid, true);
+    }
+    if (!env.CCEM_RUNTIME_ID?.trim() && !env.CCEM_SESSION_ID?.trim()) continue;
+    const sourceHome = env.HOME || env.USERPROFILE || home;
+    let effectiveHome = provider === "claude" ? env.CLAUDE_CONFIG_DIR || path3.join(sourceHome, ".claude") : env.CODEX_HOME || path3.join(sourceHome, ".codex");
+    if (/^~[\\/]/.test(effectiveHome)) effectiveHome = path3.join(sourceHome, effectiveHome.slice(2));
+    if (samePath(effectiveHome, source) && !samePath(effectiveHome, destination) && processAlive(pid)) {
+      migrationBlocked(provider, pid);
+    }
+  }
+}
+
+// ../core/src/agent-plugins.ts
+import fs3 from "node:fs";
+import path4 from "node:path";
+import { randomUUID } from "node:crypto";
+var CLAUDE_PLUGIN_IMPORT_LEDGER = ".ccem-plugins-import-v1.json";
+function object(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid ${label}`);
+  return value;
+}
+function stat(file2) {
+  try {
+    return fs3.lstatSync(file2);
+  } catch (error48) {
+    if (error48.code === "ENOENT") return void 0;
+    throw error48;
+  }
+}
+function noLinks(file2) {
+  let current = path4.parse(file2).root;
+  for (const part of file2.slice(current.length).split(path4.sep).filter(Boolean)) {
+    current = path4.join(current, part);
+    if (stat(current)?.isSymbolicLink()) throw new Error(`Plugin import cannot use a destination symlink: ${current}`);
+  }
+}
+function readDocument(file2, fallback = {}) {
+  noLinks(file2);
+  const info = stat(file2);
+  if (!info) return { file: file2, value: structuredClone(fallback) };
+  if (!info.isFile()) throw new Error(`Plugin metadata is not a file: ${file2}`);
+  const before = fs3.readFileSync(file2, "utf8");
+  return { file: file2, before, value: object(JSON.parse(before), `plugin metadata: ${file2}`) };
+}
+function pluginId(id) {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*@[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(id)) {
+    throw new Error("Invalid plugin identity");
+  }
+}
+function identity(value) {
+  const row = object(value, "plugin install");
+  if (typeof row.scope !== "string" || !["user", "project", "local"].includes(row.scope)) throw new Error("Invalid plugin scope");
+  const projectPath = row.projectPath ?? null;
+  if (row.scope === "user" ? projectPath !== null : typeof projectPath !== "string" || !path4.isAbsolute(projectPath) || projectPath.split(/[\\/]/).includes("..")) {
+    throw new Error("Invalid plugin project scope");
+  }
+  return { scope: row.scope, projectPath };
+}
+function same(a, b) {
+  return a.scope === b.scope && a.projectPath === b.projectPath;
+}
+function registry(document2) {
+  if (document2.value.version !== 2) throw new Error("Unsupported Claude plugin registry version");
+  const plugins = object(document2.value.plugins, "Claude plugin registry");
+  for (const [id, rows] of Object.entries(plugins)) {
+    pluginId(id);
+    if (!Array.isArray(rows)) throw new Error("Invalid plugin installations");
+    const seen = [];
+    for (const row of rows) {
+      const key = identity(row);
+      if (seen.some((old) => same(old, key))) throw new Error("Duplicate plugin installation identity");
+      seen.push(key);
+    }
+  }
+  return plugins;
+}
+function readLedger(target) {
+  const document2 = readDocument(path4.join(target, CLAUDE_PLUGIN_IMPORT_LEDGER), { version: 1, seen: {} });
+  if (document2.value.version !== 1 || Object.keys(document2.value).some((key) => !["version", "seen"].includes(key))) {
+    throw new Error("Unsupported Claude plugin import ledger");
+  }
+  for (const [id, rows] of Object.entries(object(document2.value.seen, "plugin import ledger"))) {
+    pluginId(id);
+    if (!Array.isArray(rows) || rows.length === 0) throw new Error("Invalid plugin import ledger");
+    const parsed = [];
+    for (const row of rows) {
+      if (!Object.hasOwn(object(row, "plugin import identity"), "projectPath") || Object.keys(row).some((key) => !["scope", "projectPath"].includes(key))) {
+        throw new Error("Invalid plugin import identity");
+      }
+      const item = identity(row);
+      if (parsed.some((old) => same(old, item))) throw new Error("Duplicate plugin import identity");
+      parsed.push(item);
+    }
+  }
+  return document2;
+}
+function readSource(source) {
+  return readDocument(path4.join(source, "plugins", "installed_plugins.json"), { version: 2, plugins: {} });
+}
+function claudePluginImportPending(source, target) {
+  const installed = registry(readSource(source));
+  const ledger = readLedger(target).value;
+  return Object.entries(installed).some(([id, rows]) => rows.length > 0 && !Object.hasOwn(ledger.seen, id));
+}
+function contained(root, file2) {
+  const relative = path4.relative(root, file2);
+  return relative !== "" && !relative.startsWith(`..${path4.sep}`) && relative !== ".." && !path4.isAbsolute(relative);
+}
+function rejectPrivateData(root, file2) {
+  if (path4.relative(root, file2).split(path4.sep)[0] === "data") {
+    throw new Error("Plugin import cannot copy private plugin data");
+  }
+}
+function relocated(value, source, target) {
+  if (typeof value !== "string" || !path4.isAbsolute(value)) throw new Error("Plugin installation path must be absolute");
+  const resolved = path4.resolve(value);
+  if (!contained(source, resolved)) throw new Error("Plugin path escapes the official plugin store");
+  rejectPrivateData(source, resolved);
+  return { source: resolved, target: path4.join(target, path4.relative(source, resolved)) };
+}
+function planCopy(source, target, sourceRoot, copies, excluded = /* @__PURE__ */ new Set(), ancestors = /* @__PURE__ */ new Set()) {
+  if (excluded.has(target)) return;
+  const resolved = fs3.realpathSync(source);
+  if (resolved !== sourceRoot && !contained(sourceRoot, resolved)) throw new Error("Plugin symlink escapes the official plugin store");
+  rejectPrivateData(sourceRoot, resolved);
+  if (ancestors.has(resolved)) throw new Error("Plugin symlink cycle");
+  noLinks(target);
+  const info = fs3.statSync(resolved);
+  const existing = stat(target);
+  if (info.isDirectory()) {
+    if (existing && !existing.isDirectory()) throw new Error("Plugin destination directory conflicts with a file");
+    copies.push({ source: resolved, target, directory: true, mode: 448 });
+    const next = new Set(ancestors).add(resolved);
+    for (const name of fs3.readdirSync(resolved).sort()) planCopy(path4.join(resolved, name), path4.join(target, name), sourceRoot, copies, excluded, next);
+  } else if (info.isFile()) {
+    if (existing) {
+      if (!existing.isFile() || !fs3.readFileSync(target).equals(fs3.readFileSync(resolved))) {
+        throw new Error("Existing CCEM plugin files differ; keeping the CCEM copy");
+      }
+      return;
+    }
+    copies.push({ source: resolved, target, directory: false, mode: 384 | info.mode & 73 });
+  } else {
+    throw new Error("Plugin asset is not a regular file or directory");
+  }
+}
+function privateDirectory(directory) {
+  noLinks(directory);
+  fs3.mkdirSync(directory, { recursive: true, mode: 448 });
+}
+function publishCopy(copy) {
+  noLinks(copy.target);
+  if (copy.directory) {
+    privateDirectory(copy.target);
+    return;
+  }
+  privateDirectory(path4.dirname(copy.target));
+  const temporary = `${copy.target}.ccem-${randomUUID()}.tmp`;
+  let input;
+  let output;
+  try {
+    input = fs3.openSync(copy.source, fs3.constants.O_RDONLY | (fs3.constants.O_NOFOLLOW ?? 0));
+    const before = fs3.fstatSync(input);
+    if (!before.isFile()) throw new Error("Plugin source changed during import");
+    output = fs3.openSync(temporary, "wx", copy.mode);
+    const buffer = Buffer.alloc(1024 * 1024);
+    let remaining = before.size;
+    while (remaining > 0) {
+      const count2 = fs3.readSync(input, buffer, 0, Math.min(buffer.length, remaining), null);
+      if (!count2) throw new Error("Plugin source changed during import");
+      let offset = 0;
+      while (offset < count2) offset += fs3.writeSync(output, buffer, offset, count2 - offset);
+      remaining -= count2;
+    }
+    const after = fs3.fstatSync(input);
+    if (after.size !== before.size || after.mtimeMs !== before.mtimeMs) throw new Error("Plugin source changed during import");
+    fs3.fsyncSync(output);
+    fs3.closeSync(output);
+    output = void 0;
+    noLinks(copy.target);
+    try {
+      fs3.linkSync(temporary, copy.target);
+    } catch (error48) {
+      if (error48.code !== "EEXIST" || !stat(copy.target)?.isFile() || !fs3.readFileSync(copy.target).equals(fs3.readFileSync(temporary))) throw error48;
+    }
+  } finally {
+    if (input !== void 0) fs3.closeSync(input);
+    if (output !== void 0) fs3.closeSync(output);
+    fs3.rmSync(temporary, { force: true });
+  }
+}
+function unchanged(document2) {
+  noLinks(document2.file);
+  const current = stat(document2.file) ? fs3.readFileSync(document2.file, "utf8") : void 0;
+  if (current !== document2.before) throw new Error("Plugin metadata changed during import; retry later");
+}
+function publishDocument(document2, target) {
+  const contents = `${JSON.stringify(document2.value, null, 2)}
+`;
+  if (document2.before !== void 0 && JSON.stringify(JSON.parse(document2.before)) === JSON.stringify(document2.value)) return;
+  unchanged(document2);
+  privateDirectory(path4.dirname(document2.file));
+  if (document2.before !== void 0) {
+    const backup = path4.join(target, ".ccem-plugins-backup-v1", path4.relative(target, document2.file));
+    privateDirectory(path4.dirname(backup));
+    noLinks(backup);
+    const existing = stat(backup);
+    if (existing && !existing.isFile()) throw new Error("Plugin metadata backup is not a file");
+    if (!existing) fs3.writeFileSync(backup, document2.before, { flag: "wx", mode: 384 });
+  }
+  const temporary = `${document2.file}.ccem-${randomUUID()}.tmp`;
+  try {
+    const fd = fs3.openSync(temporary, "wx", 384);
+    try {
+      fs3.writeFileSync(fd, contents);
+      fs3.fsyncSync(fd);
+    } finally {
+      fs3.closeSync(fd);
+    }
+    unchanged(document2);
+    fs3.renameSync(temporary, document2.file);
+    document2.before = contents;
+  } finally {
+    fs3.rmSync(temporary, { force: true });
+  }
+}
+function importClaudePlugins(sourceHome, targetHome) {
+  const sourceRegistry = readSource(sourceHome);
+  const sourcePlugins = registry(sourceRegistry);
+  const ledger = readLedger(targetHome);
+  const pending = Object.entries(sourcePlugins).flatMap(([id, installs]) => installs.filter(() => !Object.hasOwn(ledger.value.seen, id)).map((install) => ({ id, install, identity: identity(install) })));
+  if (!pending.length) return { imported: 0, observed: 0 };
+  noLinks(path4.join(sourceHome, "plugins"));
+  const sourceRoot = fs3.realpathSync(path4.join(sourceHome, "plugins"));
+  const targetRoot = path4.join(targetHome, "plugins");
+  if (sourceRoot === path4.resolve(targetRoot) || contained(sourceRoot, path4.resolve(targetRoot)) || contained(path4.resolve(targetRoot), sourceRoot)) throw new Error("Plugin stores must not overlap");
+  noLinks(targetRoot);
+  const sourceSettings = readDocument(path4.join(sourceHome, "settings.json"));
+  const sourceMarkets = readDocument(path4.join(sourceRoot, "known_marketplaces.json"));
+  const targetRegistry = readDocument(path4.join(targetRoot, "installed_plugins.json"), { version: 2, plugins: {} });
+  const targetPlugins = registry(targetRegistry);
+  const targetSettings = readDocument(path4.join(targetHome, "settings.json"));
+  const targetMarkets = readDocument(path4.join(targetRoot, "known_marketplaces.json"));
+  const existingMarketplaces = new Set(Object.keys(targetMarkets.value));
+  const sourceCatalogues = /* @__PURE__ */ new Map();
+  const targetCatalogues = /* @__PURE__ */ new Map();
+  const catalogueFiles = /* @__PURE__ */ new Set();
+  const copies = [];
+  function sourceCatalogue(location) {
+    const file2 = fs3.realpathSync(path4.join(location, ".claude-plugin/marketplace.json"));
+    if (!contained(sourceRoot, file2)) throw new Error("Marketplace manifest escapes the official plugin store");
+    rejectPrivateData(sourceRoot, file2);
+    const document2 = sourceCatalogues.get(file2) ?? readDocument(file2);
+    if (!Array.isArray(document2.value.plugins)) throw new Error("Invalid plugin marketplace catalogue");
+    sourceCatalogues.set(file2, document2);
+    return document2;
+  }
+  function localCatalogueEntry(entry, from, to2) {
+    const local = typeof entry.source === "string" ? entry.source : entry.source && typeof entry.source === "object" && ["directory", "file"].includes(String(entry.source.source)) ? entry.source.path : void 0;
+    if (local === void 0) return;
+    if (typeof local !== "string") throw new Error("Invalid local marketplace plugin source");
+    const original = path4.resolve(from, local);
+    const destination = path4.isAbsolute(local) ? relocated(local, sourceRoot, targetRoot).target : path4.resolve(to2, local);
+    if (!contained(sourceRoot, original) || !contained(targetRoot, destination)) throw new Error("Local marketplace source escapes its plugin store");
+    rejectPrivateData(targetRoot, destination);
+    planCopy(original, destination, sourceRoot, copies, catalogueFiles);
+    if (path4.isAbsolute(local)) {
+      if (typeof entry.source === "string") entry.source = destination;
+      else entry.source.path = destination;
+    }
+  }
+  let imported = 0;
+  const visitedIds = /* @__PURE__ */ new Set();
+  for (const { id, install, identity: key } of pending) {
+    if (!targetPlugins[id]?.some((existing) => same(identity(existing), key))) {
+      const location = relocated(install.installPath, sourceRoot, targetRoot);
+      planCopy(location.source, location.target, sourceRoot, copies);
+      (targetPlugins[id] ??= []).push({ ...install, installPath: location.target });
+      imported += 1;
+    }
+    if (!visitedIds.has(id)) {
+      visitedIds.add(id);
+      const marketplace = id.split("@")[1];
+      if (!Object.hasOwn(sourceMarkets.value, marketplace) && !Object.hasOwn(targetMarkets.value, marketplace)) {
+        throw new Error(`Plugin is missing its marketplace registration: ${id}`);
+      }
+      if (Object.hasOwn(sourceMarkets.value, marketplace) && !Object.hasOwn(targetMarkets.value, marketplace)) {
+        const entry = structuredClone(object(sourceMarkets.value[marketplace], "marketplace"));
+        const location = relocated(entry.installLocation, sourceRoot, targetRoot);
+        const catalogue = sourceCatalogue(location.source);
+        const file2 = path4.join(location.target, ".claude-plugin/marketplace.json");
+        const destination = readDocument(file2);
+        const existingCatalogue = destination.value;
+        destination.value = structuredClone(catalogue.value);
+        targetCatalogues.set(file2, destination);
+        catalogueFiles.add(file2);
+        for (const item of destination.value.plugins) {
+          const plugin = object(item, "catalogue plugin");
+          localCatalogueEntry(plugin, location.source, location.target);
+        }
+        if (destination.before !== void 0 && JSON.stringify(existingCatalogue) !== JSON.stringify(destination.value)) {
+          throw new Error("Existing CCEM marketplace catalogue differs; keeping the CCEM copy");
+        }
+        for (const newId of pending.filter((item) => item.id.split("@")[1] === marketplace).map((item) => item.id)) {
+          if (!destination.value.plugins.some((item) => item.name === newId.split("@")[0])) {
+            throw new Error(`Plugin is missing from its marketplace catalogue: ${newId}`);
+          }
+        }
+        planCopy(location.source, location.target, sourceRoot, copies, catalogueFiles);
+        entry.installLocation = location.target;
+        if (entry.source && typeof entry.source === "object" && ["directory", "file"].includes(String(entry.source.source)) && "path" in entry.source) {
+          const local = relocated(entry.source.path, sourceRoot, targetRoot);
+          planCopy(local.source, local.target, sourceRoot, copies, catalogueFiles);
+          entry.source.path = local.target;
+        }
+        targetMarkets.value[marketplace] = entry;
+      }
+      if (existingMarketplaces.has(marketplace) && Object.hasOwn(sourceMarkets.value, marketplace)) {
+        const from = relocated(object(sourceMarkets.value[marketplace], "marketplace").installLocation, sourceRoot, targetRoot);
+        const to2 = relocated(object(targetMarkets.value[marketplace], "marketplace").installLocation, targetRoot, targetRoot);
+        const targetFile = path4.join(to2.target, ".claude-plugin/marketplace.json");
+        const officialCatalogue = sourceCatalogue(from.source);
+        const targetCatalogue = targetCatalogues.get(targetFile) ?? readDocument(targetFile);
+        targetCatalogues.set(targetFile, targetCatalogue);
+        catalogueFiles.add(targetFile);
+        if (!Array.isArray(officialCatalogue.value.plugins) || !Array.isArray(targetCatalogue.value.plugins)) {
+          throw new Error("Invalid plugin marketplace catalogue");
+        }
+        const name = id.split("@")[0];
+        if (!targetCatalogue.value.plugins.some((entry) => object(entry, "catalogue plugin").name === name)) {
+          const entry = officialCatalogue.value.plugins.find((entry2) => object(entry2, "catalogue plugin").name === name);
+          if (!entry) throw new Error(`Plugin is missing from its marketplace catalogue: ${id}`);
+          const importedEntry = structuredClone(object(entry, "catalogue plugin"));
+          localCatalogueEntry(importedEntry, from.source, to2.target);
+          targetCatalogue.value.plugins.push(importedEntry);
+        }
+      }
+      for (const [field, entryKey] of [["enabledPlugins", id], ["extraKnownMarketplaces", marketplace]]) {
+        if (field === "enabledPlugins" && !pending.some((item) => item.id === id && item.identity.scope === "user")) continue;
+        const from = sourceSettings.value[field] === void 0 ? {} : object(sourceSettings.value[field], field);
+        const to2 = targetSettings.value[field] === void 0 ? {} : object(targetSettings.value[field], field);
+        if (Object.hasOwn(from, entryKey) && !Object.hasOwn(to2, entryKey)) {
+          const value = structuredClone(from[entryKey]);
+          if (field === "enabledPlugins" && typeof value !== "boolean") throw new Error("Invalid plugin enablement");
+          if (field === "extraKnownMarketplaces") {
+            const extra = object(value, field);
+            if (extra.source && typeof extra.source === "object" && ["directory", "file"].includes(String(extra.source.source)) && "path" in extra.source) {
+              const local = relocated(extra.source.path, sourceRoot, targetRoot);
+              planCopy(local.source, local.target, sourceRoot, copies, catalogueFiles);
+              extra.source.path = local.target;
+            }
+          }
+          to2[entryKey] = value;
+          targetSettings.value[field] = to2;
+        }
+      }
+    }
+    (ledger.value.seen[id] ??= []).push(key);
+  }
+  const sources = [sourceRegistry, sourceSettings, sourceMarkets, ...sourceCatalogues.values()];
+  const targets = [...targetCatalogues.values(), targetMarkets, targetRegistry, targetSettings, ledger];
+  for (const document2 of [...sources, ...targets]) unchanged(document2);
+  for (const copy of copies) if (!catalogueFiles.has(copy.target)) publishCopy(copy);
+  for (const document2 of [...sources, ...targets]) unchanged(document2);
+  for (const document2 of targets) {
+    for (const observed of [...sources, ...targets]) unchanged(observed);
+    if (document2.before === void 0 && Object.keys(document2.value).length === 0) continue;
+    publishDocument(document2, targetHome);
+  }
+  return { imported, observed: pending.length };
+}
+
+// ../core/src/agent-home.ts
+var AGENT_MIGRATION_MARKER = ".ccem-migration-v1.json";
+var MIGRATION_LOCK = ".ccem-migration.lock";
 var PROFILES_FILE = "profiles.json";
+var LEGACY_ENTRIES = {
+  claude: ["projects", "history.jsonl", "plans", "file-history", "CLAUDE.md"],
+  codex: ["sessions", "archived_sessions", "history.jsonl", "session_index.jsonl", "memories", "memories_v2", "AGENTS.md", "AGENTS.override.md"]
+};
 var IDENTITY_ENV_KEYS = [
   "ANTHROPIC_PROFILE",
   "CLAUDE_CODE_SESSION_ACCESS_TOKEN",
@@ -27763,6 +28316,8 @@ var IDENTITY_ENV_KEYS = [
   "CLAUDE_CODE_DESIGN_OAUTH_CLIENT_ID",
   "CLAUDE_CODE_REMOTE_SETTINGS_PATH",
   "CLAUDE_CODE_MOCK_REMOTE_SETTINGS",
+  "CLAUDE_CODE_PLUGIN_SEED_DIR",
+  "CLAUDE_CODE_PLUGIN_USE_ZIP_CACHE",
   "USE_LOCAL_OAUTH",
   "USE_STAGING_OAUTH",
   "CLAUDE_LOCAL_OAUTH_API_BASE",
@@ -27804,6 +28359,7 @@ var INHERITED_AGENT_ENV_KEYS = [
   "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
   "CLAUDE_CONFIG_DIR",
   "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+  "CLAUDE_CODE_PLUGIN_CACHE_DIR",
   "OPENAI_API_KEY",
   "OPENAI_BASE_URL",
   "CODEX_API_KEY",
@@ -27829,18 +28385,18 @@ function userHome(env) {
 }
 function getCcemAgentBase(env = process.env) {
   const override = env.CCEM_AGENT_HOME?.trim();
-  if (override && (!path3.isAbsolute(override) || override.split(/[\\/]/).includes(".."))) {
+  if (override && (!path5.isAbsolute(override) || override.split(/[\\/]/).includes(".."))) {
     throw new Error("CCEM_AGENT_HOME must be an absolute path without '..'");
   }
-  return path3.resolve(override || path3.join(userHome(env), ".ccem", "agents"));
+  return path5.resolve(override || path5.join(userHome(env), ".ccem", "agents"));
 }
 function readCodexIsolation(env) {
   if (env.CCEM_CODEX_ISOLATED === "1") return true;
   if (env.CCEM_CODEX_ISOLATED === "0") return false;
-  const file2 = path3.join(getCcemAgentBase(env), PROFILES_FILE);
+  const file2 = path5.join(getCcemAgentBase(env), PROFILES_FILE);
   let raw;
   try {
-    raw = fs2.readFileSync(file2, "utf8");
+    raw = fs4.readFileSync(file2, "utf8");
   } catch (error48) {
     if (error48.code === "ENOENT") return false;
     throw new Error("Cannot read CCEM agent profile preferences");
@@ -27867,14 +28423,14 @@ function isCodexIsolated(env = process.env) {
   }
 }
 function getCcemIsolatedAgentHome(provider, env = process.env) {
-  return path3.join(getCcemAgentBase(env), provider);
+  return path5.join(getCcemAgentBase(env), provider);
 }
 function getOfficialCodexHome(env) {
   const override = env.CODEX_HOME?.trim();
-  if (!override) return path3.resolve(userHome(env), ".codex");
-  if (override === "~") return path3.resolve(userHome(env));
-  if (/^~[\\/]/.test(override)) return path3.resolve(userHome(env), override.slice(2));
-  return path3.resolve(override);
+  if (!override) return path5.resolve(userHome(env), ".codex");
+  if (override === "~") return path5.resolve(userHome(env));
+  if (/^~[\\/]/.test(override)) return path5.resolve(userHome(env), override.slice(2));
+  return path5.resolve(override);
 }
 function getCcemAgentHome(provider, env = process.env) {
   return provider === "codex" && !isCodexIsolated(env) ? getOfficialCodexHome(env) : getCcemIsolatedAgentHome(provider, env);
@@ -27886,6 +28442,7 @@ function getCcemAgentEnv(env = process.env) {
   return {
     CLAUDE_CONFIG_DIR: claude,
     CLAUDE_SECURESTORAGE_CONFIG_DIR: claude,
+    CLAUDE_CODE_PLUGIN_CACHE_DIR: path5.join(claude, "plugins"),
     CODEX_HOME: codex,
     CCEM_CODEX_ISOLATED: isolated ? "1" : "0",
     ...isolated ? { CODEX_SQLITE_HOME: codex } : {}
@@ -27917,6 +28474,253 @@ function buildIsolatedAgentEnv(baseEnv = process.env, selectedEnv = {}) {
   }
   Object.assign(env, profile);
   return Object.fromEntries(Object.entries(env).filter((entry) => entry[1] !== void 0));
+}
+function statIfPresent(file2) {
+  try {
+    return fs4.lstatSync(file2);
+  } catch (error48) {
+    if (error48.code === "ENOENT") return void 0;
+    throw error48;
+  }
+}
+function ensureRealDirectory(directory) {
+  validateNoSymlinks(directory);
+  fs4.mkdirSync(directory, { recursive: true, mode: 448 });
+  const stat2 = fs4.lstatSync(directory);
+  if (stat2.isSymbolicLink() || !stat2.isDirectory()) {
+    throw new Error(`CCEM agent directory must be a real directory: ${directory}`);
+  }
+  fs4.chmodSync(directory, 448);
+}
+function validateNoSymlinks(file2) {
+  let current = path5.parse(file2).root;
+  for (const component of file2.slice(current.length).split(path5.sep).filter(Boolean)) {
+    current = path5.join(current, component);
+    const stat2 = statIfPresent(current);
+    if (!stat2) break;
+    if (stat2.isSymbolicLink()) throw new Error(`CCEM agent state cannot use a symlink: ${current}`);
+  }
+}
+function resolveExistingParent(file2) {
+  const suffix = [];
+  let parent = file2;
+  while (!statIfPresent(parent)) {
+    suffix.unshift(path5.basename(parent));
+    parent = path5.dirname(parent);
+  }
+  return path5.join(fs4.realpathSync(parent), ...suffix);
+}
+function validateAgentBase(base, env) {
+  validateNoSymlinks(base);
+  const resolved = resolveExistingParent(base);
+  for (const name of [".claude", ".codex"]) {
+    const official = resolveExistingParent(path5.join(userHome(env), name));
+    if (resolved === official || resolved.startsWith(`${official}${path5.sep}`) || official.startsWith(`${resolved}${path5.sep}`)) {
+      throw new Error("CCEM agent state must not overlap an official Claude or Codex home");
+    }
+  }
+}
+function syncDirectory(directory) {
+  if (process.platform === "win32") return;
+  const fd = fs4.openSync(directory, "r");
+  try {
+    fs4.fsyncSync(fd);
+  } finally {
+    fs4.closeSync(fd);
+  }
+}
+function migrationComplete(marker) {
+  const stat2 = statIfPresent(marker);
+  if (!stat2) return false;
+  if (!stat2.isFile() || stat2.isSymbolicLink()) throw new Error("CCEM agent migration marker is invalid");
+  let version2;
+  try {
+    version2 = JSON.parse(fs4.readFileSync(marker, "utf8")).version;
+  } catch {
+  }
+  if (version2 !== 1) throw new Error("CCEM agent migration marker is invalid or unsupported");
+  return true;
+}
+function writeNewFile(file2, contents) {
+  validateNoSymlinks(file2);
+  const existing = statIfPresent(file2);
+  if (existing) {
+    if (!existing.isFile()) throw new Error(`CCEM agent file conflicts with a directory: ${file2}`);
+    return;
+  }
+  const temporary = path5.join(path5.dirname(file2), `.ccem-copy-${randomUUID2()}.tmp`);
+  try {
+    const fd = fs4.openSync(temporary, "wx", 384);
+    try {
+      fs4.writeFileSync(fd, contents);
+      fs4.fsyncSync(fd);
+    } finally {
+      fs4.closeSync(fd);
+    }
+    try {
+      fs4.linkSync(temporary, file2);
+    } catch (error48) {
+      if (error48.code !== "EEXIST") throw error48;
+    }
+  } finally {
+    fs4.rmSync(temporary, { force: true });
+  }
+}
+function copyLegacyEntry(source, destination) {
+  const sourceStat = statIfPresent(source);
+  if (!sourceStat || sourceStat.isSymbolicLink()) return;
+  if (sourceStat.isFile() && /\.(?:sqlite|sqlite3|db)(?:-(?:wal|shm))?$/i.test(path5.basename(source))) return;
+  validateNoSymlinks(destination);
+  const destinationStat = statIfPresent(destination);
+  if (sourceStat.isDirectory()) {
+    if (destinationStat && !destinationStat.isDirectory()) throw new Error(`CCEM agent directory conflicts with a file: ${destination}`);
+    ensureRealDirectory(destination);
+    for (const name of fs4.readdirSync(source)) {
+      copyLegacyEntry(path5.join(source, name), path5.join(destination, name));
+    }
+    syncDirectory(destination);
+    return;
+  }
+  if (!sourceStat.isFile()) return;
+  if (destinationStat) {
+    if (!destinationStat.isFile()) throw new Error(`CCEM agent file conflicts with a directory: ${destination}`);
+    return;
+  }
+  const temporary = path5.join(path5.dirname(destination), `.ccem-copy-${randomUUID2()}.tmp`);
+  let sourceFd;
+  let destinationFd;
+  try {
+    sourceFd = fs4.openSync(source, fs4.constants.O_RDONLY | (fs4.constants.O_NOFOLLOW ?? 0));
+    const openedStat = fs4.fstatSync(sourceFd);
+    if (!openedStat.isFile()) throw new Error("Legacy agent history changed during migration");
+    destinationFd = fs4.openSync(temporary, "wx", 384);
+    const buffer = Buffer.alloc(1024 * 1024);
+    let remaining = openedStat.size;
+    while (remaining > 0) {
+      const bytesRead = fs4.readSync(sourceFd, buffer, 0, Math.min(remaining, buffer.length), null);
+      if (!bytesRead) throw new Error("Legacy agent history changed during migration");
+      let offset = 0;
+      while (offset < bytesRead) offset += fs4.writeSync(destinationFd, buffer, offset, bytesRead - offset);
+      remaining -= bytesRead;
+    }
+    fs4.futimesSync(destinationFd, openedStat.atime, openedStat.mtime);
+    fs4.fsyncSync(destinationFd);
+    fs4.closeSync(destinationFd);
+    destinationFd = void 0;
+    try {
+      fs4.linkSync(temporary, destination);
+    } catch (error48) {
+      if (error48.code !== "EEXIST") throw error48;
+    }
+  } finally {
+    if (sourceFd !== void 0) fs4.closeSync(sourceFd);
+    if (destinationFd !== void 0) fs4.closeSync(destinationFd);
+    fs4.rmSync(temporary, { force: true });
+  }
+}
+function acquireMigrationLock(base) {
+  const lockPath = path5.join(base, MIGRATION_LOCK);
+  const contents = JSON.stringify({ pid: process.pid });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const fd = fs4.openSync(lockPath, "wx", 384);
+      try {
+        fs4.writeFileSync(fd, contents);
+        fs4.fsyncSync(fd);
+      } catch (error48) {
+        const owned = fs4.fstatSync(fd);
+        const current = statIfPresent(lockPath);
+        if (current?.ino === owned.ino && current.dev === owned.dev) fs4.unlinkSync(lockPath);
+        throw error48;
+      } finally {
+        fs4.closeSync(fd);
+      }
+      return () => {
+        if (statIfPresent(lockPath)?.isFile() && fs4.readFileSync(lockPath, "utf8") === contents) fs4.unlinkSync(lockPath);
+      };
+    } catch (error48) {
+      if (error48.code !== "EEXIST") throw error48;
+      const stat2 = fs4.lstatSync(lockPath);
+      if (!stat2.isFile() || stat2.isSymbolicLink()) throw new Error("CCEM agent migration lock is invalid");
+      const old = fs4.readFileSync(lockPath, "utf8");
+      let pid;
+      try {
+        pid = JSON.parse(old).pid;
+      } catch {
+      }
+      if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("CCEM agent migration lock is invalid");
+      try {
+        process.kill(pid, 0);
+      } catch (probeError) {
+        if (probeError.code === "ESRCH" && attempt === 0) {
+          if (fs4.readFileSync(lockPath, "utf8") !== old) throw new Error("CCEM agent migration lock changed; retry preparation");
+          fs4.unlinkSync(lockPath);
+          continue;
+        }
+      }
+      throw new Error(`CCEM agent migration is in progress (PID ${pid}); retry when it finishes`);
+    }
+  }
+  throw new Error("Could not acquire CCEM agent migration lock");
+}
+function ensureCcemAgentHome(provider, env = process.env) {
+  if (provider === "codex" && !readCodexIsolation(env)) return getOfficialCodexHome(env);
+  const base = getCcemAgentBase(env);
+  const root = getCcemIsolatedAgentHome(provider, env);
+  validateAgentBase(base, env);
+  for (const entry of LEGACY_ENTRIES[provider]) validateNoSymlinks(path5.join(root, entry));
+  validateNoSymlinks(path5.join(root, provider === "claude" ? ".claude.json" : "config.toml"));
+  const marker = path5.join(root, AGENT_MIGRATION_MARKER);
+  const source = provider === "codex" ? getOfficialCodexHome(env) : path5.join(userHome(env), ".claude");
+  const historyReady = migrationComplete(marker);
+  if (historyReady) {
+    if (provider !== "claude") return root;
+    try {
+      if (!claudePluginImportPending(source, root)) return root;
+    } catch (error48) {
+      console.warn(`CCEM plugin import deferred: ${error48.message}`);
+      return root;
+    }
+  }
+  ensureRealDirectory(base);
+  ensureRealDirectory(root);
+  let unlock;
+  try {
+    unlock = acquireMigrationLock(base);
+  } catch (error48) {
+    if (!historyReady) throw error48;
+    console.warn(`CCEM plugin import deferred: ${error48.message}`);
+    return root;
+  }
+  try {
+    if (!migrationComplete(marker)) {
+      if (provider === "codex") {
+        const resolvedBase = resolveExistingParent(base);
+        const resolvedSource = resolveExistingParent(source);
+        if (resolvedBase === resolvedSource || resolvedBase.startsWith(`${resolvedSource}${path5.sep}`) || resolvedSource.startsWith(`${resolvedBase}${path5.sep}`)) {
+          throw new Error("CCEM Codex migration source must not overlap its isolated agent directory");
+        }
+      }
+      assertNoLegacyAgentWriters(provider, userHome(env), source, root);
+      const sourceStat = statIfPresent(source);
+      if (sourceStat?.isDirectory() && !sourceStat.isSymbolicLink()) {
+        for (const entry of LEGACY_ENTRIES[provider]) copyLegacyEntry(path5.join(source, entry), path5.join(root, entry));
+      }
+      if (provider === "claude") writeNewFile(path5.join(root, ".claude.json"), JSON.stringify({ hasCompletedOnboarding: true }));
+      writeNewFile(marker, JSON.stringify({ version: 1 }));
+      syncDirectory(root);
+    }
+    if (provider === "claude") {
+      try {
+        importClaudePlugins(source, root);
+      } catch (error48) {
+        console.warn(`CCEM plugin import deferred: ${error48.message}`);
+      }
+    }
+    return root;
+  } finally {
+    unlock();
+  }
 }
 
 // src/claudeEnv.ts
@@ -28050,6 +28854,79 @@ function resolveClaudeInterruptTimeoutMs(raw) {
   }
   return Math.min(DEFAULT_CLAUDE_INTERRUPT_TIMEOUT_MS, Math.max(0, parsed));
 }
+
+// src/claudePluginRefresh.ts
+import fs5 from "node:fs";
+import path6 from "node:path";
+function preparePlugins() {
+  const home = ensureCcemAgentHome("claude");
+  const ledger = path6.join(home, CLAUDE_PLUGIN_IMPORT_LEDGER);
+  try {
+    if (!fs5.lstatSync(ledger).isFile()) throw new Error("Plugin import ledger is not a regular file");
+    return fs5.readFileSync(ledger, "utf8");
+  } catch (error48) {
+    if (error48.code === "ENOENT") return null;
+    throw error48;
+  }
+}
+var ClaudePluginRefresh = class {
+  revisions = /* @__PURE__ */ new WeakMap();
+  pending = /* @__PURE__ */ new WeakMap();
+  prepare;
+  warn;
+  timeoutMs;
+  constructor(options = {}) {
+    this.prepare = options.prepare ?? preparePlugins;
+    this.warn = options.warn ?? console.warn;
+    this.timeoutMs = options.timeoutMs ?? 5e3;
+  }
+  deferred(error48) {
+    this.warn(`Claude plugin refresh deferred: ${error48 instanceof Error ? error48.message : String(error48)}`);
+  }
+  /** Call synchronously immediately before query(), so later imports cannot become its baseline. */
+  prepareQuery() {
+    try {
+      return this.prepare();
+    } catch (error48) {
+      this.deferred(error48);
+      return void 0;
+    }
+  }
+  trackQuery(query, revision) {
+    this.revisions.set(query, revision);
+  }
+  beforePrompt(query, isCurrentAndIdle) {
+    const pending = this.pending.get(query);
+    if (pending) return pending;
+    if (!isCurrentAndIdle()) return Promise.resolve();
+    const refresh = this.refresh(query, isCurrentAndIdle);
+    let timer;
+    const deadline = new Promise((resolve2) => {
+      timer = setTimeout(() => {
+        this.deferred(new Error(`plugin controls did not settle within ${this.timeoutMs}ms; continuing the prompt`));
+        resolve2();
+      }, this.timeoutMs);
+    });
+    const operation = Promise.race([refresh, deadline]).finally(() => clearTimeout(timer));
+    this.pending.set(query, operation);
+    void refresh.finally(() => {
+      if (this.pending.get(query) === operation) this.pending.delete(query);
+    });
+    return operation;
+  }
+  async refresh(query, isCurrentAndIdle) {
+    try {
+      const revision = this.prepare();
+      if (revision === void 0 || revision === this.revisions.get(query) || !isCurrentAndIdle()) return;
+      await query.applyFlagSettings({});
+      if (!isCurrentAndIdle()) return;
+      await query.reloadPlugins();
+      if (isCurrentAndIdle()) this.revisions.set(query, revision);
+    } catch (error48) {
+      this.deferred(error48);
+    }
+  }
+};
 
 // src/permissionModes.ts
 function withClaudePermissionOptions(settings, options) {
@@ -28188,7 +29065,7 @@ var QuerySnapshotSlot = class {
 };
 
 // src/claudePlanGuard.ts
-import path4 from "node:path";
+import path7 from "node:path";
 var PLAN_MODE_BLOCKED_TOOLS = /* @__PURE__ */ new Set([
   "Write",
   "Edit",
@@ -28215,9 +29092,9 @@ function isClaudeInternalPlanFile(toolName, input, claudeHome = getCcemAgentHome
   if (!pathLikeValue) {
     return false;
   }
-  const resolvedTarget = path4.resolve(pathLikeValue);
-  const planDir = path4.resolve(claudeHome, "plans");
-  return resolvedTarget === planDir || resolvedTarget.startsWith(`${planDir}${path4.sep}`);
+  const resolvedTarget = path7.resolve(pathLikeValue);
+  const planDir = path7.resolve(claudeHome, "plans");
+  return resolvedTarget === planDir || resolvedTarget.startsWith(`${planDir}${path7.sep}`);
 }
 function shouldBlockClaudeToolInPlanMode(toolName, input, claudeHome = getCcemAgentHome("claude")) {
   if (!PLAN_MODE_BLOCKED_TOOLS.has(toolName)) {
@@ -28255,8 +29132,8 @@ function buildClaudePlanModeHooks(isPlanMode, claudeHome = getCcemAgentHome("cla
 }
 
 // src/claudeTurnPlan.ts
-import fs3 from "node:fs";
-import path5 from "node:path";
+import fs6 from "node:fs";
+import path8 from "node:path";
 var ClaudeTurnPlanTracker = class {
   pending = /* @__PURE__ */ new Map();
   content;
@@ -28266,9 +29143,9 @@ var ClaudeTurnPlanTracker = class {
   }
   started(toolUseId, toolName, input, workingDir) {
     if (!["Write", "Edit", "MultiEdit"].includes(toolName) || typeof input.file_path !== "string") return;
-    const filePath = path5.resolve(workingDir, input.file_path);
+    const filePath = path8.resolve(workingDir, input.file_path);
     if (!/\.md$/i.test(filePath)) return;
-    if (!filePath.split(path5.sep).some((part) => part === ".plans" || part === "plans")) return;
+    if (!filePath.split(path8.sep).some((part) => part === ".plans" || part === "plans")) return;
     this.pending.set(toolUseId, {
       filePath,
       ...toolName === "Write" && typeof input.content === "string" ? { content: input.content } : {}
@@ -28279,7 +29156,7 @@ var ClaudeTurnPlanTracker = class {
     this.pending.delete(toolUseId);
     if (!write || !success2) return;
     try {
-      const content = write.content ?? fs3.readFileSync(write.filePath, "utf8");
+      const content = write.content ?? fs6.readFileSync(write.filePath, "utf8");
       this.content = content.trim() ? content : void 0;
     } catch {
       this.content = void 0;
@@ -28353,7 +29230,7 @@ function buildClaudeRoutePreToolUseHook(router) {
         "Explicit CCEM environment aliases must be 1-64 ASCII letters, numbers, '.', '_', or '-'."
       );
     }
-    const identity = override ? `ccem:${override.env}` : `subagent:${subagentType}`;
+    const identity2 = override ? `ccem:${override.env}` : `subagent:${subagentType}`;
     const rest = override?.rest ?? prompt;
     return {
       continue: true,
@@ -28361,7 +29238,7 @@ function buildClaudeRoutePreToolUseHook(router) {
         hookEventName: "PreToolUse",
         updatedInput: {
           ...toolInput,
-          prompt: `<CCEM-ROUTE nonce="${router.routeTagNonce}">${identity}</CCEM-ROUTE>
+          prompt: `<CCEM-ROUTE nonce="${router.routeTagNonce}">${identity2}</CCEM-ROUTE>
 ${rest}`
         }
       }
@@ -28396,7 +29273,7 @@ function buildClaudeRouterSystemPrompt(router) {
 }
 
 // src/browserMcp.ts
-import { randomUUID } from "node:crypto";
+import { randomUUID as randomUUID3 } from "node:crypto";
 
 // ../../node_modules/.pnpm/zod@4.3.6/node_modules/zod/v4/classic/external.js
 var external_exports = {};
@@ -28576,7 +29453,7 @@ __export(external_exports, {
   nullable: () => nullable,
   nullish: () => nullish2,
   number: () => number2,
-  object: () => object,
+  object: () => object2,
   optional: () => optional,
   overwrite: () => _overwrite,
   parse: () => parse3,
@@ -28594,7 +29471,7 @@ __export(external_exports, {
   refine: () => refine,
   regex: () => _regex,
   regexes: () => regexes_exports,
-  registry: () => registry,
+  registry: () => registry2,
   safeDecode: () => safeDecode2,
   safeDecodeAsync: () => safeDecodeAsync2,
   safeEncode: () => safeEncode2,
@@ -28903,7 +29780,7 @@ __export(core_exports2, {
   prettifyError: () => prettifyError,
   process: () => process3,
   regexes: () => regexes_exports,
-  registry: () => registry,
+  registry: () => registry2,
   safeDecode: () => safeDecode,
   safeDecodeAsync: () => safeDecodeAsync,
   safeEncode: () => safeEncode,
@@ -29121,9 +29998,9 @@ function floatSafeRemainder(val, step) {
   return valInt % stepInt / 10 ** decCount;
 }
 var EVALUATING = Symbol("evaluating");
-function defineLazy(object2, key, getter) {
+function defineLazy(object3, key, getter) {
   let value = void 0;
-  Object.defineProperty(object2, key, {
+  Object.defineProperty(object3, key, {
     get() {
       if (value === EVALUATING) {
         return void 0;
@@ -29135,7 +30012,7 @@ function defineLazy(object2, key, getter) {
       return value;
     },
     set(v2) {
-      Object.defineProperty(object2, key, {
+      Object.defineProperty(object3, key, {
         value: v2
         // configurable: true,
       });
@@ -29165,10 +30042,10 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path9) {
-  if (!path9)
+function getElementAtPath(obj, path12) {
+  if (!path12)
     return obj;
-  return path9.reduce((acc, key) => acc?.[key], obj);
+  return path12.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -29551,11 +30428,11 @@ function aborted(x2, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path9, issues) {
+function prefixIssues(path12, issues) {
   return issues.map((iss) => {
     var _a3;
     (_a3 = iss).path ?? (_a3.path = []);
-    iss.path.unshift(path9);
+    iss.path.unshift(path12);
     return iss;
   });
 }
@@ -29738,7 +30615,7 @@ function formatError(error48, mapper = (issue2) => issue2.message) {
 }
 function treeifyError(error48, mapper = (issue2) => issue2.message) {
   const result = { errors: [] };
-  const processError = (error49, path9 = []) => {
+  const processError = (error49, path12 = []) => {
     var _a3, _b2;
     for (const issue2 of error49.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
@@ -29748,7 +30625,7 @@ function treeifyError(error48, mapper = (issue2) => issue2.message) {
       } else if (issue2.code === "invalid_element") {
         processError({ issues: issue2.issues }, issue2.path);
       } else {
-        const fullpath = [...path9, ...issue2.path];
+        const fullpath = [...path12, ...issue2.path];
         if (fullpath.length === 0) {
           result.errors.push(mapper(issue2));
           continue;
@@ -29780,8 +30657,8 @@ function treeifyError(error48, mapper = (issue2) => issue2.message) {
 }
 function toDotPath(_path) {
   const segs = [];
-  const path9 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
-  for (const seg of path9) {
+  const path12 = _path.map((seg) => typeof seg === "object" ? seg.key : seg);
+  for (const seg of path12) {
     if (typeof seg === "number")
       segs.push(`[${seg}]`);
     else if (typeof seg === "symbol")
@@ -38235,10 +39112,10 @@ var $ZodRegistry = class {
     return this._map.has(schema);
   }
 };
-function registry() {
+function registry2() {
   return new $ZodRegistry();
 }
-(_a2 = globalThis).__zod_globalRegistry ?? (_a2.__zod_globalRegistry = registry());
+(_a2 = globalThis).__zod_globalRegistry ?? (_a2.__zod_globalRegistry = registry2());
 var globalRegistry = globalThis.__zod_globalRegistry;
 
 // ../../node_modules/.pnpm/zod@4.3.6/node_modules/zod/v4/core/api.js
@@ -40150,21 +41027,21 @@ var allProcessors = {
 };
 function toJSONSchema(input, params) {
   if ("_idmap" in input) {
-    const registry2 = input;
+    const registry3 = input;
     const ctx2 = initializeContext({ ...params, processors: allProcessors });
     const defs = {};
-    for (const entry of registry2._idmap.entries()) {
+    for (const entry of registry3._idmap.entries()) {
       const [_, schema] = entry;
       process3(schema, ctx2);
     }
     const schemas = {};
     const external = {
-      registry: registry2,
+      registry: registry3,
       uri: params?.uri,
       defs
     };
     ctx2.external = external;
-    for (const entry of registry2._idmap.entries()) {
+    for (const entry of registry3._idmap.entries()) {
       const [key, schema] = entry;
       extractDefs(ctx2, schema);
       schemas[key] = finalize(ctx2, schema);
@@ -40393,7 +41270,7 @@ __export(schemas_exports2, {
   nullable: () => nullable,
   nullish: () => nullish2,
   number: () => number2,
-  object: () => object,
+  object: () => object2,
   optional: () => optional,
   partialRecord: () => partialRecord,
   pipe: () => pipe,
@@ -41085,7 +41962,7 @@ var ZodObject = /* @__PURE__ */ $constructor("ZodObject", (inst, def) => {
   inst.partial = (...args) => util_exports.partial(ZodOptional, inst, args[0]);
   inst.required = (...args) => util_exports.required(ZodNonOptional, inst, args[0]);
 });
-function object(shape, params) {
+function object2(shape, params) {
   const def = {
     type: "object",
     shape: shape ?? {},
@@ -41758,13 +42635,13 @@ function resolveRef(ref, ctx) {
   if (!ref.startsWith("#")) {
     throw new Error("External $ref is not supported, only local refs (#/...) are allowed");
   }
-  const path9 = ref.slice(1).split("/").filter(Boolean);
-  if (path9.length === 0) {
+  const path12 = ref.slice(1).split("/").filter(Boolean);
+  if (path12.length === 0) {
     return ctx.rootSchema;
   }
   const defsKey = ctx.version === "draft-2020-12" ? "$defs" : "definitions";
-  if (path9[0] === defsKey) {
-    const key = path9[1];
+  if (path12[0] === defsKey) {
+    const key = path12[1];
     if (!key || !ctx.defs[key]) {
       throw new Error(`Reference not found: ${ref}`);
     }
@@ -42265,7 +43142,7 @@ function createBrowserToolBridge(emitRequest, timeoutMs = BROWSER_TOOL_BRIDGE_TI
     queuedOwners.set(key, queue);
   }
   function sendBrowserToolRequest(toolName, args) {
-    const requestId = randomUUID();
+    const requestId = randomUUID3();
     const ownerKey = browserRequestOwnerKey(toolName, args);
     const ownerQueue = queuedOwners.get(ownerKey);
     const owner = ownerQueue?.shift() ?? resolveOwner();
@@ -42531,7 +43408,7 @@ function buildPromptContentParts(text, images) {
 }
 
 // src/sessionHandoffMcp.ts
-import { randomUUID as randomUUID2 } from "node:crypto";
+import { randomUUID as randomUUID4 } from "node:crypto";
 var SESSION_HANDOFF_TOOL_NAME = "mcp__ccem-sessions__send_message";
 var SESSION_HANDOFF_TIMEOUT_MS = 3e4;
 var MAX_PENDING_SESSION_HANDOFFS = 8;
@@ -42568,7 +43445,7 @@ function createSessionHandoffBridge(emitRequest, timeoutMs = SESSION_HANDOFF_TIM
     if (pending.size >= MAX_PENDING_SESSION_HANDOFFS) {
       return Promise.reject(new Error("Too many pending session handoffs; no message was submitted."));
     }
-    const request_id = randomUUID2();
+    const request_id = randomUUID4();
     return new Promise((resolve2, reject) => {
       const timeout = setTimeout(() => {
         pending.delete(request_id);
@@ -42628,14 +43505,14 @@ function createCcemSessionHandoffMcpServer(permissionMode, sendMessage) {
 }
 
 // src/imageInputs.ts
-import fs4 from "fs";
+import fs7 from "fs";
 import os3 from "os";
-import path6 from "path";
+import path9 from "path";
 var MAX_SINGLE_IMAGE_BYTES = 30 * 1024 * 1024;
 var MAX_TOTAL_IMAGE_BYTES = 300 * 1024 * 1024;
 function createLocalImageInputs(parts) {
-  const tempDir = path6.join(os3.tmpdir(), "ccem-images");
-  fs4.mkdirSync(tempDir, { recursive: true });
+  const tempDir = path9.join(os3.tmpdir(), "ccem-images");
+  fs7.mkdirSync(tempDir, { recursive: true });
   const inputs = [];
   const tempFiles = [];
   let totalSize = 0;
@@ -42655,8 +43532,8 @@ function createLocalImageInputs(parts) {
       }
       const ext = part.image.mediaType.split("/")[1] || "png";
       const filename = `paste-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.${ext}`;
-      const filePath = path6.join(tempDir, filename);
-      fs4.writeFileSync(filePath, data);
+      const filePath = path9.join(tempDir, filename);
+      fs7.writeFileSync(filePath, data);
       tempFiles.push(filePath);
       inputs.push({ type: "local_image", path: filePath });
     }
@@ -42669,15 +43546,15 @@ function createLocalImageInputs(parts) {
 function cleanupTempFiles(files) {
   for (const file2 of files) {
     try {
-      fs4.unlinkSync(file2);
+      fs7.unlinkSync(file2);
     } catch {
     }
   }
 }
 
 // src/codexContextUsage.ts
-import fs5 from "node:fs";
-import path7 from "node:path";
+import fs8 from "node:fs";
+import path10 from "node:path";
 var TAIL_BYTES = 512 * 1024;
 function asRecord3(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value : null;
@@ -42731,7 +43608,7 @@ function buildCodexContextUsageFromTokenCount(payload, fallbackModel = "codex") 
 }
 function resolveCodexSessionsRoot(env = process.env) {
   const codexHome = getCcemAgentHome("codex", env);
-  return path7.join(codexHome, "sessions");
+  return path10.join(codexHome, "sessions");
 }
 function looksLikeUuid(value) {
   return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(value);
@@ -42739,12 +43616,12 @@ function looksLikeUuid(value) {
 function scanDirectoryForSessionFile(dir, sessionId, recursive) {
   let entries;
   try {
-    entries = fs5.readdirSync(dir, { withFileTypes: true });
+    entries = fs8.readdirSync(dir, { withFileTypes: true });
   } catch {
     return null;
   }
   for (const entry of entries) {
-    const entryPath = path7.join(dir, entry.name);
+    const entryPath = path10.join(dir, entry.name);
     if (entry.isFile() && entry.name.endsWith(".jsonl") && entry.name.includes(sessionId)) {
       return entryPath;
     }
@@ -42756,7 +43633,7 @@ function scanDirectoryForSessionFile(dir, sessionId, recursive) {
     if (!entry.isDirectory()) {
       continue;
     }
-    const match = scanDirectoryForSessionFile(path7.join(dir, entry.name), sessionId, true);
+    const match = scanDirectoryForSessionFile(path10.join(dir, entry.name), sessionId, true);
     if (match) {
       return match;
     }
@@ -42770,7 +43647,7 @@ function recentSessionDirs(root, days = 7) {
     const yyyy = String(date5.getFullYear());
     const mm2 = String(date5.getMonth() + 1).padStart(2, "0");
     const dd2 = String(date5.getDate()).padStart(2, "0");
-    dirs.push(path7.join(root, yyyy, mm2, dd2));
+    dirs.push(path10.join(root, yyyy, mm2, dd2));
   }
   return dirs;
 }
@@ -42788,18 +43665,18 @@ function findCodexSessionFile(sessionId, sessionsRoot2 = resolveCodexSessionsRoo
   return scanDirectoryForSessionFile(sessionsRoot2, trimmed, true);
 }
 function readTailLines(filePath) {
-  const stat = fs5.statSync(filePath);
-  const length = Math.min(stat.size, TAIL_BYTES);
-  const start = Math.max(0, stat.size - length);
-  const fd = fs5.openSync(filePath, "r");
+  const stat2 = fs8.statSync(filePath);
+  const length = Math.min(stat2.size, TAIL_BYTES);
+  const start = Math.max(0, stat2.size - length);
+  const fd = fs8.openSync(filePath, "r");
   try {
     const buffer = Buffer.alloc(length);
-    fs5.readSync(fd, buffer, 0, length, start);
+    fs8.readSync(fd, buffer, 0, length, start);
     const text = buffer.toString("utf8");
     const lines = text.split(/\r?\n/).filter((line) => line.trim());
     return start > 0 ? lines.slice(1) : lines;
   } finally {
-    fs5.closeSync(fd);
+    fs8.closeSync(fd);
   }
 }
 function readLatestCodexContextUsageFromSessionFile(filePath) {
@@ -43811,7 +44688,7 @@ function createStreamEventCoalescer(writePayload, options = {}) {
 }
 
 // src/inputOperation.ts
-import { randomUUID as randomUUID3 } from "node:crypto";
+import { randomUUID as randomUUID5 } from "node:crypto";
 import { performance as performance2 } from "node:perf_hooks";
 var InputOperation = class {
   constructor(provider, clientMessageIds, emit2, commandId, now = () => performance2.now()) {
@@ -43821,7 +44698,7 @@ var InputOperation = class {
     this.now = now;
     this.clientMessageIds = Array.isArray(clientMessageIds) ? [...new Set(clientMessageIds.filter((id) => typeof id === "string" && id.trim().length > 0).map((id) => id.trim()))] : [];
   }
-  id = randomUUID3();
+  id = randomUUID5();
   clientMessageIds;
   started = false;
   terminal = false;
@@ -43874,8 +44751,8 @@ var InputOperation = class {
 };
 
 // src/codexTurnUsage.ts
-import fs6 from "node:fs";
-import path8 from "node:path";
+import fs9 from "node:fs";
+import path11 from "node:path";
 var TAIL_BYTES2 = 1024 * 1024;
 var MAX_TURN_BYTES = 32 * 1024 * 1024;
 var RETRY_COUNT = 8;
@@ -43914,13 +44791,13 @@ function normalize(raw) {
   };
 }
 function sessionsRoot(codexHome) {
-  return codexHome?.trim() ? path8.join(codexHome.trim(), "sessions") : resolveCodexSessionsRoot();
+  return codexHome?.trim() ? path11.join(codexHome.trim(), "sessions") : resolveCodexSessionsRoot();
 }
 function readRange(fd, start, length) {
   const buffer = Buffer.alloc(length);
   let read = 0;
   while (read < length) {
-    const next = fs6.readSync(fd, buffer, read, length - read, start + read);
+    const next = fs9.readSync(fd, buffer, read, length - read, start + read);
     if (next === 0) throw new Error("Codex rollout changed while reading");
     read += next;
   }
@@ -43947,11 +44824,11 @@ function captureCodexUsageBaseline(sessionId, codexHome) {
   if (!filePath) return baseline;
   let fd;
   try {
-    fd = fs6.openSync(filePath, "r");
-    const stat = fs6.fstatSync(fd);
-    if (!stat.isFile() || stat.size === 0) return baseline;
-    const start = Math.max(0, stat.size - TAIL_BYTES2);
-    const tail = readRange(fd, start, stat.size - start);
+    fd = fs9.openSync(filePath, "r");
+    const stat2 = fs9.fstatSync(fd);
+    if (!stat2.isFile() || stat2.size === 0) return baseline;
+    const start = Math.max(0, stat2.size - TAIL_BYTES2);
+    const tail = readRange(fd, start, stat2.size - start);
     if (tail[tail.length - 1] !== 10) return baseline;
     const lines = tail.toString("utf8").split("\n");
     if (start > 0) lines.shift();
@@ -43966,13 +44843,13 @@ function captureCodexUsageBaseline(sessionId, codexHome) {
       } catch {
       }
     }
-    const anchor = readAnchor(fd, stat.size);
-    if (fs6.fstatSync(fd).size !== stat.size) return baseline;
-    return { ...baseline, filePath, offset: stat.size, device: stat.dev, inode: stat.ino, anchor, valid: true };
+    const anchor = readAnchor(fd, stat2.size);
+    if (fs9.fstatSync(fd).size !== stat2.size) return baseline;
+    return { ...baseline, filePath, offset: stat2.size, device: stat2.dev, inode: stat2.ino, anchor, valid: true };
   } catch {
     return baseline;
   } finally {
-    if (fd !== void 0) fs6.closeSync(fd);
+    if (fd !== void 0) fs9.closeSync(fd);
   }
 }
 var INVALID = { state: "invalid" };
@@ -44054,17 +44931,17 @@ function tryResolve(sessionId, baseline) {
   if (!filePath) return PENDING;
   let fd;
   try {
-    fd = fs6.openSync(filePath, "r");
-    const stat = fs6.fstatSync(fd);
-    if (!stat.isFile() || stat.size < baseline.offset || stat.size - baseline.offset > MAX_TURN_BYTES) return INVALID;
-    if (baseline.filePath && (stat.dev !== baseline.device || stat.ino !== baseline.inode || readAnchor(fd, baseline.offset) !== baseline.anchor)) return INVALID;
-    const bytes = readRange(fd, baseline.offset, stat.size - baseline.offset);
+    fd = fs9.openSync(filePath, "r");
+    const stat2 = fs9.fstatSync(fd);
+    if (!stat2.isFile() || stat2.size < baseline.offset || stat2.size - baseline.offset > MAX_TURN_BYTES) return INVALID;
+    if (baseline.filePath && (stat2.dev !== baseline.device || stat2.ino !== baseline.inode || readAnchor(fd, baseline.offset) !== baseline.anchor)) return INVALID;
+    const bytes = readRange(fd, baseline.offset, stat2.size - baseline.offset);
     if (!bytes.length || bytes[bytes.length - 1] !== 10) return PENDING;
     return parseTurn(bytes.toString("utf8"), sessionId, baseline);
   } catch {
     return PENDING;
   } finally {
-    if (fd !== void 0) fs6.closeSync(fd);
+    if (fd !== void 0) fs9.closeSync(fd);
   }
 }
 async function resolveCodexTurnUsage(sessionId, baseline, codexHome) {
@@ -44091,9 +44968,13 @@ var currentAbortController = null;
 var currentClaudeQuery = null;
 var claudeInputQueue = null;
 var claudeQuerySlot = new QuerySnapshotSlot();
+var claudePluginRefresh = new ClaudePluginRefresh({
+  warn: (line) => emitEvent({ type: "stderr_line", line })
+});
 var claudeConsumeLoop = null;
 var claudeIdleCloseTimer = null;
 var claudeLastSessionState = null;
+var claudeSessionStateObserved = false;
 var claudeInterruptRequested = false;
 var claudeInterruptCompletionEmitted = false;
 var runtimeTeardownPreparationId = null;
@@ -44323,6 +45204,7 @@ function beginClaudeLifecycleGeneration() {
   }
   clearClaudeLifecycleTerminalTimer();
   claudeLifecycleMode = "negotiating";
+  claudeSessionStateObserved = false;
   claudeSdkCapabilities = void 0;
   claudePreInitLifecycleFrames = [];
   claudeLifecycleProtocolErrorKey = null;
@@ -46241,10 +47123,12 @@ async function consumeClaudeMessages() {
   const inputQueue = new AsyncMessageQueue();
   const handoffOwner = { snapshot: null };
   const options = buildClaudeQueryOptions(handoffOwner);
+  const pluginRevision = claudePluginRefresh.prepareQuery();
   const claudeQuery = withSuppressedClaudeBypassShadowWarning(options, () => Okt({
     prompt: inputQueue,
     options
   }));
+  claudePluginRefresh.trackQuery(claudeQuery, pluginRevision);
   claudeQueryBypassCapabilities.set(claudeQuery, {
     allowBypass: options.allowDangerouslySkipPermissions === true,
     admitted: false
@@ -46592,6 +47476,7 @@ async function consumeClaudeMessages() {
             }
           }
         }
+        claudeSessionStateObserved = true;
         claudeLastSessionState = message.state;
         if (message.state === "idle" && !nonHumanStateIngress && claudeLifecycleMode === "full" && claudeTurnAwaitingResult && claudeForegroundPromptUuid && !claudeLifecycleTerminalTimer) {
           armClaudeLifecycleTerminalTimer(
@@ -46813,13 +47698,20 @@ async function ensureClaudePromptQueueReady() {
   if (!claudeInputQueue) {
     await ensureClaudeSession();
   }
+  const snapshot = captureCurrentClaudeQuerySnapshot();
+  if (snapshot) {
+    await claudePluginRefresh.beforePrompt(snapshot.query, () => initCommand?.provider === "claude" && isCurrentClaudeQuerySnapshot(snapshot) && !stopped && !runtimeTeardownPreparationId && !claudeInterruptRequested && isClaudeForegroundAndSdkIdle() && (claudeSessionStateObserved ? claudeLastSessionState === "idle" : claudeAuthoritativeTerminalCommandId !== null) && !hasUnsettledClaudeBackgroundTasks());
+  }
+  if (!claudeInputQueue && !stopped && !runtimeTeardownPreparationId) {
+    await ensureClaudeSession();
+  }
 }
 function enqueueClaudePrompt(text, images, commandId, legacyReplayMessageId, operation) {
   if (!claudeInputQueue) {
     throw new Error("Claude streaming input queue is not ready");
   }
   const coordinatorStamped = Boolean(commandId);
-  const messageUuid = commandId ?? legacyReplayMessageId ?? randomUUID4();
+  const messageUuid = commandId ?? legacyReplayMessageId ?? randomUUID6();
   pendingClaudePromptReplay = {
     text,
     images,
@@ -47885,7 +48777,7 @@ async function handleCommand(command) {
       return;
     }
     if (initCommand?.provider === "claude" && command.client_message_ids?.length && !command.command_id) {
-      command.command_id = randomUUID4();
+      command.command_id = randomUUID6();
     }
     const operation = new InputOperation(initCommand?.provider ?? "codex", command.client_message_ids, emitEvent, command.command_id);
     promptInputOperations.set(command, operation);
