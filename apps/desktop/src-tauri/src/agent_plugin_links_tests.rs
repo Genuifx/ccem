@@ -500,10 +500,10 @@ fn newly_installed_root_marketplace_is_imported_incrementally_and_stays_disabled
             .as_str()
             .unwrap(),
     );
-    assert_eq!(
-        fs::read_link(linked.join("skills")).unwrap(),
-        extra.join("skills")
-    );
+    assert!(same_link_target(
+        &fs::read_link(linked.join("skills")).unwrap(),
+        &extra.join("skills")
+    ));
     assert!(!linked.join(".claude-plugin/marketplace.json").exists());
     assert_eq!(read(&target.join("settings.json")), settings);
     assert_eq!(all_state(&source), source_before);
@@ -556,10 +556,10 @@ fn metadata_child_links_refresh_and_local_metadata_changes_are_preserved() {
             b"official extra manifest",
         );
         link_plugins(&source, &target).unwrap();
-        assert_eq!(
-            fs::read_link(linked.join(".claude-plugin/config.json")).unwrap(),
-            code.join(".claude-plugin/config.json")
-        );
+        assert!(same_link_target(
+            &fs::read_link(linked.join(".claude-plugin/config.json")).unwrap(),
+            &code.join(".claude-plugin/config.json")
+        ));
         fs::remove_file(code.join(".claude-plugin/config.json")).unwrap();
         link_plugins(&source, &target).unwrap();
         assert!(fs::symlink_metadata(linked.join(".claude-plugin/config.json")).is_err());

@@ -1,5 +1,11 @@
 # ccem
 
+## 2.97.0
+
+### Minor Changes
+
+- Add annotation highlight styles and a color palette, responsive sidebar controls, breadcrumb navigation, and a unified Changes view with worktree-aware diffs. Aggregate Claude usage across isolated profiles, improve analytics interaction recovery and workspace performance, and keep linked marketplace metadata private. Correct Windows symlink-target assertions in the release test suite.
+
 ## 2.96.0
 
 ### Minor Changes
