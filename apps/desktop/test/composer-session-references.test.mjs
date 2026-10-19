@@ -4,12 +4,12 @@ import { build } from 'esbuild';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fixturePath, importFixture } from './helpers/fixture-paths.mjs';
 const temp = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-session-refs-'));
 const outfile = path.join(temp, 'references.mjs');
-await build({ entryPoints: [path.resolve(import.meta.dirname, '../src/components/workspace/composerSessionReferences.ts')],
-  outfile, bundle: true, format: 'esm', platform: 'node', tsconfig: path.resolve(import.meta.dirname, '../tsconfig.json') });
-const refs = await import(pathToFileURL(outfile).href);
+await build({ entryPoints: [fixturePath(import.meta.url, '../src/components/workspace/composerSessionReferences.ts')],
+  outfile, bundle: true, format: 'esm', platform: 'node', tsconfig: fixturePath(import.meta.url, '../tsconfig.json') });
+const refs = await importFixture(outfile);
 test.after(() => fs.rm(temp, { recursive: true, force: true }));
 const chip = (id = 'native-one', title = '设计 [草稿] / 100%') => ({ type: 'chip', trigger: '@', value: id,
   displayText: title, data: { kind: 'session', session: { runtime_id: id, title, provider: 'claude', can_send: true } } });

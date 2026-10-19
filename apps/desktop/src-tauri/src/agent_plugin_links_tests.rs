@@ -1,4 +1,7 @@
 use super::*;
+use crate::test_support::assert_symlink_target;
+#[cfg(unix)]
+use crate::test_support::{symlink_dir, symlink_file};
 
 fn write(path: &Path, bytes: impl AsRef<[u8]>) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -500,10 +503,7 @@ fn newly_installed_root_marketplace_is_imported_incrementally_and_stays_disabled
             .as_str()
             .unwrap(),
     );
-    assert!(same_link_target(
-        &fs::read_link(linked.join("skills")).unwrap(),
-        &extra.join("skills")
-    ));
+    assert_symlink_target(linked.join("skills"), extra.join("skills"));
     assert!(!linked.join(".claude-plugin/marketplace.json").exists());
     assert_eq!(read(&target.join("settings.json")), settings);
     assert_eq!(all_state(&source), source_before);
@@ -556,10 +556,10 @@ fn metadata_child_links_refresh_and_local_metadata_changes_are_preserved() {
             b"official extra manifest",
         );
         link_plugins(&source, &target).unwrap();
-        assert!(same_link_target(
-            &fs::read_link(linked.join(".claude-plugin/config.json")).unwrap(),
-            &code.join(".claude-plugin/config.json")
-        ));
+        assert_symlink_target(
+            linked.join(".claude-plugin/config.json"),
+            code.join(".claude-plugin/config.json"),
+        );
         fs::remove_file(code.join(".claude-plugin/config.json")).unwrap();
         link_plugins(&source, &target).unwrap();
         assert!(fs::symlink_metadata(linked.join(".claude-plugin/config.json")).is_err());
@@ -706,7 +706,11 @@ fn source_escape_private_data_cycles_and_destination_links_are_rejected() {
         if kind != "cycle" && kind != "registry" {
             write(&destination, b"must not be shared");
         }
-        std::os::unix::fs::symlink(&destination, code.join("unsafe")).unwrap();
+        if kind == "cycle" {
+            symlink_dir(&destination, code.join("unsafe")).unwrap();
+        } else {
+            symlink_file(&destination, code.join("unsafe")).unwrap();
+        }
         let before = all_state(&target);
         assert!(link_plugins(&source, &target).is_err());
         assert_eq!(all_state(&target), before);
@@ -715,7 +719,7 @@ fn source_escape_private_data_cycles_and_destination_links_are_rejected() {
     let (_temporary, source, target, _code) = fixture(false);
     let copy = install(&target);
     fs::remove_dir_all(copy.join("skills")).unwrap();
-    std::os::unix::fs::symlink(
+    symlink_dir(
         source.join("plugins/cache/market/demo/1.0.0/skills"),
         copy.join("skills"),
     )
@@ -785,7 +789,7 @@ fn interrupted_owned_version_can_recover_after_official_version_advances_again()
 fn refuses_registered_catalogue_links_but_allows_static_marketplace_named_assets() {
     let (_temporary, source, target, code) = fixture(false);
     let metadata = source.join("plugins/marketplaces/market/.claude-plugin/marketplace.json");
-    std::os::unix::fs::symlink(&metadata, code.join("catalogue-copy.json")).unwrap();
+    symlink_file(&metadata, code.join("catalogue-copy.json")).unwrap();
     let before = all_state(&target);
     assert!(link_plugins(&source, &target)
         .unwrap_err()
