@@ -7,6 +7,17 @@ import { ENV_PRESETS } from '@ccem/core/browser';
 import type { PermissionModeName } from '@ccem/core/browser';
 import { AppLayout } from '@/components/layout';
 import { Workspace } from '@/pages/Workspace';
+// Primary pages render in the urgent navigation commit. Keep code splitting
+// inside expensive detail panels instead of suspending the whole destination.
+import { Analytics as AnalyticsPage, primeAnalyticsPage } from '@/pages/Analytics';
+import { Environments as EnvironmentsPage } from '@/pages/Environments';
+import { Skills as SkillsPage } from '@/pages/Skills';
+import { History as HistoryPage, primeHistoryPage } from '@/pages/History';
+import { Sessions as SessionsPage } from '@/pages/Sessions';
+import { CronTasks as CronTasksPage } from '@/pages/CronTasks';
+import { ProxyDebug as ProxyDebugPage } from '@/pages/ProxyDebug';
+import { ChatApp as ChatAppPage } from '@/pages/ChatApp';
+import { Settings as SettingsPage } from '@/pages/Settings';
 import { useAppStore, type Environment, type LaunchClient } from '@/store';
 import { useTauriCommands } from '@/hooks/useTauriCommands';
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
@@ -22,7 +33,6 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 import { scheduleAfterFirstPaint } from '@/lib/idle';
 import { calculateContinuousUsageDays } from '@/lib/streak';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion, useGSAP } from '@/lib/gsapMotion';
-import { EnvironmentsSkeleton } from '@/components/ui/skeleton-states';
 import { StartupSplash } from '@/components/layout/StartupSplash';
 import { useStartup } from '@/hooks/useStartup';
 import type { PetOpenSessionRequest } from '@/types/pet';
@@ -46,35 +56,8 @@ interface TrayOpenTabRequest {
   tab?: string;
 }
 
-const AnalyticsPage = lazy(async () =>
-  import('@/pages/Analytics').then((m) => ({ default: m.Analytics }))
-);
 const EnvironmentDialogComponent = lazy(async () =>
   import('@/components/EnvironmentDialog').then((m) => ({ default: m.EnvironmentDialog }))
-);
-const EnvironmentsPage = lazy(async () =>
-  import('@/pages/Environments').then((m) => ({ default: m.Environments }))
-);
-const SkillsPage = lazy(async () =>
-  import('@/pages/Skills').then((m) => ({ default: m.Skills }))
-);
-const HistoryPage = lazy(async () =>
-  import('@/pages/History').then((m) => ({ default: m.History }))
-);
-const SessionsPage = lazy(async () =>
-  import('@/pages/Sessions').then((m) => ({ default: m.Sessions }))
-);
-const CronTasksPage = lazy(async () =>
-  import('@/pages/CronTasks').then((m) => ({ default: m.CronTasks }))
-);
-const ProxyDebugPage = lazy(async () =>
-  import('@/pages/ProxyDebug').then((m) => ({ default: m.ProxyDebug }))
-);
-const ChatAppPage = lazy(async () =>
-  import('@/pages/ChatApp').then((m) => ({ default: m.ChatApp }))
-);
-const SettingsPage = lazy(async () =>
-  import('@/pages/Settings').then((m) => ({ default: m.Settings }))
 );
 
 const PERMISSION_MODE_NAMES: PermissionModeName[] = ['yolo', 'dev', 'readonly', 'safe', 'ci', 'audit'];
@@ -261,64 +244,27 @@ function AppContent() {
     );
   }, [openInteractiveSessionInTerminal, t]);
 
-  const preloadAnalyticsPage = useCallback(() => {
-    void import('@/pages/Analytics').then((module) => {
-      module.primeAnalyticsPage?.();
-    });
-  }, []);
-
-  const preloadEnvironmentsPage = useCallback(() => {
-    void import('@/pages/Environments');
-  }, []);
-
-  const preloadHistoryPage = useCallback(() => {
-    void import('@/pages/History').then((module) => {
-      module.primeHistoryPage?.();
-    });
-  }, []);
-
-  const preloadSessionsPage = useCallback(() => {
-    void import('@/pages/Sessions');
-  }, []);
-
-  const preloadSettingsPage = useCallback(() => {
-    void import('@/pages/Settings');
-  }, []);
-
+  // Only the expensive content within these pages still needs prefetching.
   const prefetchTab = useCallback((tab: string) => {
     switch (tab) {
       case 'analytics':
-        preloadAnalyticsPage();
-        return;
-      case 'environments':
-        preloadEnvironmentsPage();
+        primeAnalyticsPage();
         return;
       case 'history':
-        preloadHistoryPage();
-        return;
-      case 'sessions':
-        preloadSessionsPage();
-        return;
-      case 'settings':
-        preloadSettingsPage();
+        primeHistoryPage();
         return;
       default:
         return;
     }
-  }, [
-    preloadAnalyticsPage,
-    preloadEnvironmentsPage,
-    preloadHistoryPage,
-    preloadSessionsPage,
-    preloadSettingsPage,
-  ]);
+  }, []);
 
   // Tab switches must stay urgent. Wrapping setActiveTab in startTransition
   // let the 140ms active-session poll (urgent setEvents batches) interrupt the
   // transition render faster than it could finish, so long transcripts starved
   // the switch and every entry point (sidebar / menu / ⌘N / tray) went dead.
-  // Pages are lazy() + prefetched above, so the Suspense skeleton already
-  // covers the (pre-warmed) load.
+  // An urgent tab update alone cannot guarantee a lazy page's later Suspense
+  // retry will commit. Import primary pages up front so the same urgent commit
+  // includes their content, even when deferred transcript work is delayed.
   const navigateToTab = useCallback((tab: string) => {
     prefetchTab(tab);
     setActiveTab(tab);
@@ -824,11 +770,7 @@ function AppContent() {
                   />
                 </div>
 
-                {activeTab !== 'workspace' ? (
-                  <Suspense fallback={<PageFallback activeTab={activeTab} />}>
-                    {renderActivePage()}
-                  </Suspense>
-                ) : null}
+                {renderActivePage()}
               </div>
             </AppLayout>
           ) : null}
@@ -880,18 +822,6 @@ function App() {
         <AppContent />
       </NativeBackgroundTaskAppGuardProvider>
     </LocaleProvider>
-  );
-}
-
-function PageFallback({ activeTab }: { activeTab: string }) {
-  if (activeTab === 'environments') {
-    return <EnvironmentsSkeleton />;
-  }
-
-  return (
-    <div className="min-h-[320px] w-full flex items-center justify-center text-sm text-muted-foreground">
-      Loading...
-    </div>
   );
 }
 
