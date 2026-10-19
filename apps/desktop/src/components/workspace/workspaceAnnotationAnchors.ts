@@ -38,7 +38,7 @@ function characterOffsetWithin(
 interface ItemTextIndex {
   nodes: Text[];
   starts: number[];
-  startsByNode: Map<Text, number>;
+  indicesByNode: Map<Text, number>;
   total: number;
 }
 
@@ -47,17 +47,17 @@ type ItemTextIndexCache = Map<HTMLElement, ItemTextIndex>;
 function buildItemTextIndex(item: HTMLElement): ItemTextIndex {
   const nodes: Text[] = [];
   const starts: number[] = [];
-  const startsByNode = new Map<Text, number>();
+  const indicesByNode = new Map<Text, number>();
   let total = 0;
   const walker = item.ownerDocument.createTreeWalker(item, NodeFilter.SHOW_TEXT);
   while (walker.nextNode()) {
     const node = walker.currentNode as Text;
-    startsByNode.set(node, total);
+    indicesByNode.set(node, nodes.length);
     nodes.push(node);
     starts.push(total);
     total += node.data.length;
   }
-  return { nodes, starts, startsByNode, total };
+  return { nodes, starts, indicesByNode, total };
 }
 
 function itemTextIndex(item: HTMLElement, cache?: ItemTextIndexCache): ItemTextIndex {
@@ -123,8 +123,8 @@ function textBetweenBoundaries(
   if (start.node === end.node) {
     return start.node.data.slice(start.offset, end.offset);
   }
-  const startNodeIndex = index.startsByNode.get(start.node);
-  const endNodeIndex = index.startsByNode.get(end.node);
+  const startNodeIndex = index.indicesByNode.get(start.node);
+  const endNodeIndex = index.indicesByNode.get(end.node);
   if (startNodeIndex == null || endNodeIndex == null || startNodeIndex > endNodeIndex) {
     return null;
   }

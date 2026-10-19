@@ -39,7 +39,7 @@ async function importHarness() {
         import { createRoot } from 'react-dom/client';
         import { WorkspaceTranscriptSelection } from '@/components/workspace/WorkspaceAnnotations';
 
-        export function mount(container) {
+        export function mount(container, html) {
           let addCalls = 0;
           let flushState = null;
 
@@ -57,7 +57,9 @@ async function importHarness() {
                 React.createElement(
                   'div',
                   { 'data-transcript-item-key': 'message-a', id: 'item-a' },
-                  'Alpha selected words here.',
+                  html === undefined
+                    ? 'Alpha selected words here.'
+                    : React.createElement('div', { dangerouslySetInnerHTML: { __html: html } }),
                 ),
                 React.createElement(WorkspaceTranscriptSelection, {
                   rootRef: viewportRef,
@@ -497,3 +499,109 @@ test('annotation highlights and markers live in content coordinates and ignore s
     await fs.rm(tempDir, { recursive: true, force: true });
   }
 });
+
+const multiNodeSelections = [
+  {
+    name: 'paragraphs',
+    html: '<p>Unselected prefix.</p><p id="selection-start">Alpha first paragraph.</p><p>Middle paragraph.</p><p id="selection-end">Omega final paragraph.</p>',
+    expected: 'pha first paragraph.Middle paragraph.Omega',
+  },
+  {
+    name: 'bold text',
+    html: '<p>Unselected prefix.<span id="selection-start">Alpha </span><strong>bold middle</strong><span id="selection-end">Omega tail.</span></p>',
+    expected: 'pha bold middleOmega',
+  },
+  {
+    name: 'table cells',
+    html: '<table><tbody><tr><td>Unselected prefix.</td><td id="selection-start">Alpha cell</td><td>Middle cell</td><td id="selection-end">Omega cell</td></tr></tbody></table>',
+    expected: 'pha cellMiddle cellOmega',
+  },
+  {
+    name: 'table rows',
+    html: '<table><tbody><tr><td>Unselected prefix.</td><td id="selection-start">Alpha cell</td></tr><tr><td>Middle cell</td><td id="selection-end">Omega cell</td></tr></tbody></table>',
+    expected: 'pha cellMiddle cellOmega',
+  },
+];
+
+for (const selectionCase of multiNodeSelections) {
+  test(`selecting across ${selectionCase.name} opens the toolbar and saves the complete quote`, async () => {
+    const dom = installDom();
+    const { window } = dom;
+    const { document } = window;
+    const { harness, tempDir } = await importHarness();
+    const errors = [];
+    window.addEventListener('error', (event) => {
+      errors.push(event.error?.message ?? event.message);
+      event.preventDefault();
+    });
+    let api = null;
+
+    try {
+      api = harness.mount(document.getElementById('root'), selectionCase.html);
+      const viewport = document.getElementById('viewport');
+      const content = document.getElementById('content');
+      viewport.getBoundingClientRect = () => domRect(0, 0, 800, 600);
+      content.getBoundingClientRect = () => domRect(0, 0, 800, 1200);
+      window.Range.prototype.getClientRects = () => [domRect(150, 100, 300, 118)];
+
+      const range = document.createRange();
+      range.setStart(document.getElementById('selection-start').firstChild, 2);
+      range.setEnd(document.getElementById('selection-end').firstChild, 5);
+      assert.equal(range.cloneContents().textContent, selectionCase.expected);
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+      harness.run(() => {
+        document.dispatchEvent(new window.MouseEvent('mouseup', { bubbles: true }));
+      });
+      await harness.flush();
+
+      assert.deepEqual(errors, [], 'capturing a multi-node selection must not throw');
+      const actionBar = document.querySelector('[data-workspace-annotation-action-bar]');
+      assert.ok(actionBar, 'the selection toolbar should open');
+      assert.ok(document.querySelector('[data-workspace-selection-highlight="candidate"]'));
+      const addToTask = [...actionBar.querySelectorAll('button')]
+        .find((button) => button.textContent.trim() === 'Add to task');
+      assert.ok(addToTask);
+      harness.run(() => addToTask.click());
+      await harness.flush();
+
+      const textarea = document.querySelector('[data-workspace-selection-action] textarea');
+      assert.ok(textarea, 'the note editor should open');
+      harness.run(() => {
+        Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set
+          .call(textarea, `Review ${selectionCase.name}`);
+        textarea.dispatchEvent(new window.Event('input', { bubbles: true }));
+      });
+      await harness.flush();
+      const addButton = [...document.querySelectorAll('button')]
+        .find((button) => button.textContent.trim() === 'Add');
+      assert.ok(addButton);
+      harness.run(() => addButton.click());
+      await harness.flush();
+
+      assert.equal(api.addCalls, 1);
+      assert.equal(api.annotations[0].quote, selectionCase.expected);
+      assert.equal(api.annotations[0].note, `Review ${selectionCase.name}`);
+      assert.ok(document.querySelector('[data-workspace-selection-highlight="saved"]'),
+        'the saved multi-node anchor should resolve and render its highlight');
+      assert.ok(document.querySelector('[data-workspace-annotation-marker]'));
+      assert.deepEqual(errors, [], 'resolving the saved anchor must not throw');
+
+      // Re-measure after a content mutation to exercise the cached batch resolver.
+      harness.run(() => {
+        document.getElementById('item-a').append(document.createTextNode('Later text.'));
+      });
+      await new Promise((resolve) => setTimeout(resolve, 220));
+      await harness.flush();
+      assert.ok(document.querySelector('[data-workspace-selection-highlight="saved"]'));
+      assert.equal(api.annotations[0].quote, selectionCase.expected);
+      assert.deepEqual(errors, []);
+    } finally {
+      api?.unmount();
+      dom.window.close();
+      await stopEsbuild();
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  });
+}
