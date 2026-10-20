@@ -1328,15 +1328,25 @@ fn debug_compare_sessions(
     unified_state.debug_compare_sessions()
 }
 
-fn prepare_workspace_initial_prompt(initial_prompt: &str, limit_write_tools: bool) -> String {
+fn prepare_workspace_initial_prompt(
+    initial_prompt: &str,
+    limit_write_tools: bool,
+    provider_session_id: Option<&str>,
+) -> String {
+    // Provider commands must reach their parser unchanged, including on resume.
     // A guidance-only prompt must not start an otherwise empty session turn.
-    if initial_prompt.trim().is_empty() {
+    if initial_prompt.trim().is_empty() || initial_prompt.trim_start().starts_with('/') {
         return initial_prompt.to_string();
     }
-    let mut prompt = format!(
-        "<system_tip>{}</system_tip>\n\n",
-        user_prompt_display::WORKSPACE_FILE_PREVIEW_SYSTEM_TIP,
-    );
+    let is_resume = provider_session_id.is_some_and(|id| !id.trim().is_empty());
+    let mut prompt = String::new();
+    // Restored and forked sessions already carry their conversation guidance.
+    if !is_resume {
+        prompt.push_str(&format!(
+            "<system_tip>{}</system_tip>\n\n",
+            user_prompt_display::WORKSPACE_FILE_PREVIEW_SYSTEM_TIP,
+        ));
+    }
     if limit_write_tools {
         prompt.push_str(&format!(
             "<system_tip>{}</system_tip>\n\n",
@@ -1459,6 +1469,7 @@ async fn create_native_session(
                 initial_prompt: Some(prepare_workspace_initial_prompt(
                     &initial_prompt,
                     resolved.limit_write_tools,
+                    provider_session_id.as_deref(),
                 )),
                 display_prompt: Some(user_visible_initial_prompt.clone()),
                 initial_images: initial_images.clone(),
@@ -1495,6 +1506,7 @@ async fn create_native_session(
                 initial_prompt: Some(prepare_workspace_initial_prompt(
                     &initial_prompt,
                     resolved.limit_write_tools,
+                    provider_session_id.as_deref(),
                 )),
                 display_prompt: Some(user_visible_initial_prompt.clone()),
                 initial_images: initial_images.clone(),
@@ -6805,7 +6817,7 @@ mod tests {
     fn workspace_initial_prompt_includes_preview_guidance_and_optional_write_limit() {
         let prompt = "Update the configuration";
         for limit_write_tools in [false, true] {
-            let prepared = prepare_workspace_initial_prompt(prompt, limit_write_tools);
+            let prepared = prepare_workspace_initial_prompt(prompt, limit_write_tools, None);
             assert!(prepared.starts_with(&format!(
                 "<system_tip>{WORKSPACE_FILE_PREVIEW_SYSTEM_TIP}</system_tip>\n\n"
             )));
@@ -6822,11 +6834,56 @@ mod tests {
     fn workspace_initial_prompt_does_not_start_guidance_only_turns() {
         for prompt in ["", " \n\t"] {
             for limit_write_tools in [false, true] {
-                assert_eq!(
-                    prepare_workspace_initial_prompt(prompt, limit_write_tools),
-                    prompt
-                );
+                for session_id in [None, Some("existing-session")] {
+                    assert_eq!(
+                        prepare_workspace_initial_prompt(prompt, limit_write_tools, session_id),
+                        prompt
+                    );
+                }
             }
+        }
+    }
+
+    #[test]
+    fn workspace_initial_prompt_preserves_provider_commands_on_create_and_resume() {
+        for prompt in [
+            "/compact",
+            "/compact retain implementation decisions",
+            " \n/compact 保留当前任务状态  ",
+            "/context",
+            "/clear",
+            "/plugin:command arguments",
+        ] {
+            for limit_write_tools in [false, true] {
+                for session_id in [None, Some("existing-session")] {
+                    assert_eq!(
+                        prepare_workspace_initial_prompt(prompt, limit_write_tools, session_id),
+                        prompt
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_initial_prompt_does_not_repeat_preview_guidance_on_resume() {
+        let prompt = "Continue the current task\nKeep this line too.";
+        assert_eq!(
+            prepare_workspace_initial_prompt(prompt, false, Some("existing-session")),
+            prompt
+        );
+        // The environment's write-size advice remains independent of preview guidance.
+        let prepared = prepare_workspace_initial_prompt(prompt, true, Some("existing-session"));
+        assert!(!prepared.contains(WORKSPACE_FILE_PREVIEW_SYSTEM_TIP));
+        assert_eq!(
+            prepared,
+            format!("<system_tip>{WRITE_TOOL_LIMIT_SYSTEM_TIP}</system_tip>\n\n{prompt}")
+        );
+        for session_id in [None, Some(""), Some(" \t")] {
+            assert_eq!(
+                prepare_workspace_initial_prompt(prompt, false, session_id),
+                prepare_workspace_initial_prompt(prompt, false, None)
+            );
         }
     }
 

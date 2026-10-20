@@ -7119,7 +7119,7 @@ mod tests {
     #[test]
     fn workspace_preview_prompt_guidance_is_hidden_in_claude_and_codex_history() {
         let temp = tempfile::tempdir().unwrap();
-        let prompt = crate::prepare_workspace_initial_prompt("请生成报告", true);
+        let prompt = crate::prepare_workspace_initial_prompt("请生成报告", true, None);
         let image = serde_json::json!({ "type": "image", "source": { "type": "base64", "data": "image-data", "media_type": "image/png" } });
         let claude = temp.path().join("claude.jsonl");
         let lines = [
