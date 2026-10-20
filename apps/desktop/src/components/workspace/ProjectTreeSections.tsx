@@ -294,7 +294,9 @@ export const ProjectTreeContent = memo(function ProjectTreeContent({
       <div
         key={node.project}
         data-project-motion-key={`project:${section}:${node.project}`}
-        className="mb-0.5 [content-visibility:auto] [contain-intrinsic-size:44px]"
+        // WebKit can leave remounted content-visibility:auto subtrees unpainted
+        // after the sidebar reopens. Rows are already paginated; paint groups eagerly.
+        className="mb-0.5"
       >
         <ContextMenu>
           <ContextMenuTrigger asChild>{header}</ContextMenuTrigger>
