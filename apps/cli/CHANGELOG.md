@@ -1,5 +1,11 @@
 # ccem
 
+## 2.98.0
+
+### Minor Changes
+
+- fix(desktop): restore multi-node annotation selections
+
 ## 2.97.0
 
 ### Minor Changes
