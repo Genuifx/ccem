@@ -1,5 +1,11 @@
 # ccem
 
+## 2.99.0
+
+### Minor Changes
+
+- Release v2.99.0.
+
 ## 2.98.0
 
 ### Minor Changes
