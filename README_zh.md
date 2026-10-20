@@ -175,15 +175,15 @@ ccem cp <src> <dst>
 |---|---|---|---|
 | GLM（智谱） | `https://open.bigmodel.cn/api/anthropic` | glm-5.3[1m] | glm-5.3-flash |
 | KIMI（月之暗面） | `https://api.moonshot.cn/anthropic` | kimi-k3[1m] | kimi-k2.7-code |
-| Kimi Code Plan | `https://api.kimi.com/coding/` | kimi-for-coding | kimi-for-coding |
-| MiniMax | `https://api.minimax.cn/anthropic` | MiniMax-M3[1m] | MiniMax-M3[1m] |
-| DeepSeek | `https://api.deepseek.com/anthropic` | deepseek-v4-pro[1m] | deepseek-v4-flash |
+| Kimi Code Plan | `https://api.kimi.com/coding/` | k3[1m] | k3[1m] |
+| MiniMax | `https://api.minimax.cn/anthropic` | MiniMax-M3.1-Flash[1m] | MiniMax-M3.1-Flash[1m] |
+| DeepSeek | `https://api.deepseek.com/anthropic` | deepseek-flash[1m] | deepseek-flash |
 | 百炼（阿里云） | `https://dashscope.aliyuncs.com/apps/anthropic` | qwen3.7-max | qwen3.6-flash |
 | 百炼 Code Plan | `https://coding.dashscope.aliyuncs.com/apps/anthropic` | qwen3.7-plus | qwen3.7-plus |
-| OpenRouter | `https://openrouter.ai/api` | anthropic/claude-opus-5 | anthropic/claude-haiku-4.5 |
+| OpenRouter | `https://openrouter.ai/api` | ~anthropic/claude-opus-latest[1m] | ~anthropic/claude-haiku-latest |
 | Ollama | `http://localhost:11434` | gemma4:31b | gemma4:e4b |
-| MiMo（小米） | `https://api.xiaomimimo.com/anthropic` | mimo-v2.5-pro | mimo-v2.5 |
-| MiMo Token Plan | `https://token-plan-cn.xiaomimimo.com/anthropic` | mimo-v2.5-pro | mimo-v2.5-pro |
+| MiMo（小米） | `https://api.xiaomimimo.com/anthropic` | mimo-v2.6-pro | mimo-v2.6-pro |
+| MiMo Token Plan | `https://token-plan-cn.xiaomimimo.com/anthropic` | mimo-v2.6-pro | mimo-v2.6-pro |
 
 > 官方环境默认 `claude-sonnet-4-5-20250929` + `claude-haiku-4-5-20251001`。
 

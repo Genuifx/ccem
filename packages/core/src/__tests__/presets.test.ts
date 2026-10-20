@@ -33,17 +33,17 @@ describe('presets', () => {
     it('should have MiniMax preset with correct structure', () => {
       expect(ENV_PRESETS.MiniMax).toBeDefined();
       expect(ENV_PRESETS.MiniMax.ANTHROPIC_BASE_URL).toContain('minimax.cn');
-      expect(ENV_PRESETS.MiniMax.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('MiniMax-M3[1m]');
-      expect(ENV_PRESETS.MiniMax.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('MiniMax-M3[1m]');
-      expect(ENV_PRESETS.MiniMax.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('MiniMax-M3[1m]');
+      expect(ENV_PRESETS.MiniMax.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('MiniMax-M3.1-Flash[1m]');
+      expect(ENV_PRESETS.MiniMax.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('MiniMax-M3.1-Flash[1m]');
+      expect(ENV_PRESETS.MiniMax.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('MiniMax-M3.1-Flash[1m]');
     });
 
     it('should have DeepSeek preset with correct structure and 1M context', () => {
       expect(ENV_PRESETS.DeepSeek).toBeDefined();
       expect(ENV_PRESETS.DeepSeek.ANTHROPIC_BASE_URL).toContain('deepseek.com');
-      expect(ENV_PRESETS.DeepSeek.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('deepseek-v4-pro[1m]');
-      expect(ENV_PRESETS.DeepSeek.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('deepseek-v4-pro[1m]');
-      expect(ENV_PRESETS.DeepSeek.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('deepseek-v4-flash');
+      expect(ENV_PRESETS.DeepSeek.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('deepseek-flash[1m]');
+      expect(ENV_PRESETS.DeepSeek.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('deepseek-flash[1m]');
+      expect(ENV_PRESETS.DeepSeek.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('deepseek-flash');
     });
 
     it('should include new preset providers', () => {
@@ -54,9 +54,9 @@ describe('presets', () => {
 
     it('should keep highlighted provider presets aligned with official defaults', () => {
       expect(ENV_PRESETS.KimiCodePlan.ANTHROPIC_BASE_URL).toBe('https://api.kimi.com/coding/');
-      expect(ENV_PRESETS.KimiCodePlan.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('kimi-for-coding');
-      expect(ENV_PRESETS.KimiCodePlan.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('kimi-for-coding');
-      expect(ENV_PRESETS.KimiCodePlan.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('kimi-for-coding');
+      expect(ENV_PRESETS.KimiCodePlan.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('k3[1m]');
+      expect(ENV_PRESETS.KimiCodePlan.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('k3[1m]');
+      expect(ENV_PRESETS.KimiCodePlan.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('k3[1m]');
 
       expect(ENV_PRESETS.Bailian.ANTHROPIC_BASE_URL).toBe(
         'https://dashscope.aliyuncs.com/apps/anthropic',
@@ -73,20 +73,22 @@ describe('presets', () => {
       expect(ENV_PRESETS.BailianCodePlan.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('qwen3.7-plus');
 
       expect(ENV_PRESETS.OpenRouter.ANTHROPIC_BASE_URL).toBe('https://openrouter.ai/api');
-      expect(ENV_PRESETS.OpenRouter.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('anthropic/claude-opus-5');
+      expect(ENV_PRESETS.OpenRouter.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe(
+        '~anthropic/claude-opus-latest[1m]',
+      );
       expect(ENV_PRESETS.OpenRouter.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe(
-        'anthropic/claude-sonnet-5',
+        '~anthropic/claude-sonnet-latest[1m]',
       );
       expect(ENV_PRESETS.OpenRouter.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe(
-        'anthropic/claude-haiku-4.5',
+        '~anthropic/claude-haiku-latest',
       );
 
       expect(ENV_PRESETS.MiMoTokenPlan.ANTHROPIC_BASE_URL).toBe(
         'https://token-plan-cn.xiaomimimo.com/anthropic',
       );
-      expect(ENV_PRESETS.MiMoTokenPlan.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('mimo-v2.5-pro');
-      expect(ENV_PRESETS.MiMoTokenPlan.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('mimo-v2.5-pro');
-      expect(ENV_PRESETS.MiMoTokenPlan.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('mimo-v2.5-pro');
+      expect(ENV_PRESETS.MiMoTokenPlan.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('mimo-v2.6-pro');
+      expect(ENV_PRESETS.MiMoTokenPlan.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('mimo-v2.6-pro');
+      expect(ENV_PRESETS.MiMoTokenPlan.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('mimo-v2.6-pro');
     });
 
     it('should not include auth tokens in presets', () => {

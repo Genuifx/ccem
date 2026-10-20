@@ -26,23 +26,23 @@ export const ENV_PRESETS: Record<
   },
   'KimiCodePlan': {
     ANTHROPIC_BASE_URL: 'https://api.kimi.com/coding/',
-    ANTHROPIC_DEFAULT_OPUS_MODEL: 'kimi-for-coding',
-    ANTHROPIC_DEFAULT_SONNET_MODEL: 'kimi-for-coding',
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'kimi-for-coding',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'k3[1m]',
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'k3[1m]',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'k3[1m]',
     ANTHROPIC_MODEL: 'opus'
   },
   'MiniMax': {
     ANTHROPIC_BASE_URL: 'https://api.minimax.cn/anthropic',
-    ANTHROPIC_DEFAULT_OPUS_MODEL: 'MiniMax-M3[1m]',
-    ANTHROPIC_DEFAULT_SONNET_MODEL: 'MiniMax-M3[1m]',
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'MiniMax-M3[1m]',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'MiniMax-M3.1-Flash[1m]',
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'MiniMax-M3.1-Flash[1m]',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'MiniMax-M3.1-Flash[1m]',
     ANTHROPIC_MODEL: 'opus'
   },
   'DeepSeek': {
     ANTHROPIC_BASE_URL: 'https://api.deepseek.com/anthropic',
-    ANTHROPIC_DEFAULT_OPUS_MODEL: 'deepseek-v4-pro[1m]',
-    ANTHROPIC_DEFAULT_SONNET_MODEL: 'deepseek-v4-pro[1m]',
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'deepseek-v4-flash',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'deepseek-flash[1m]',
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'deepseek-flash[1m]',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'deepseek-flash',
     ANTHROPIC_MODEL: 'opus'
   },
   'Bailian': {
@@ -61,9 +61,9 @@ export const ENV_PRESETS: Record<
   },
   'OpenRouter': {
     ANTHROPIC_BASE_URL: 'https://openrouter.ai/api',
-    ANTHROPIC_DEFAULT_OPUS_MODEL: 'anthropic/claude-opus-5',
-    ANTHROPIC_DEFAULT_SONNET_MODEL: 'anthropic/claude-sonnet-5',
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'anthropic/claude-haiku-4.5',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: '~anthropic/claude-opus-latest[1m]',
+    ANTHROPIC_DEFAULT_SONNET_MODEL: '~anthropic/claude-sonnet-latest[1m]',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: '~anthropic/claude-haiku-latest',
     ANTHROPIC_MODEL: 'opus'
   },
   'Ollama': {
@@ -75,16 +75,16 @@ export const ENV_PRESETS: Record<
   },
   'MiMo': {
     ANTHROPIC_BASE_URL: 'https://api.xiaomimimo.com/anthropic',
-    ANTHROPIC_DEFAULT_OPUS_MODEL: 'mimo-v2.5-pro',
-    ANTHROPIC_DEFAULT_SONNET_MODEL: 'mimo-v2.5-pro',
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'mimo-v2.5',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'mimo-v2.6-pro',
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'mimo-v2.6-pro',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'mimo-v2.6-pro',
     ANTHROPIC_MODEL: 'opus'
   },
   'MiMoTokenPlan': {
     ANTHROPIC_BASE_URL: 'https://token-plan-cn.xiaomimimo.com/anthropic',
-    ANTHROPIC_DEFAULT_OPUS_MODEL: 'mimo-v2.5-pro',
-    ANTHROPIC_DEFAULT_SONNET_MODEL: 'mimo-v2.5-pro',
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'mimo-v2.5-pro',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'mimo-v2.6-pro',
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'mimo-v2.6-pro',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'mimo-v2.6-pro',
     ANTHROPIC_MODEL: 'opus'
   },
 };
