@@ -1,17 +1,41 @@
 import { useLocale } from '@/locales';
-import { FileText, Image as ImageIcon, Paperclip, X } from '@/lib/lucide-react';
-import { getComposerImageAttachmentSrc, type ComposerAttachment, type ComposerImageAttachment } from './composerAttachments';
+import { cn } from '@/lib/utils';
+import {
+  File,
+  FileCode,
+  FileImage,
+  FileJson,
+  FileSpreadsheet,
+  FileText,
+  Image as ImageIcon,
+  Package,
+  X,
+} from '@/lib/lucide-react';
+import {
+  getComposerFileKind,
+  getComposerImageAttachmentSrc,
+  type ComposerAttachment,
+  type ComposerFileKind,
+  type ComposerImageAttachment,
+} from './composerAttachments';
+
+const NEUTRAL_TONE = 'bg-muted text-muted-foreground';
+
+// Only kinds worth telling apart at a glance get a tint; the rest stay neutral.
+const FILE_KIND_ICONS: Record<ComposerFileKind, { Icon: typeof File; tone: string }> = {
+  image: { Icon: FileImage, tone: 'bg-info/10 text-info' },
+  code: { Icon: FileCode, tone: 'bg-primary/10 text-primary' },
+  data: { Icon: FileJson, tone: 'bg-warning/15 text-warning' },
+  spreadsheet: { Icon: FileSpreadsheet, tone: 'bg-success/10 text-success' },
+  document: { Icon: FileText, tone: NEUTRAL_TONE },
+  archive: { Icon: Package, tone: NEUTRAL_TONE },
+  file: { Icon: File, tone: NEUTRAL_TONE },
+};
 
 function attachmentIcon(attachment: ComposerAttachment) {
-  if (attachment.kind === 'text') {
-    return <FileText className="h-3.5 w-3.5" />;
-  }
-
-  if (attachment.kind === 'image') {
-    return <ImageIcon className="h-3.5 w-3.5" />;
-  }
-
-  return <Paperclip className="h-3.5 w-3.5" />;
+  if (attachment.kind === 'text') return { Icon: FileText, tone: NEUTRAL_TONE };
+  if (attachment.kind === 'image') return { Icon: ImageIcon, tone: FILE_KIND_ICONS.image.tone };
+  return FILE_KIND_ICONS[getComposerFileKind(attachment.name)];
 }
 
 export function formatImageSize(bytes: number): string {
@@ -41,6 +65,7 @@ export function ComposerAttachmentChip({
     ? attachment.absolutePath
     : attachment.name;
 
+  const { Icon, tone } = attachmentIcon(attachment);
   const imageSrc = attachment.kind === 'image'
     ? getComposerImageAttachmentSrc(attachment)
     : null;
@@ -61,8 +86,8 @@ export function ComposerAttachmentChip({
       </button>
     )
     : (
-      <span className="shrink-0 rounded-lg bg-muted p-1.5 text-muted-foreground">
-        {attachmentIcon(attachment)}
+      <span className={cn('shrink-0 rounded-lg p-1.5', tone)}>
+        <Icon className="h-3.5 w-3.5" />
       </span>
     );
 

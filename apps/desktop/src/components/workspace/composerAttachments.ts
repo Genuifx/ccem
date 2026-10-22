@@ -99,6 +99,26 @@ export function getComposerPathName(path: string): string {
   return parts[parts.length - 1] ?? normalized;
 }
 
+export type ComposerFileKind = 'image' | 'code' | 'data' | 'spreadsheet' | 'document' | 'archive' | 'file';
+
+const COMPOSER_FILE_KIND_BY_EXTENSION: Record<string, ComposerFileKind> = Object.fromEntries([
+  ...['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico', 'heic', 'avif'].map((ext) => [ext, 'image']),
+  ...['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'py', 'rs', 'go', 'java', 'kt', 'swift', 'c', 'h', 'cc', 'cpp', 'hpp',
+    'cs', 'rb', 'php', 'sh', 'bash', 'zsh', 'css', 'scss', 'less', 'html', 'vue', 'svelte', 'sql', 'lua', 'dart'].map((ext) => [ext, 'code']),
+  ...['json', 'jsonc', 'json5', 'yaml', 'yml', 'toml', 'xml', 'ini', 'lock', 'plist'].map((ext) => [ext, 'data']),
+  ...['csv', 'tsv', 'xls', 'xlsx', 'numbers'].map((ext) => [ext, 'spreadsheet']),
+  ...['md', 'mdx', 'txt', 'pdf', 'doc', 'docx', 'rtf', 'log', 'pages', 'ppt', 'pptx', 'key'].map((ext) => [ext, 'document']),
+  ...['zip', 'tar', 'gz', 'tgz', 'bz2', 'xz', 'rar', '7z', 'dmg'].map((ext) => [ext, 'archive']),
+]);
+
+/** Classifies a file attachment by extension so the chip can pick an icon. */
+export function getComposerFileKind(name: string): ComposerFileKind {
+  const dot = name.lastIndexOf('.');
+  // No extension, or a dotfile such as `.env`.
+  if (dot <= 0) return 'file';
+  return COMPOSER_FILE_KIND_BY_EXTENSION[name.slice(dot + 1).toLowerCase()] ?? 'file';
+}
+
 export function getRelativeComposerPath(path: string, workingDir?: string | null): string | null {
   if (!workingDir) {
     return null;

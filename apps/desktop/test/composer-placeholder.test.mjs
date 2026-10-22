@@ -153,3 +153,19 @@ test('builds selected skill prompt attachments inside user request', async () =>
   assert.match(userRequest, /```text\nlarge paste\n```/);
   assert.doesNotMatch(afterUserRequest, /Attached files:|Attached text snippets:|\[Image #1\]/);
 });
+
+test('classifies composer file attachments by extension for their icon', async () => {
+  const { getComposerFileKind } = await importComposerAttachments();
+
+  assert.equal(getComposerFileKind('shot.PNG'), 'image');
+  assert.equal(getComposerFileKind('App.tsx'), 'code');
+  assert.equal(getComposerFileKind('lib.rs'), 'code');
+  assert.equal(getComposerFileKind('package.json'), 'data');
+  assert.equal(getComposerFileKind('config.yaml'), 'data');
+  assert.equal(getComposerFileKind('report.csv'), 'spreadsheet');
+  assert.equal(getComposerFileKind('README.md'), 'document');
+  assert.equal(getComposerFileKind('spec.pdf'), 'document');
+  assert.equal(getComposerFileKind('build.tar.gz'), 'archive');
+  assert.equal(getComposerFileKind('Makefile'), 'file');
+  assert.equal(getComposerFileKind('.env'), 'file');
+});
