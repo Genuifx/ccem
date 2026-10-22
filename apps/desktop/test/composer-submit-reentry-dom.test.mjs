@@ -53,13 +53,13 @@ const stubsPlugin = {
       loader: 'js',
       contents: 'export async function invoke() { return []; }',
     }));
-    builder.onResolve({ filter: /^@tauri-apps\/api\/window$/ }, () => ({
-      path: 'tauri-window-stub', namespace: 'composer-submit-stubs',
+    builder.onResolve({ filter: /^@tauri-apps\/api\/webview$/ }, () => ({
+      path: 'tauri-webview-stub', namespace: 'composer-submit-stubs',
     }));
-    builder.onLoad({ filter: /^tauri-window-stub$/, namespace: 'composer-submit-stubs' }, () => ({
+    builder.onLoad({ filter: /^tauri-webview-stub$/, namespace: 'composer-submit-stubs' }, () => ({
       loader: 'js',
       contents: `
-        export function getCurrentWindow() {
+        export function getCurrentWebview() {
           return { async onDragDropEvent(handler) {
             window.__composerDragHandlers ??= new Set();
             window.__composerDragHandlers.add(handler);

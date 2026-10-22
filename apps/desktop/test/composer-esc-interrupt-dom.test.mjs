@@ -46,13 +46,13 @@ const stubsPlugin = {
       loader: 'js',
       contents: 'export async function invoke(command, args) { return globalThis.__escInterruptInvoke ? globalThis.__escInterruptInvoke(command, args) : []; }',
     }));
-    builder.onResolve({ filter: /^@tauri-apps\/api\/window$/ }, () => ({
-      path: 'tauri-window-stub', namespace: 'composer-esc-stubs',
+    builder.onResolve({ filter: /^@tauri-apps\/api\/webview$/ }, () => ({
+      path: 'tauri-webview-stub', namespace: 'composer-esc-stubs',
     }));
-    builder.onLoad({ filter: /^tauri-window-stub$/, namespace: 'composer-esc-stubs' }, () => ({
+    builder.onLoad({ filter: /^tauri-webview-stub$/, namespace: 'composer-esc-stubs' }, () => ({
       loader: 'js',
       contents: `
-        export function getCurrentWindow() {
+        export function getCurrentWebview() {
           return { async onDragDropEvent() { return () => {}; } };
         }
       `,

@@ -10,7 +10,7 @@ import {
   useState,
 } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { getCurrentWindow } from '@tauri-apps/api/window';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { toast } from 'sonner';
 import { readAppZoom } from '@/hooks/useZoom';
 import { isComposerFileDropInside } from './composerFileDrop';
@@ -1355,7 +1355,9 @@ export function WorkspaceSessionComposer({
     setDraggedFileCount(0);
     if (disabled) return;
 
-    void getCurrentWindow()
+    // Tauri's `unstable` feature hosts the main page as a child webview, so
+    // drag-drop events target the webview; window listeners never see them.
+    void getCurrentWebview()
       .onDragDropEvent((event) => {
         const shell = composerDropTargetRef.current;
         if (cancelled || !shell) {

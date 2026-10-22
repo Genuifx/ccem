@@ -61,13 +61,13 @@ const stubsPlugin = {
       loader: 'js',
       contents: 'export async function invoke(command, args) { return globalThis.__acceptanceInvoke ? globalThis.__acceptanceInvoke(command, args) : []; }',
     }));
-    builder.onResolve({ filter: /^@tauri-apps\/api\/window$/ }, () => ({
-      path: 'tauri-window-stub', namespace: 'composer-compact-stubs',
+    builder.onResolve({ filter: /^@tauri-apps\/api\/webview$/ }, () => ({
+      path: 'tauri-webview-stub', namespace: 'composer-compact-stubs',
     }));
-    builder.onLoad({ filter: /^tauri-window-stub$/, namespace: 'composer-compact-stubs' }, () => ({
+    builder.onLoad({ filter: /^tauri-webview-stub$/, namespace: 'composer-compact-stubs' }, () => ({
       loader: 'js',
       contents: `
-        export function getCurrentWindow() {
+        export function getCurrentWebview() {
           return { async onDragDropEvent() { return () => {}; } };
         }
       `,
