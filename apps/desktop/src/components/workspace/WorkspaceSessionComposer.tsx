@@ -1842,7 +1842,7 @@ export function WorkspaceSessionComposer({
           data-composer-drop-active={isDragTarget || undefined}
           className={cn(
             'relative z-20 rounded-[20px] border border-border/40 bg-surface-raised px-5 py-3 shadow-[0_40px_120px_-70px_rgba(0,0,0,0.38)] transition-[border-color,box-shadow] duration-300',
-            isDragTarget && 'border-primary/45 bg-primary/[0.035]',
+            isDragTarget && 'border-primary/45 ring-4 ring-primary/10',
             planModeEnabled && 'border-primary/15',
           )}
         >
@@ -1887,36 +1887,31 @@ export function WorkspaceSessionComposer({
             </div>
           ) : null}
 
-          {(attachments.length > 0 || isDragTarget) ? (
+          {isDragTarget ? (
             <div
-              ref={attachmentStripRef}
-              className={cn(
-                'mb-3 rounded-xl border border-dashed bg-surface px-3 py-2.5',
-                isDragTarget
-                  ? 'border-primary/45 bg-primary/[0.045]'
-                  : 'border-border/30',
-              )}
+              data-composer-drop-overlay
+              className="pointer-events-none absolute inset-1.5 z-30 flex items-center justify-center gap-2.5 rounded-[16px] border-2 border-dashed border-primary/45 bg-surface-raised/95 text-primary backdrop-blur-sm"
             >
-              <div className="flex items-center gap-2 text-[11px] font-medium text-muted-foreground">
-                <Paperclip className="h-3.5 w-3.5" />
-                <span>{isDragTarget ? t('workspace.composerAttachmentDropHint') : t('workspace.composerAttachmentsLabel')}</span>
-                {isDragTarget && draggedFileCount > 0 ? (
-                  <span className="tabular-nums">{draggedFileCount}</span>
-                ) : null}
-              </div>
-
-              {attachments.length > 0 ? (
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {attachments.map((attachment) => (
-                    <ComposerAttachmentChip
-                      key={attachment.id}
-                      attachment={attachment}
-                      onRemove={removeAttachment}
-                      onImageClick={(image) => setPreviewingImageId(image.id)}
-                    />
-                  ))}
-                </div>
+              <span className="flex h-8 w-8 items-center justify-center rounded-full bg-primary/10">
+                <Paperclip className="h-4 w-4" />
+              </span>
+              <span className="text-sm font-medium">{t('workspace.composerAttachmentDropHint')}</span>
+              {draggedFileCount > 1 ? (
+                <span className="rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium tabular-nums">{draggedFileCount}</span>
               ) : null}
+            </div>
+          ) : null}
+
+          {attachments.length > 0 ? (
+            <div ref={attachmentStripRef} className="mb-3 flex flex-wrap gap-2">
+              {attachments.map((attachment) => (
+                <ComposerAttachmentChip
+                  key={attachment.id}
+                  attachment={attachment}
+                  onRemove={removeAttachment}
+                  onImageClick={(image) => setPreviewingImageId(image.id)}
+                />
+              ))}
             </div>
           ) : null}
 

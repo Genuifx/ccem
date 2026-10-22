@@ -61,7 +61,7 @@ export function ComposerAttachmentChip({
       </button>
     )
     : (
-      <span className="rounded-md bg-background/80 p-1 text-muted-foreground">
+      <span className="shrink-0 rounded-lg bg-muted p-1.5 text-muted-foreground">
         {attachmentIcon(attachment)}
       </span>
     );
@@ -70,21 +70,21 @@ export function ComposerAttachmentChip({
     <span
       data-composer-attachment-chip
       data-attachment-id={attachment.id}
-      className="inline-flex max-w-full items-center gap-2 rounded-xl bg-muted/55 px-2.5 py-1.5 text-left text-foreground"
+      className="inline-flex max-w-[min(100%,320px)] items-center gap-2 rounded-xl border border-border/40 bg-surface py-1.5 pl-1.5 pr-2 text-left text-foreground"
       title={title}
     >
       {thumbnail}
       <span className="min-w-0">
-        <span className="block truncate text-[11px] font-medium leading-4">
+        <span className="block truncate text-xs font-medium leading-4">
           {attachment.name}
         </span>
-        <span className="block truncate text-[9px] leading-3.5 text-muted-foreground/85">
+        <span className="block truncate text-[10px] leading-4 text-muted-foreground">
           {secondaryLabel}
         </span>
       </span>
       <button
         type="button"
-        className="rounded-full p-0.5 text-muted-foreground transition-colors hover:bg-background/80 hover:text-foreground"
+        className="ml-0.5 shrink-0 rounded-full p-1 text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
         onClick={() => onRemove(attachment.id)}
         aria-label={t('workspace.composerRemoveAttachment')}
         title={t('workspace.composerRemoveAttachment')}

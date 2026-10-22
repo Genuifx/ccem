@@ -766,7 +766,6 @@
     "transcriptTextSnippetsAttached": "{count} text snippets",
     "composerSearchingFiles": "Searching files...",
     "composerRecentFiles": "Recent files",
-    "composerAttachmentsLabel": "Attachments",
     "composerAttachmentDropHint": "Drop to attach files",
     "composerAttachmentSummary": "{count} attachments",
     "composerRemoveAttachment": "Remove attachment",

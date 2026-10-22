@@ -766,7 +766,6 @@
     "transcriptTextSnippetsAttached": "{count} 段文本片段",
     "composerSearchingFiles": "正在搜索文件...",
     "composerRecentFiles": "最近文件",
-    "composerAttachmentsLabel": "附件",
     "composerAttachmentDropHint": "松手附加文件",
     "composerAttachmentSummary": "{count} 个附件",
     "composerRemoveAttachment": "移除附件",
