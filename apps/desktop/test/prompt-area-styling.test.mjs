@@ -32,8 +32,9 @@ test('prompt area keeps its trailing-newline sentinel inline without clipping IM
     'utf8',
   );
 
-  assert.match(promptAreaHook, /document\.createElement\('span'\)/);
-  assert.match(promptAreaHook, /prompt-area-trailing-newline-sentinel/);
+  assert.match(promptAreaHook, /syncTrailingSentinel\(editor\)/);
+  assert.match(domHelpers, /document\.createElement\('span'\)/);
+  assert.match(domHelpers, /prompt-area-trailing-newline-sentinel/);
   assert.doesNotMatch(promptAreaHook, /const sentinel = document\.createElement\('br'\)/);
   assert.match(domHelpers, /isPromptAreaSentinel/);
   const sentinelRule = css.match(

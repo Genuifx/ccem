@@ -226,6 +226,40 @@ export function normalizePromptAreaSentinels(editor: HTMLElement): boolean {
 }
 
 /**
+ * Keeps exactly one empty sentinel at the end of the editor when the content
+ * ends with a <br> or a chip. WebKit cannot draw a caret at an editor-level
+ * offset after either, so the sentinel's zero-width text gives it an anchor.
+ * Misplaced empty sentinels (e.g. after the chip was deleted) are removed.
+ */
+export function syncTrailingSentinel(editor: HTMLElement): boolean {
+  let changed = false
+  for (let i = editor.childNodes.length - 1; i >= 0; i--) {
+    const child = editor.childNodes[i]
+    if (isPromptAreaSentinel(child) && child !== editor.lastChild) {
+      editor.removeChild(child)
+      changed = true
+    }
+  }
+
+  const last = editor.lastChild
+  if (last && isPromptAreaSentinel(last)) {
+    const previous = last.previousSibling
+    if (previous && (isBRElement(previous) || isChipElement(previous))) return changed
+    editor.removeChild(last)
+    return true
+  }
+  if (!last || !(isBRElement(last) || isChipElement(last))) return changed
+
+  const sentinel = document.createElement('span')
+  sentinel.dataset.sentinel = 'true'
+  sentinel.className = 'prompt-area-trailing-newline-sentinel'
+  sentinel.setAttribute('aria-hidden', 'true')
+  sentinel.textContent = '​'
+  editor.appendChild(sentinel)
+  return true
+}
+
+/**
  * Normalizes the editor DOM after browser mutations.
  *
  * Browsers insert various wrapper elements on Enter/paste:

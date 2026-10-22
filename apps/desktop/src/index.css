@@ -1315,28 +1315,33 @@
 
 .ccem-prompt-area .prompt-area-chip {
   --prompt-chip-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.05' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z'/%3E%3Cpath d='m3.3 7 8.7 5 8.7-5'/%3E%3Cpath d='M12 22V12'/%3E%3C/svg%3E");
-  --prompt-chip-icon-size: 14px;
-  display: inline-flex;
-  height: 26px;
-  align-items: center;
-  gap: 7px;
+  --prompt-chip-icon-size: 12px;
+  /* 20px + borders stays inside the 26px line, so inserting a chip never
+     grows the line. overflow:hidden (for the ellipsis) makes an inline-block's
+     baseline its bottom edge; -0.4em drops the chip so its text lines up with
+     the surrounding text (measured in WKWebView). */
+  display: inline-block;
   max-width: min(100%, 280px);
   margin: 0 2px;
-  padding: 0 8px;
-  border: 1px solid hsl(var(--primary) / 0.22);
-  border-radius: 7px;
-  background: hsl(var(--primary) / 0.075);
+  padding: 0 6px;
+  border: 1px solid hsl(var(--primary) / 0.16);
+  border-radius: 6px;
+  background: hsl(var(--primary) / 0.08);
   color: hsl(var(--primary));
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 500;
-  line-height: 1;
+  line-height: 20px;
   overflow: hidden;
   position: relative;
-  vertical-align: baseline;
+  text-overflow: ellipsis;
+  vertical-align: -0.4em;
   white-space: nowrap;
-  box-shadow:
-    inset 0 1px 0 hsl(var(--glass-border-light) / 0.18),
-    inset 0 0 0 1px hsl(var(--primary) / 0.11);
+  transition: background-color 150ms ease, border-color 150ms ease;
+}
+
+.ccem-prompt-area .prompt-area-chip:hover {
+  background: hsl(var(--primary) / 0.13);
+  border-color: hsl(var(--primary) / 0.26);
 }
 
 .ccem-prompt-area .prompt-area-chip-ripple {
@@ -1358,34 +1363,39 @@
 
 .ccem-prompt-area .prompt-area-chip::before {
   content: "";
+  display: inline-block;
   width: var(--prompt-chip-icon-size);
   height: var(--prompt-chip-icon-size);
-  flex: 0 0 auto;
+  margin-right: 4px;
+  vertical-align: -1.5px;
   background: currentColor;
-  opacity: 0.95;
-  transform: translateY(-0.5px);
+  opacity: 0.8;
   -webkit-mask: var(--prompt-chip-icon) center / contain no-repeat;
   mask: var(--prompt-chip-icon) center / contain no-repeat;
 }
 
 .ccem-prompt-area .prompt-area-chip[data-chip-kind='command'] {
   --prompt-chip-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M18 3a3 3 0 0 0-3 3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0 0-6'/%3E%3C/svg%3E");
-  color: hsl(var(--foreground) / 0.86);
-  border-color: hsl(var(--border) / 0.85);
-  background: hsl(var(--muted) / 0.48);
-  box-shadow: inset 0 0 0 1px hsl(var(--glass-border-light) / 0.04);
 }
 
 .ccem-prompt-area .prompt-area-chip[data-chip-kind='file'] {
   --prompt-chip-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z'/%3E%3C/svg%3E");
 }
 
+.ccem-prompt-area .prompt-area-chip[data-chip-kind='session'] {
+  --prompt-chip-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z'/%3E%3C/svg%3E");
+}
+
 .ccem-prompt-area .prompt-area-chip[data-chip-kind='image'] {
   --prompt-chip-icon: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect width='18' height='18' x='3' y='3' rx='2'/%3E%3Ccircle cx='9' cy='9' r='2'/%3E%3Cpath d='m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21'/%3E%3C/svg%3E");
   color: hsl(var(--info));
-  border-color: hsl(var(--info) / 0.24);
+  border-color: hsl(var(--info) / 0.18);
   background: hsl(var(--info) / 0.08);
-  box-shadow: inset 0 0 0 1px hsl(var(--info) / 0.14);
+}
+
+.ccem-prompt-area .prompt-area-chip[data-chip-kind='image']:hover {
+  border-color: hsl(var(--info) / 0.3);
+  background: hsl(var(--info) / 0.13);
 }
 
 /* === Status Indicators === */

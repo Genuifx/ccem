@@ -13,6 +13,7 @@ import type {
 import {
   detectActiveTrigger,
   segmentsToPlainText,
+  segmentsToTriggerScanText,
   segmentsEqual,
   resolveChip,
   removeChipAtIndex,
@@ -38,6 +39,7 @@ import {
   indexOfChildNode,
   normalizeEditorDOM,
   normalizePromptAreaSentinels,
+  syncTrailingSentinel,
   decorateURLsInEditor,
   decorateMarkdownInEditor,
   isPromptAreaSentinel,
@@ -127,8 +129,8 @@ function shouldRunTriggerDetectionAfterInput(
     return false
   }
 
-  const plainText = segmentsToPlainText(segments)
-  const beforeCursor = plainText.slice(Math.max(0, cursorOffset - TRIGGER_INPUT_SCAN_RADIUS), cursorOffset)
+  const scanText = segmentsToTriggerScanText(segments)
+  const beforeCursor = scanText.slice(Math.max(0, cursorOffset - TRIGGER_INPUT_SCAN_RADIUS), cursorOffset)
   return triggers.some((trigger) => trigger.char.length > 0 && beforeCursor.includes(trigger.char))
 }
 
@@ -228,7 +230,9 @@ export function usePromptArea({
 
       isSyncing.current = true
 
-      const savedCursor = saveCursorPosition(editor)
+      // Plain-text offsets survive the rebuild; child-node indexes do not once
+      // decorations split text differently or the caret sits inside a link.
+      const savedCursorOffset = getCursorOffset(editor)
 
       // Clear DOM safely (no innerHTML assignment)
       while (editor.firstChild) {
@@ -281,16 +285,8 @@ export function usePromptArea({
         }
       }
 
-      // Append an inline sentinel so trailing newlines are visible in contentEditable
-      // without leaving the caret on an empty block-sized <br> line.
-      if (editor.lastChild && isBRElement(editor.lastChild)) {
-        const sentinel = document.createElement('span')
-        sentinel.dataset.sentinel = 'true'
-        sentinel.className = 'prompt-area-trailing-newline-sentinel'
-        sentinel.setAttribute('aria-hidden', 'true')
-        sentinel.textContent = '\u200B'
-        editor.appendChild(sentinel)
-      }
+      // Trailing newlines and trailing chips need a text anchor for the caret.
+      syncTrailingSentinel(editor)
 
       // Decorate URLs and markdown formatting in text nodes
       if (segmentsContainUrlHint(segments)) {
@@ -298,8 +294,8 @@ export function usePromptArea({
       }
       if (markdownEnabled) decorateMarkdownInEditor(editor)
 
-      if (savedCursor) {
-        restoreCursorPosition(editor, savedCursor)
+      if (savedCursorOffset !== null) {
+        setCursorAtOffset(editor, savedCursorOffset)
       }
 
       lastRenderedValue.current = segments
@@ -322,7 +318,7 @@ export function usePromptArea({
 
     if (cursorPos === null) return
 
-    const detected = detectActiveTrigger(plainText, cursorPos, triggers)
+    const detected = detectActiveTrigger(segmentsToTriggerScanText(segments), cursorPos, triggers)
 
     if (detected) {
       setActiveTrigger(detected)
@@ -511,6 +507,7 @@ export function usePromptArea({
     if (editor) {
       // Normalize browser-inserted block elements (div, p, font, a, etc.)
       editorDomChanged = normalizeEditorDOM(editor)
+      editorDomChanged = syncTrailingSentinel(editor) || editorDomChanged
     }
 
     const segments = readSegmentsFromDOM()
@@ -660,6 +657,9 @@ export function usePromptArea({
       const newSegments = removeChipAtIndex(segments, segIdx)
       onChange(newSegments)
       renderSegmentsToDOM(newSegments)
+      // Keep the caret where the chip started; the pre-render offset would
+      // land the chip's length further along.
+      setCursorAtOffset(editor, segmentsToPlainText(segments.slice(0, segIdx)).length)
 
       if (deletedChip?.type === 'chip') {
         onChipDelete?.(deletedChip)
@@ -766,6 +766,15 @@ export function usePromptArea({
         }
         return removeChipNodeFromDOM(editor, prevSibling)
       }
+    }
+
+    // Case 3: cursor in the trailing sentinel right after a chip
+    const chipBeforeSentinel = getChipBeforeSentinelCursor(editor)
+    if (chipBeforeSentinel) {
+      if (getChipAutoResolved(chipBeforeSentinel)) {
+        return revertChipNodeToText(editor, chipBeforeSentinel)
+      }
+      return removeChipNodeFromDOM(editor, chipBeforeSentinel)
     }
 
     return false
@@ -1090,6 +1099,28 @@ export function usePromptArea({
         }
       }
 
+      // 4.6 ArrowLeft from the trailing sentinel: skipping its zero-width
+      // anchor would be an invisible step, so cross the chip in one press.
+      if (e.key === 'ArrowLeft' && !e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey) {
+        const editor = editorRef.current
+        const chip = editor ? getChipBeforeSentinelCursor(editor) : null
+        const selection = window.getSelection()
+        if (chip && selection) {
+          e.preventDefault()
+          const range = document.createRange()
+          const prev = chip.previousSibling
+          if (prev && prev.nodeType === Node.TEXT_NODE) {
+            range.setStart(prev, (prev.textContent ?? '').length)
+          } else {
+            range.setStartBefore(chip)
+          }
+          range.collapse(true)
+          selection.removeAllRanges()
+          selection.addRange(range)
+          return
+        }
+      }
+
       // 5. Backspace: check list prefix removal, then chip deletion
       if (e.key === 'Backspace') {
         const editor = editorRef.current
@@ -1231,62 +1262,21 @@ export function usePromptArea({
 // Cursor position utilities (private to this module)
 // ---------------------------------------------------------------------------
 
-type SavedCursor = {
-  nodeIndex: number
-  offset: number
-}
-
-function saveCursorPosition(editor: HTMLElement): SavedCursor | null {
+/**
+ * Returns the chip right before the trailing sentinel when the collapsed
+ * caret sits in that sentinel with only its zero-width anchor before it —
+ * i.e. the caret the user sees directly after the chip.
+ */
+function getChipBeforeSentinelCursor(editor: HTMLElement): HTMLElement | null {
   const range = getSelectionRange()
-  if (!range) return null
-  if (!editor.contains(range.startContainer)) return null
-
+  if (!range || !range.collapsed) return null
   const node = range.startContainer
-  if (node === editor) {
-    return { nodeIndex: range.startOffset, offset: 0 }
-  }
-
-  // Walk up to find the direct child of editor using type-safe helper
-  const directChild = getDirectChildContaining(editor, node)
-  if (!directChild) return null
-
-  const nodeIndex = indexOfChildNode(editor, directChild)
-  return { nodeIndex, offset: range.startOffset }
-}
-
-function restoreCursorPosition(editor: HTMLElement, saved: SavedCursor): void {
-  const sel = window.getSelection()
-  if (!sel) return
-
-  const childNodes = editor.childNodes
-  if (childNodes.length === 0) return
-
-  const range = document.createRange()
-
-  if (saved.nodeIndex >= childNodes.length) {
-    const lastChild = childNodes[childNodes.length - 1]
-    if (lastChild.nodeType === Node.TEXT_NODE) {
-      range.setStart(lastChild, (lastChild.textContent ?? '').length)
-    } else if (isPromptAreaSentinel(lastChild)) {
-      range.setStartBefore(lastChild)
-    } else {
-      range.setStartAfter(lastChild)
-    }
-  } else {
-    const targetNode = childNodes[saved.nodeIndex]
-    if (targetNode.nodeType === Node.TEXT_NODE) {
-      const maxOffset = (targetNode.textContent ?? '').length
-      range.setStart(targetNode, Math.min(saved.offset, maxOffset))
-    } else if (isPromptAreaSentinel(targetNode)) {
-      range.setStartBefore(targetNode)
-    } else {
-      range.setStartAfter(targetNode)
-    }
-  }
-
-  range.collapse(true)
-  sel.removeAllRanges()
-  sel.addRange(range)
+  if (node.nodeType !== Node.TEXT_NODE) return null
+  const sentinel = node.parentNode
+  if (!sentinel || sentinel.parentNode !== editor || !isPromptAreaSentinel(sentinel)) return null
+  if ((node.textContent ?? '').slice(0, range.startOffset).replace(/​/g, '') !== '') return null
+  const prev = sentinel.previousSibling
+  return prev && isChipElement(prev) ? prev : null
 }
 
 function getCursorOffset(editor: HTMLElement): number | null {
@@ -1435,7 +1425,16 @@ function findDOMPosition(
       const display = child.dataset.chipDisplay ?? child.textContent ?? ''
       const chipLen = trigger.length + display.length
       if (remaining <= chipLen) {
-        // Position after the chip element
+        // Position after the chip. Prefer the start of the following text (or
+        // the trailing sentinel): WebKit draws no caret at an element-level
+        // offset next to a contentEditable=false chip.
+        const next = child.nextSibling
+        if (next && next.nodeType === Node.TEXT_NODE) {
+          return { node: next, offset: 0 }
+        }
+        if (next && isPromptAreaSentinel(next) && next.firstChild) {
+          return { node: next.firstChild, offset: (next.firstChild.textContent ?? '').length }
+        }
         return { node: container, offset: i + 1 }
       }
       remaining -= chipLen
@@ -1457,6 +1456,14 @@ function findDOMPosition(
     }
   }
 
-  // Fallback: end of container
+  // Fallback: end of container, inside the last text (or sentinel) so the
+  // caret stays drawable instead of sitting at an element-level offset.
+  const last = container.lastChild
+  if (last && last.nodeType === Node.TEXT_NODE) {
+    return { node: last, offset: (last.textContent ?? '').length }
+  }
+  if (last && isPromptAreaSentinel(last) && last.firstChild) {
+    return { node: last.firstChild, offset: (last.firstChild.textContent ?? '').length }
+  }
   return { node: container, offset: container.childNodes.length }
 }

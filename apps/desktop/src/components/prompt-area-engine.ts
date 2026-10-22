@@ -18,6 +18,20 @@ export function segmentsToPlainText(segments: Segment[]): string {
 }
 
 /**
+ * Like segmentsToPlainText, but masks chip text with U+FFFC so trigger
+ * detection never re-reads a resolved chip (e.g. "/dev") as a typed trigger.
+ * Offsets stay aligned with segmentsToPlainText.
+ */
+export function segmentsToTriggerScanText(segments: Segment[]): string {
+  return segments
+    .map((seg) => {
+      if (seg.type === 'text') return seg.text
+      return '￼'.repeat(seg.trigger.length + seg.displayText.length)
+    })
+    .join('')
+}
+
+/**
  * Converts plain text into a single text segment.
  * Used for initial value conversion from plain strings.
  */
