@@ -1592,3 +1592,21 @@ test('turn_completed without assistant_message_uuid keeps the synthetic uuid', a
   assert.ok(assistant);
   assert.match(String(assistant?.uuid), /^assistant-turn-/);
 });
+
+test('live turn progress follows only the active operation and clears at its terminal', async () => {
+  const { deriveTranscriptReset, deriveTranscriptAppend } = await importWorkspaceEventTranscript();
+  const operation = (id, stage) => ({ type: 'input_operation', operation_id: id,
+    client_message_ids: [id], provider: 'claude', stage, detail: '' });
+  const progressEvent = (seq, id, tokens, generation) => event(seq, { type: 'turn_progress', provider: 'claude',
+    operation_id: id, output_tokens: tokens, ...(generation ? { generation_ms: generation } : {}) });
+  let state = deriveTranscriptReset([], [], [event(1, operation('a', 'started')), progressEvent(2, 'a', 12)]);
+  assert.deepEqual(state.liveProgress, { operationId: 'a', outputTokens: 12 });
+  state = deriveTranscriptAppend(state, [progressEvent(3, 'stale', 999, 10), progressEvent(4, 'a', 40, 800)]);
+  assert.deepEqual(state.liveProgress, { operationId: 'a', outputTokens: 40, generationMs: 800 });
+  state = deriveTranscriptAppend(state, [event(5, operation('a', 'completed'))]);
+  assert.equal(state.liveProgress, undefined);
+  state = deriveTranscriptAppend(state, [progressEvent(6, 'a', 41)]);
+  assert.equal(state.liveProgress, undefined, 'late progress never revives a finished turn');
+  state = deriveTranscriptAppend(state, [event(7, operation('b', 'started')), progressEvent(8, 'b', -1)]);
+  assert.equal(state.liveProgress, undefined, 'invalid counts are ignored');
+});

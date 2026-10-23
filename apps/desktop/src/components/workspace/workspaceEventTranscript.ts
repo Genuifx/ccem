@@ -998,6 +998,12 @@ function attachToolResultToBlocks(
  * assistant turn must stay pending across appends (flushing it per append would
  * re-key the streaming message every batch).
  */
+export interface TurnLiveProgress {
+  operationId: string;
+  outputTokens: number;
+  generationMs?: number;
+}
+
 export interface TranscriptDerivationState {
   /** Runtime whose events were folded; mismatch forces a reset. */
   runtimeId: string | null;
@@ -1007,6 +1013,8 @@ export interface TranscriptDerivationState {
   headLength: number;
   pendingTurn: PendingAssistantTurn | null;
   activeOperationId?: string;
+  /** Latest live counter of the active operation; cleared at its terminal. */
+  liveProgress?: TurnLiveProgress;
   hiddenInteractiveToolUseIds: Set<string>;
   /** Tool uses owned by background tasks: their completions never render as
    *  standalone result/error rows (v2.70.0 background-task lifecycle). */
@@ -1103,6 +1111,7 @@ function foldAppendTranscriptGapSummary(
   foldFlushPendingTurn(state);
   // The missing range may contain a terminal and another operation's start.
   state.activeOperationId = undefined;
+  state.liveProgress = undefined;
   const last = state.messages[state.messages.length - 1];
   if (last?.msgType === 'summary' && last.summary === TRANSCRIPT_GAP_SUMMARY_TOKEN) {
     return;
@@ -1434,6 +1443,19 @@ function foldTranscriptEvents(
         } else if (state.activeOperationId === event.payload.operation_id) {
           state.activeOperationId = undefined;
         }
+        if (state.liveProgress && state.liveProgress.operationId !== state.activeOperationId) {
+          state.liveProgress = undefined;
+        }
+        break;
+      }
+      case 'turn_progress': {
+        const { operation_id, output_tokens, generation_ms } = event.payload;
+        if (operation_id !== state.activeOperationId
+          || !Number.isSafeInteger(output_tokens) || output_tokens < 0) break;
+        state.liveProgress = {
+          operationId: operation_id, outputTokens: output_tokens,
+          ...(Number.isSafeInteger(generation_ms) && generation_ms! > 0 ? { generationMs: generation_ms } : {}),
+        };
         break;
       }
       case 'turn_metrics': {

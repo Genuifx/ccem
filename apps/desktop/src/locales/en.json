@@ -698,7 +698,7 @@
     "nativeToolRunning": "Tool running",
     "nativeToolDone": "Tool complete",
     "nativeApprovalNeeded": "A tool call needs your approval",
-    "nativeThinking": "Thinking...",
+    "nativeThinking": "Thinking",
     "nativeInputNeeded": "Claude needs your input",
     "nativePlanReviewNeeded": "Claude is waiting for your plan review",
     "nativePlanModeActive": "Claude is planning this task",

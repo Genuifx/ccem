@@ -1504,6 +1504,13 @@ export type SessionEventPayload =
       generation_ms?: number;
     }
   | {
+      type: 'turn_progress';
+      operation_id: string;
+      provider: 'claude' | 'codex';
+      output_tokens: number;
+      generation_ms?: number;
+    }
+  | {
       type: 'token_usage';
       operation_id?: string | null;
       provider: string;

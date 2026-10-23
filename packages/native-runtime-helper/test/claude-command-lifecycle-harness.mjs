@@ -376,10 +376,14 @@ async function buildHelperWithWireMock(options = {}) {
                         for (let delta = 0; delta < streamDeltas.deltas; delta += 1) {
                           if (delta > 0) await sleep(streamDeltas.gapMs);
                           yield partial({ type: 'content_block_delta', index: 0,
-                            delta: { type: 'text_delta', text: 'x' } });
+                            delta: { type: 'text_delta', text: 'abcd' } });
+                        }
+                        if (streamDeltas.usage) {
+                          yield partial({ type: 'message_delta', delta: {}, usage: { output_tokens: streamDeltas.usage } });
                         }
                         // Subagent output streams under a parent tool and is not main-agent time.
                         yield partial({ type: 'message_start' }, 'child-task');
+                        yield partial({ type: 'message_delta', delta: {}, usage: { output_tokens: 999 } }, 'child-task');
                         yield partial({ type: 'content_block_delta', index: 0,
                           delta: { type: 'text_delta', text: 'child' } }, 'child-task');
                         await sleep(streamDeltas.toolMs);

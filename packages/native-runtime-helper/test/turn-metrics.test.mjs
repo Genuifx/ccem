@@ -132,3 +132,58 @@ test('Claude integration measures main-agent streaming only', async (t) => {
   assert.ok(generationMs >= 150 && generationMs < 290, `generation ${generationMs}ms`);
   assert.ok(elapsedMs >= generationMs + 550, `elapsed ${elapsedMs}ms`);
 });
+
+const progress = (outputs) => outputs.filter((event) => event.type === 'turn_progress');
+
+test('live progress estimates the response in flight, snaps to usage and is throttled', () => {
+  let now = 0;
+  const events = [];
+  const op = new InputOperation('claude', ['user'], (e) => events.push(e), undefined, () => now);
+  op.observe('started', 'start');
+  op.markResponseStart();
+  now = 1_000; op.markOutputDelta('abcdefgh'); // 8 ASCII chars ≈ 2 tokens
+  now = 1_100; op.markOutputDelta('你好吗'); // throttled, still counted (3 × 0.7)
+  now = 1_600; op.markOutputDelta('abcd');
+  assert.deepEqual(progress(events).map((e) => [e.output_tokens, e.generation_ms]), [[2, undefined], [5, 600]]);
+  now = 1_700; op.recordResponseOutputTokens(9); // authoritative usage: forced, replaces estimate
+  now = 3_000; op.markResponseStart();
+  now = 3_500; op.markOutputDelta('abcd');
+  assert.deepEqual(progress(events).slice(2).map((e) => [e.output_tokens, e.generation_ms]),
+    [[9, 600], [10, 600]], 'finished responses settle at their usage; the new one adds an estimate');
+  now = 4_000; op.observe('completed', 'done');
+  op.markOutputDelta('late text');
+  op.recordResponseOutputTokens(50);
+  assert.equal(progress(events).length, 4, 'nothing after the terminal');
+  assert.ok(progress(events).every((e) => e.operation_id === op.id && e.provider === 'claude'));
+});
+
+test('Claude integration progress counts main-agent usage only', async (t) => {
+  const session = await startHelper(t, { streamDeltas: { responses: 2, ttftMs: 20, deltas: 2, gapMs: 20, toolMs: 20, usage: 7 } });
+  send(session, { type: 'prompt', text: 'progress', command_id: 'progress', client_message_ids: ['progress'] });
+  await waitForOutput(session, (o) => o.payload?.type === 'turn_metrics', 'metrics');
+  const counts = session.outputs.filter((o) => o.payload?.type === 'turn_progress').map((o) => o.payload.output_tokens);
+  assert.ok(counts.length >= 2, `progress ${counts}`);
+  assert.equal(Math.max(...counts), 14, 'two main responses × 7; child usage 999 ignored');
+});
+
+test('a settled response calibrates later estimates to the provider tokenizer', () => {
+  let now = 0;
+  const events = [];
+  const op = new InputOperation('claude', ['user'], (e) => events.push(e), undefined, () => now);
+  op.observe('started', 'start');
+  op.markResponseStart();
+  now = 1_000; op.markOutputDelta('a'.repeat(400)); // raw estimate 100
+  op.recordResponseOutputTokens(50); // provider counts half
+  now = 2_000; op.markResponseStart();
+  now = 3_000; op.markOutputDelta('a'.repeat(400));
+  assert.equal(progress(events).at(-1).output_tokens, 50 + 50, 'new estimate scaled by 0.5');
+  now = 4_000; op.observe('completed', 'done');
+  // A later turn in the same helper inherits the calibration.
+  const next = new InputOperation('claude', ['next'], (e) => events.push(e), undefined, () => now);
+  next.observe('started', 'start');
+  next.markResponseStart();
+  next.markOutputDelta('a'.repeat(400));
+  assert.equal(progress(events).at(-1).output_tokens, 50);
+  next.recordResponseOutputTokens(100); // restore scale 1 for any later test
+  next.markResponseStart();
+});

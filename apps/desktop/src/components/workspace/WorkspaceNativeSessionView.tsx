@@ -4563,6 +4563,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
             <WorkspaceTranscriptList
               messages={messages}
               isAwaitingResponse={isAwaitingResponse}
+              liveProgress={isAwaitingResponse ? transcriptDerivation.liveProgress : undefined}
               enableTopWindowing
               viewportRef={containerRef}
               onForkTurn={onForkTurnRequest ? handleForkTurn : undefined}

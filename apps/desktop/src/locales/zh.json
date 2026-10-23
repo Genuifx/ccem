@@ -698,7 +698,7 @@
     "nativeToolRunning": "工具运行中",
     "nativeToolDone": "工具完成",
     "nativeApprovalNeeded": "需要你确认一个工具调用",
-    "nativeThinking": "思考中...",
+    "nativeThinking": "思考中",
     "nativeInputNeeded": "Claude 需要你的输入",
     "nativePlanReviewNeeded": "Claude 等待你确认计划",
     "nativePlanModeActive": "Claude 正在计划这个任务",
