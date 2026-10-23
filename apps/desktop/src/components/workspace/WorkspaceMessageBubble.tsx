@@ -1142,44 +1142,6 @@ export const WorkspaceToolDigest = memo(
   )
 );
 
-export const WorkspacePendingResponse = memo(function WorkspacePendingResponse() {
-  const { t } = useLocale();
-  const pendingRef = useRef<HTMLDivElement | null>(null);
-
-  useGSAP(() => {
-    const pending = pendingRef.current;
-    if (!pending) {
-      return;
-    }
-
-    if (shouldReduceMotion()) {
-      clearMotionProps(pending);
-      return;
-    }
-
-    gsap.fromTo(
-      pending,
-      { autoAlpha: 0, y: 6 },
-      {
-        autoAlpha: 1,
-        y: 0,
-        duration: ccemMotion.duration.base,
-        ease: ccemMotion.ease.standard,
-        clearProps: 'opacity,visibility,transform',
-      },
-    );
-  }, { scope: pendingRef });
-
-  return (
-    <div ref={pendingRef} className="flex items-center gap-2.5 py-1">
-      <LoaderCircle className="h-3.5 w-3.5 animate-spin text-muted-foreground/50" />
-      <span className="text-[12px] text-muted-foreground/60">
-        {t('workspace.nativeThinking')}
-      </span>
-    </div>
-  );
-});
-
 function AgentNoteBlock({ msg, label }: { msg: TeammateMessage; label: string }) {
   const notification = msg.notification;
   const summary = notification

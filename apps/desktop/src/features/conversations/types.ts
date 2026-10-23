@@ -103,7 +103,7 @@ export interface ConversationMessageData {
   cacheReadTokens?: number;
   /** Runtime-scoped execution identity; never inferred from message order. */
   turnOperationId?: string;
-  turnMetrics?: { outputTokens: number; elapsedMs: number };
+  turnMetrics?: { outputTokens: number; elapsedMs: number; generationMs?: number };
   segmentIndex: number;
   isCompactBoundary: boolean;
   planContent?: string;

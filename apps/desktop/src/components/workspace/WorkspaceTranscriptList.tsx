@@ -5,12 +5,13 @@ import type {
 } from '@/features/conversations/types';
 import { cn } from '@/lib/utils';
 import { TurnSpeedBadge } from './TurnSpeedBadge';
+import { WorkspacePendingResponse } from './WorkspacePendingResponse';
+import type { TurnLiveProgress } from './workspaceEventTranscript';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion, useGSAP } from '@/lib/gsapMotion';
 import {
   processMessageBlocks,
   formatMessageTime,
   WorkspaceMessageBubble,
-  WorkspacePendingResponse,
   WorkspaceToolDigest,
   type MessageSegment,
   type ToolDigestEntry,
@@ -278,6 +279,8 @@ export function buildWorkspaceTranscriptItems(
 interface WorkspaceTranscriptListProps {
   messages: ConversationMessageData[];
   isAwaitingResponse?: boolean;
+  /** Live counter of the running turn, shown beside the pending indicator. */
+  liveProgress?: TurnLiveProgress;
   /**
    * Opt-in top-windowing (plan 022): items far above the viewport render as an
    * estimated-height spacer. Only the live session view enables it; history
@@ -296,6 +299,7 @@ interface WorkspaceTranscriptListProps {
 export function WorkspaceTranscriptList({
   messages,
   isAwaitingResponse = false,
+  liveProgress,
   enableTopWindowing = false,
   viewportRef,
   onForkTurn,
@@ -355,11 +359,8 @@ export function WorkspaceTranscriptList({
       return transcriptItems;
     }
 
-    const lastRole = transcriptItems[transcriptItems.length - 1]?.role;
-    if (lastRole === 'assistant') {
-      return transcriptItems;
-    }
-
+    // Stays at the tail for the whole run (not only before the first reply),
+    // carrying the live token counter while output streams.
     return [
       ...transcriptItems,
       {
@@ -815,7 +816,7 @@ export function WorkspaceTranscriptList({
                 getWorkspaceTranscriptSpacing(prevRole, item.role, item.type),
               )}
             >
-              <WorkspacePendingResponse />
+              <WorkspacePendingResponse progress={liveProgress} />
             </div>
           );
         }

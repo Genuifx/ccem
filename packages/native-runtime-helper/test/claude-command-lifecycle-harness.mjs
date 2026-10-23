@@ -68,6 +68,7 @@ async function buildHelperWithWireMock(options = {}) {
             const permissionModeDelays = ${JSON.stringify(permissionModeDelays)};
             const permissionCapabilityProbe = ${JSON.stringify(options.permissionCapabilityProbe ?? false)};
             const assistantUuidPrefix = ${JSON.stringify(assistantUuidPrefix)};
+            const streamDeltas = ${JSON.stringify(options.streamDeltas ?? null)};
             const probe = (value) => { if (permissionCapabilityProbe) process.stdout.write(JSON.stringify({type:'permission_probe',...value})+'\\n'); };
             const pluginProbe = (value) => { if (${JSON.stringify(options.pluginRefreshProbe ?? false)}) process.stdout.write(JSON.stringify({type:'plugin_probe',...value})+String.fromCharCode(10)); };
             let queryCount = 0;
@@ -365,6 +366,31 @@ async function buildHelperWithWireMock(options = {}) {
                       continue;
                     }
 
+                    if (streamDeltas) {
+                      // Per response: time to first token, then deltas spaced by gapMs.
+                      const partial = (event, parent = null) => ({ type: 'stream_event', event,
+                        parent_tool_use_id: parent, session_id, uuid: 'partial-' + Math.random() });
+                      for (let response = 0; response < streamDeltas.responses; response += 1) {
+                        yield partial({ type: 'message_start' });
+                        await sleep(streamDeltas.ttftMs);
+                        for (let delta = 0; delta < streamDeltas.deltas; delta += 1) {
+                          if (delta > 0) await sleep(streamDeltas.gapMs);
+                          yield partial({ type: 'content_block_delta', index: 0,
+                            delta: { type: 'text_delta', text: 'abcd' } });
+                        }
+                        if (streamDeltas.usage) {
+                          yield partial({ type: 'message_delta', delta: {}, usage: { output_tokens: streamDeltas.usage } });
+                        }
+                        // Subagent output streams under a parent tool and is not main-agent time.
+                        yield partial({ type: 'message_start' }, 'child-task');
+                        yield partial({ type: 'message_delta', delta: {}, usage: { output_tokens: 999 } }, 'child-task');
+                        yield partial({ type: 'content_block_delta', index: 0,
+                          delta: { type: 'text_delta', text: 'child' } }, 'child-task');
+                        await sleep(streamDeltas.toolMs);
+                        yield partial({ type: 'content_block_delta', index: 0,
+                          delta: { type: 'text_delta', text: 'child' } }, 'child-task');
+                      }
+                    }
                     if (resultDelayMs > 0) await sleep(resultDelayMs);
                     yield resultFrame(userMessage, localTurn, session_id);
 

@@ -275,6 +275,7 @@ pub(crate) fn summarize_payload(payload: &SessionEventPayload) -> Option<EventSu
         // receipts are consumed by the desktop attention layer (Slice C).
         SessionEventPayload::SessionUsage { .. }
         | SessionEventPayload::TurnMetrics { .. }
+        | SessionEventPayload::TurnProgress { .. }
         | SessionEventPayload::RuntimeSettingsChanged { .. }
         | SessionEventPayload::InteractiveResponseResult { .. }
         | SessionEventPayload::BackgroundTasksChanged { .. }

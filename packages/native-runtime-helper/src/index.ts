@@ -865,6 +865,14 @@ function isClaudeNonHumanIngress() {
   return claudeIngressOriginKind !== null && claudeIngressOriginKind !== 'human';
 }
 
+function claudeDeltaText(delta: unknown) {
+  const record = delta as Record<string, unknown> | undefined;
+  for (const key of ['text', 'thinking', 'partial_json']) {
+    if (typeof record?.[key] === 'string') return record[key] as string;
+  }
+  return undefined;
+}
+
 function claudeMessageParentToolUseId(message: unknown) {
   const parentToolUseId = (message as { parent_tool_use_id?: unknown } | undefined)
     ?.parent_tool_use_id;
@@ -3281,7 +3289,17 @@ async function consumeClaudeMessages() {
       if (message.type === 'stream_event') {
         const event = (message as { event?: Record<string, unknown> }).event;
         if (event) {
-          handleClaudePartialEvent(event, isClaudeBackgroundOwnedMessage(message));
+          const backgroundOwned = isClaudeBackgroundOwnedMessage(message);
+          if (!backgroundOwned && !claudeMessageParentToolUseId(message)) {
+            if (event.type === 'message_start') claudeInputOperation?.markResponseStart();
+            else if (event.type === 'content_block_delta') {
+              claudeInputOperation?.markOutputDelta(claudeDeltaText(event.delta));
+            } else if (event.type === 'message_delta') {
+              claudeInputOperation?.recordResponseOutputTokens(
+                (event.usage as { output_tokens?: unknown } | undefined)?.output_tokens);
+            }
+          }
+          handleClaudePartialEvent(event, backgroundOwned);
         }
         continue;
       }

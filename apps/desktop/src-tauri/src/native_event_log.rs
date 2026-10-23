@@ -1239,7 +1239,7 @@ mod tests {
         let log = NativeEventLog::new(db_path.clone());
         let payload = serde_json::json!({
             "type": "turn_metrics", "operation_id": "turn-a", "provider": "codex",
-            "output_tokens": 317, "elapsed_ms": 2500,
+            "output_tokens": 317, "elapsed_ms": 2500, "generation_ms": 1800,
         });
         log.append(&SessionEventRecord {
             runtime_id: "metrics-runtime".into(), seq: 1, occurred_at: Utc::now(),

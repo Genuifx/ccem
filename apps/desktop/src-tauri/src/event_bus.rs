@@ -344,13 +344,27 @@ pub enum SessionEventPayload {
         last_seen_seq: u64,
         oldest_available_seq: u64,
     },
-    /// Completed main-agent turn. Duration is frozen at the helper's terminal
+    /// Completed main-agent turn. `elapsed_ms` is frozen at the helper's terminal
     /// boundary using a monotonic clock, including tool execution and waiting.
+    /// `generation_ms` sums streamed first→last delta per model response, so it
+    /// excludes time to first token; absent when the provider does not stream.
     TurnMetrics {
         operation_id: String,
         provider: String,
         output_tokens: u64,
         elapsed_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation_ms: Option<u64>,
+    },
+    /// Throttled live counter for the running main-agent turn. Output tokens
+    /// estimate the response in flight until its usage lands; superseded by
+    /// `TurnMetrics` once the turn completes.
+    TurnProgress {
+        operation_id: String,
+        provider: String,
+        output_tokens: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation_ms: Option<u64>,
     },
     TokenUsage {
         #[serde(default, skip_serializing_if = "Option::is_none")]

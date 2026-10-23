@@ -45052,6 +45052,14 @@ function createStreamEventCoalescer(writePayload, options = {}) {
 // src/inputOperation.ts
 import { randomUUID as randomUUID6 } from "node:crypto";
 import { performance as performance2 } from "node:perf_hooks";
+var PROGRESS_INTERVAL_MS = 500;
+function estimateTokens(text) {
+  let tokens = 0;
+  for (const char of text) tokens += char.charCodeAt(0) < 128 ? 0.25 : 0.7;
+  return tokens;
+}
+var MIN_CALIBRATION_ESTIMATE = 50;
+var estimateScale = 1;
 var InputOperation = class {
   constructor(provider, clientMessageIds, emit2, commandId, now = () => performance2.now()) {
     this.provider = provider;
@@ -45068,6 +45076,17 @@ var InputOperation = class {
   completedAt;
   outputTokens;
   metricsEmitted = false;
+  /** Sum of first→last streamed delta per model response: excludes time to
+   * first token, tool execution and waiting between responses. */
+  generationMs = 0;
+  responseFirstDeltaAt;
+  responseLastDeltaAt;
+  /** Live progress: finished responses use their authoritative usage; the
+   * response in flight is estimated from streamed text until its usage lands. */
+  settledOutputTokens = 0;
+  responseUsageTokens;
+  responseEstimateTokens = 0;
+  lastProgressAt;
   observe(stage, detail, providerTurnId) {
     if (this.terminal || stage === "started" && this.started) return;
     if (stage === "started") {
@@ -45075,7 +45094,10 @@ var InputOperation = class {
       this.startedAt = this.now();
     } else {
       this.terminal = true;
-      if (stage === "completed") this.completedAt = this.now();
+      if (stage === "completed") {
+        this.completedAt = this.now();
+        this.closeResponse();
+      }
     }
     this.emit({
       type: "input_operation",
@@ -45097,17 +45119,71 @@ var InputOperation = class {
     this.outputTokens = tokens;
     this.emitMetricsIfReady();
   }
+  /** A new main-agent model response began streaming. */
+  markResponseStart() {
+    if (!this.started || this.terminal) return;
+    this.closeResponse();
+  }
+  /** A main-agent output delta (text, thinking or tool input) arrived. */
+  markOutputDelta(text) {
+    if (!this.started || this.terminal) return;
+    const at2 = this.now();
+    this.responseFirstDeltaAt ??= at2;
+    this.responseLastDeltaAt = at2;
+    if (text) this.responseEstimateTokens += estimateTokens(text);
+    this.emitProgress(false);
+  }
+  /** The in-flight response's authoritative output usage (message_delta). */
+  recordResponseOutputTokens(tokens) {
+    if (!this.started || this.terminal) return;
+    if (typeof tokens !== "number" || !Number.isSafeInteger(tokens) || tokens < 0) return;
+    this.responseUsageTokens = tokens;
+    this.emitProgress(true);
+  }
+  closeResponse() {
+    if (this.responseFirstDeltaAt !== void 0 && this.responseLastDeltaAt !== void 0) {
+      this.generationMs += this.responseLastDeltaAt - this.responseFirstDeltaAt;
+    }
+    if (this.responseUsageTokens !== void 0 && this.responseEstimateTokens >= MIN_CALIBRATION_ESTIMATE) {
+      estimateScale = Math.min(3, Math.max(0.3, this.responseUsageTokens / this.responseEstimateTokens));
+    }
+    this.settledOutputTokens += this.liveResponseTokens();
+    this.responseFirstDeltaAt = void 0;
+    this.responseLastDeltaAt = void 0;
+    this.responseUsageTokens = void 0;
+    this.responseEstimateTokens = 0;
+  }
+  liveResponseTokens() {
+    return this.responseUsageTokens ?? Math.round(this.responseEstimateTokens * estimateScale);
+  }
+  /** Throttled live counter for the running turn; the final turn_metrics wins. */
+  emitProgress(force) {
+    const at2 = this.now();
+    if (!force && this.lastProgressAt !== void 0 && at2 - this.lastProgressAt < PROGRESS_INTERVAL_MS) return;
+    this.lastProgressAt = at2;
+    const span = this.responseFirstDeltaAt !== void 0 && this.responseLastDeltaAt !== void 0 ? this.responseLastDeltaAt - this.responseFirstDeltaAt : 0;
+    const generationMs = Math.round(this.generationMs + span);
+    this.emit({
+      type: "turn_progress",
+      operation_id: this.id,
+      provider: this.provider,
+      output_tokens: this.settledOutputTokens + this.liveResponseTokens(),
+      ...generationMs > 0 ? { generation_ms: generationMs } : {}
+    });
+  }
   emitMetricsIfReady() {
     if (this.metricsEmitted || this.startedAt === void 0 || this.completedAt === void 0 || this.outputTokens === void 0) return;
     const elapsedMs = Math.round(this.completedAt - this.startedAt);
     if (elapsedMs <= 0) return;
     this.metricsEmitted = true;
+    const generationMs = Math.round(this.generationMs);
     this.emit({
       type: "turn_metrics",
       operation_id: this.id,
       provider: this.provider,
       output_tokens: this.outputTokens,
-      elapsed_ms: elapsedMs
+      elapsed_ms: elapsedMs,
+      ...generationMs > 0 ? { generation_ms: generationMs } : {}
     });
   }
 };
@@ -45770,6 +45846,13 @@ function claudeMessageOriginKind(message) {
 }
 function isClaudeNonHumanIngress() {
   return claudeIngressOriginKind !== null && claudeIngressOriginKind !== "human";
+}
+function claudeDeltaText(delta) {
+  const record3 = delta;
+  for (const key of ["text", "thinking", "partial_json"]) {
+    if (typeof record3?.[key] === "string") return record3[key];
+  }
+  return void 0;
 }
 function claudeMessageParentToolUseId(message) {
   const parentToolUseId = message?.parent_tool_use_id;
@@ -47539,7 +47622,18 @@ async function consumeClaudeMessages() {
       if (message.type === "stream_event") {
         const event = message.event;
         if (event) {
-          handleClaudePartialEvent(event, isClaudeBackgroundOwnedMessage(message));
+          const backgroundOwned = isClaudeBackgroundOwnedMessage(message);
+          if (!backgroundOwned && !claudeMessageParentToolUseId(message)) {
+            if (event.type === "message_start") claudeInputOperation?.markResponseStart();
+            else if (event.type === "content_block_delta") {
+              claudeInputOperation?.markOutputDelta(claudeDeltaText(event.delta));
+            } else if (event.type === "message_delta") {
+              claudeInputOperation?.recordResponseOutputTokens(
+                event.usage?.output_tokens
+              );
+            }
+          }
+          handleClaudePartialEvent(event, backgroundOwned);
         }
         continue;
       }
