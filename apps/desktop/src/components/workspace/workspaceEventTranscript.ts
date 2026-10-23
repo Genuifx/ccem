@@ -881,6 +881,7 @@ function shallowEqualMessages(
     && previous.turnOperationId === next.turnOperationId
     && previous.turnMetrics?.outputTokens === next.turnMetrics?.outputTokens
     && previous.turnMetrics?.elapsedMs === next.turnMetrics?.elapsedMs
+    && previous.turnMetrics?.generationMs === next.turnMetrics?.generationMs
     && previous.annotations === next.annotations
     && shallowEqualContent(previous.content, next.content);
 }
@@ -1436,10 +1437,13 @@ function foldTranscriptEvents(
         break;
       }
       case 'turn_metrics': {
-        const { operation_id, output_tokens, elapsed_ms } = event.payload;
+        const { operation_id, output_tokens, elapsed_ms, generation_ms } = event.payload;
         if (!Number.isSafeInteger(output_tokens) || output_tokens < 0
           || !Number.isSafeInteger(elapsed_ms) || elapsed_ms <= 0) break;
-        const turnMetrics = { outputTokens: output_tokens, elapsedMs: elapsed_ms };
+        const turnMetrics = {
+          outputTokens: output_tokens, elapsedMs: elapsed_ms,
+          ...(Number.isSafeInteger(generation_ms) && generation_ms! > 0 ? { generationMs: generation_ms } : {}),
+        };
         if (state.pendingTurn?.turnOperationId === operation_id) {
           state.pendingTurn.turnMetrics ??= turnMetrics;
         } else {

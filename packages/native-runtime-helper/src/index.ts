@@ -3281,7 +3281,12 @@ async function consumeClaudeMessages() {
       if (message.type === 'stream_event') {
         const event = (message as { event?: Record<string, unknown> }).event;
         if (event) {
-          handleClaudePartialEvent(event, isClaudeBackgroundOwnedMessage(message));
+          const backgroundOwned = isClaudeBackgroundOwnedMessage(message);
+          if (!backgroundOwned && !claudeMessageParentToolUseId(message)) {
+            if (event.type === 'message_start') claudeInputOperation?.markResponseStart();
+            else if (event.type === 'content_block_delta') claudeInputOperation?.markOutputDelta();
+          }
+          handleClaudePartialEvent(event, backgroundOwned);
         }
         continue;
       }

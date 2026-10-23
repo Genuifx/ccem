@@ -45068,6 +45068,11 @@ var InputOperation = class {
   completedAt;
   outputTokens;
   metricsEmitted = false;
+  /** Sum of first→last streamed delta per model response: excludes time to
+   * first token, tool execution and waiting between responses. */
+  generationMs = 0;
+  responseFirstDeltaAt;
+  responseLastDeltaAt;
   observe(stage, detail, providerTurnId) {
     if (this.terminal || stage === "started" && this.started) return;
     if (stage === "started") {
@@ -45075,7 +45080,10 @@ var InputOperation = class {
       this.startedAt = this.now();
     } else {
       this.terminal = true;
-      if (stage === "completed") this.completedAt = this.now();
+      if (stage === "completed") {
+        this.completedAt = this.now();
+        this.closeResponse();
+      }
     }
     this.emit({
       type: "input_operation",
@@ -45097,17 +45105,38 @@ var InputOperation = class {
     this.outputTokens = tokens;
     this.emitMetricsIfReady();
   }
+  /** A new main-agent model response began streaming. */
+  markResponseStart() {
+    if (!this.started || this.terminal) return;
+    this.closeResponse();
+  }
+  /** A main-agent output delta (text, thinking or tool input) arrived. */
+  markOutputDelta() {
+    if (!this.started || this.terminal) return;
+    const at2 = this.now();
+    this.responseFirstDeltaAt ??= at2;
+    this.responseLastDeltaAt = at2;
+  }
+  closeResponse() {
+    if (this.responseFirstDeltaAt !== void 0 && this.responseLastDeltaAt !== void 0) {
+      this.generationMs += this.responseLastDeltaAt - this.responseFirstDeltaAt;
+    }
+    this.responseFirstDeltaAt = void 0;
+    this.responseLastDeltaAt = void 0;
+  }
   emitMetricsIfReady() {
     if (this.metricsEmitted || this.startedAt === void 0 || this.completedAt === void 0 || this.outputTokens === void 0) return;
     const elapsedMs = Math.round(this.completedAt - this.startedAt);
     if (elapsedMs <= 0) return;
     this.metricsEmitted = true;
+    const generationMs = Math.round(this.generationMs);
     this.emit({
       type: "turn_metrics",
       operation_id: this.id,
       provider: this.provider,
       output_tokens: this.outputTokens,
-      elapsed_ms: elapsedMs
+      elapsed_ms: elapsedMs,
+      ...generationMs > 0 ? { generation_ms: generationMs } : {}
     });
   }
 };
@@ -47539,7 +47568,12 @@ async function consumeClaudeMessages() {
       if (message.type === "stream_event") {
         const event = message.event;
         if (event) {
-          handleClaudePartialEvent(event, isClaudeBackgroundOwnedMessage(message));
+          const backgroundOwned = isClaudeBackgroundOwnedMessage(message);
+          if (!backgroundOwned && !claudeMessageParentToolUseId(message)) {
+            if (event.type === "message_start") claudeInputOperation?.markResponseStart();
+            else if (event.type === "content_block_delta") claudeInputOperation?.markOutputDelta();
+          }
+          handleClaudePartialEvent(event, backgroundOwned);
         }
         continue;
       }

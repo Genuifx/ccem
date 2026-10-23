@@ -1501,6 +1501,7 @@ export type SessionEventPayload =
       provider: 'claude' | 'codex';
       output_tokens: number;
       elapsed_ms: number;
+      generation_ms?: number;
     }
   | {
       type: 'token_usage';

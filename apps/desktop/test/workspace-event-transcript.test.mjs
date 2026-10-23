@@ -53,7 +53,8 @@ test('turn speed belongs to its execution across late results, streaming append,
     event(8, { type: 'token_usage', provider: 'claude', operation_id: 'a', output_tokens: 120,
       input_tokens: 50, cache_read_tokens: 10, cache_creation_tokens: 0, scope: 'turn_total' }),
     event(9, operation('b', 'completed')),
-    event(10, { type: 'turn_metrics', provider: 'claude', operation_id: 'b', output_tokens: 40, elapsed_ms: 1000 }),
+    event(10, { type: 'turn_metrics', provider: 'claude', operation_id: 'b', output_tokens: 40, elapsed_ms: 1000,
+      generation_ms: 400 }),
     event(11, { type: 'lifecycle', stage: 'turn_completed', detail: '' }),
     // A duplicate must not change the already persisted value.
     event(12, { type: 'turn_metrics', provider: 'claude', operation_id: 'a', output_tokens: 999, elapsed_ms: 1 }),
@@ -63,7 +64,7 @@ test('turn speed belongs to its execution across late results, streaming append,
   assert.ok(before.every((message) => !message.turnMetrics));
   const incremental = finalizeTranscriptMessages(deriveTranscriptAppend(streaming, events.slice(6)));
   assert.deepEqual(incremental.map((message) => message.turnMetrics), [
-    { outputTokens: 120, elapsedMs: 2000 }, { outputTokens: 40, elapsedMs: 1000 },
+    { outputTokens: 120, elapsedMs: 2000 }, { outputTokens: 40, elapsedMs: 1000, generationMs: 400 },
   ]);
   assert.equal(incremental[0].outputTokens, 120);
   assert.equal(incremental[1].outputTokens, undefined, 'late usage must not overwrite the next turn');

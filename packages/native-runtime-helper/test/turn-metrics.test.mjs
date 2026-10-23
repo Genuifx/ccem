@@ -88,3 +88,47 @@ test('Claude terminal-before-Result still measures its own execution without Res
   assert.ok(measured.payload.elapsed_ms >= 30 && measured.payload.elapsed_ms < 220);
   assert.equal(session.outputs.filter((o) => o.payload?.type === 'token_usage' && o.payload.scope === 'turn_total').length, 1);
 });
+
+test('generation time sums first→last delta per response, excluding TTFT, tools and waiting', () => {
+  let now = 0;
+  const events = [];
+  const op = new InputOperation('claude', ['user'], (e) => events.push(e), undefined, () => now);
+  op.markOutputDelta(); // before start: ignored
+  op.observe('started', 'start');
+  op.markResponseStart();
+  now = 1_000; op.markOutputDelta(); // 1s TTFT excluded
+  now = 1_400; op.markOutputDelta();
+  now = 5_000; op.markResponseStart(); // tool execution 1.4s→5s excluded
+  now = 7_000; op.markOutputDelta();
+  now = 7_100; op.markOutputDelta();
+  now = 9_000; op.observe('completed', 'done');
+  now = 9_500; op.markOutputDelta(); // after terminal: ignored
+  op.recordOutputTokens(50);
+  assert.deepEqual(metrics(events), [{ type: 'turn_metrics', operation_id: op.id,
+    provider: 'claude', output_tokens: 50, elapsed_ms: 9_000, generation_ms: 500 }]);
+});
+
+test('turns without measurable streaming omit generation time instead of inventing one', () => {
+  for (const deltas of [0, 1]) {
+    let now = 0;
+    const events = [];
+    const op = new InputOperation('codex', ['user'], (e) => events.push(e), undefined, () => now);
+    op.observe('started', 'start');
+    for (let i = 0; i < deltas; i += 1) op.markOutputDelta();
+    now = 1_000;
+    op.observe('completed', 'done');
+    op.recordOutputTokens(10);
+    assert.equal(metrics(events)[0].generation_ms, undefined);
+    assert.equal(metrics(events)[0].elapsed_ms, 1_000);
+  }
+});
+
+test('Claude integration measures main-agent streaming only', async (t) => {
+  const session = await startHelper(t, { streamDeltas: { responses: 2, ttftMs: 150, deltas: 3, gapMs: 40, toolMs: 150 } });
+  send(session, { type: 'prompt', text: 'stream', command_id: 'stream', client_message_ids: ['stream'] });
+  const measured = await waitForOutput(session, (o) => o.payload?.type === 'turn_metrics', 'streamed metrics');
+  const { generation_ms: generationMs, elapsed_ms: elapsedMs } = measured.payload;
+  // 2 responses × 2 gaps × 40ms ≈ 160ms; TTFT (2×150) and child/tool time (2×150) excluded.
+  assert.ok(generationMs >= 150 && generationMs < 290, `generation ${generationMs}ms`);
+  assert.ok(elapsedMs >= generationMs + 550, `elapsed ${elapsedMs}ms`);
+});

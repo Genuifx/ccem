@@ -13,6 +13,11 @@ export class InputOperation {
   private completedAt: number | undefined;
   private outputTokens: number | undefined;
   private metricsEmitted = false;
+  /** Sum of first→last streamed delta per model response: excludes time to
+   * first token, tool execution and waiting between responses. */
+  private generationMs = 0;
+  private responseFirstDeltaAt: number | undefined;
+  private responseLastDeltaAt: number | undefined;
 
   constructor(
     private readonly provider: 'claude' | 'codex',
@@ -34,7 +39,10 @@ export class InputOperation {
       this.startedAt = this.now();
     } else {
       this.terminal = true;
-      if (stage === 'completed') this.completedAt = this.now();
+      if (stage === 'completed') {
+        this.completedAt = this.now();
+        this.closeResponse();
+      }
     }
     // Initial/legacy inputs have no external IDs. They still own an execution;
     // an empty list never borrows the preceding user's correlation identity.
@@ -60,6 +68,28 @@ export class InputOperation {
     this.emitMetricsIfReady();
   }
 
+  /** A new main-agent model response began streaming. */
+  markResponseStart() {
+    if (!this.started || this.terminal) return;
+    this.closeResponse();
+  }
+
+  /** A main-agent output delta (text, thinking or tool input) arrived. */
+  markOutputDelta() {
+    if (!this.started || this.terminal) return;
+    const at = this.now();
+    this.responseFirstDeltaAt ??= at;
+    this.responseLastDeltaAt = at;
+  }
+
+  private closeResponse() {
+    if (this.responseFirstDeltaAt !== undefined && this.responseLastDeltaAt !== undefined) {
+      this.generationMs += this.responseLastDeltaAt - this.responseFirstDeltaAt;
+    }
+    this.responseFirstDeltaAt = undefined;
+    this.responseLastDeltaAt = undefined;
+  }
+
   private emitMetricsIfReady() {
     if (this.metricsEmitted
       || this.startedAt === undefined || this.completedAt === undefined
@@ -67,12 +97,14 @@ export class InputOperation {
     const elapsedMs = Math.round(this.completedAt - this.startedAt);
     if (elapsedMs <= 0) return;
     this.metricsEmitted = true;
+    const generationMs = Math.round(this.generationMs);
     this.emit({
       type: 'turn_metrics',
       operation_id: this.id,
       provider: this.provider,
       output_tokens: this.outputTokens,
       elapsed_ms: elapsedMs,
+      ...(generationMs > 0 ? { generation_ms: generationMs } : {}),
     });
   }
 }
