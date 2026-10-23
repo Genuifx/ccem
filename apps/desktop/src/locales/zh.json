@@ -723,6 +723,8 @@
     "composerQueuedReady": "当前可发送",
     "composerQueuedSendAll": "立即发送",
     "composerQueuedWaitAction": "等待结束",
+    "composerQueuedSteer": "立即引导",
+    "composerQueuedSteerHint": "打断当前执行，排队消息会马上发送",
     "composerRemoveQueued": "取消排队消息",
     "composerCancelQueuedFailed": "消息已经开始发送或队列状态已变化，无法取消",
     "messageQueuedBadge": "排队中",

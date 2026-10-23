@@ -4650,6 +4650,10 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
         onFlushQueuedMessages={() => void flushQueuedMessages(true)}
         onRemoveQueuedMessage={handleRemoveQueuedMessage}
         queueCanFlush={!isSending && !isProcessingTurn && !hasBlockingAttention && !isTerminalStatus(session.status)}
+        onSteerQueuedMessages={() => void handleStop('composer_queue_steer')}
+        queueCanSteer={canStopForeground && !isStopping && composerQueuedMessages.some(
+          (message) => (message.deliveryState ?? 'pending') === 'pending',
+        )}
         annotations={sessionAnnotations.pendingAnnotations}
         onUpdateAnnotation={sessionAnnotations.updateAnnotation}
         onRemoveAnnotation={sessionAnnotations.removeAnnotation}

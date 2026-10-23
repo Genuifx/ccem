@@ -1205,6 +1205,30 @@
   transform-origin: center bottom;
 }
 
+/* Dock sections scroll natively; keep the thumb slim and quiet so a long
+   question never reads as a second heavy gutter beside the card edge. */
+.workspace-attention-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: hsl(var(--muted-foreground) / 0.28) transparent;
+}
+
+.workspace-attention-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+
+.workspace-attention-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.workspace-attention-scroll::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: hsl(var(--muted-foreground) / 0.28);
+}
+
+.workspace-attention-scroll:hover::-webkit-scrollbar-thumb {
+  background: hsl(var(--muted-foreground) / 0.45);
+}
+
 /* === Workspace Composer Prompt Area === */
 .ccem-prompt-area {
   --prompt-area-surface: hsl(var(--surface-raised));

@@ -52,11 +52,16 @@ test('static trigger popover renders one always-mounted shadcn overlay scrollbar
   );
 });
 
-test('attention dock keeps one outer clamp for stacked attention sections', async () => {
+test('attention dock bounds stacked sections without an outer scroller', async () => {
   const composer = await readSource('src/components/workspace/WorkspaceSessionComposer.tsx');
   assert.match(
     composer,
-    /max-h-\[min\(35vh,280px\)\] space-y-1 overflow-y-auto overscroll-contain/,
-    'the attention dock clamp should stay in place as the fallback scroller for multi-section stacks',
+    /flex max-h-\[min\(45vh,400px\)\] flex-col gap-1/,
+    'the dock keeps one bounded height budget shared by its sections',
+  );
+  assert.doesNotMatch(
+    composer,
+    /max-h-\[min\(35vh,280px\)\] space-y-1 overflow-y-auto/,
+    'the old outer scroller nested a second native scrollbar around the question panel',
   );
 });
