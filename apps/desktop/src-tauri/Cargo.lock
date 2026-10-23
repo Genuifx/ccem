@@ -602,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "ccem-desktop"
-version = "2.99.0"
+version = "2.100.0"
 dependencies = [
  "aes",
  "aes-gcm",
