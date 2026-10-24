@@ -103,6 +103,7 @@ import {
   WorkspaceSessionComposer,
   type ComposerQueuedMessage,
 } from './WorkspaceSessionComposer';
+import { playComposerLaunchTransition } from './composerLaunchTransition';
 import {
   ComposerControls,
   normalizePermissionModeName,
@@ -4519,9 +4520,16 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
     : 'idle';
   const hasTranscriptPollFailure = transcriptPollFailure?.runtimeId === session.runtime_id;
 
+  const launchTransitionRootRef = useRef<HTMLDivElement | null>(null);
+  useLayoutEffect(() => {
+    if (isVisible) {
+      playComposerLaunchTransition(launchTransitionRootRef.current, session.runtime_id);
+    }
+  }, [isVisible, session.runtime_id]);
+
   return (
     <>
-    <div className="relative flex h-full min-h-0 flex-col">
+    <div ref={launchTransitionRootRef} className="relative flex h-full min-h-0 flex-col">
       {(isReviewPopoverOpen || isReviewDetailOpen) && reviewModel ? (
         <Suspense fallback={null}>
           <LazyWorkspaceReviewPopover

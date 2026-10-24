@@ -30,6 +30,7 @@ import { WorkspaceNativeSessionView } from '@/components/workspace/WorkspaceNati
 import { WorkspaceHistoryErrorBoundary } from '@/components/workspace/WorkspaceHistoryErrorBoundary';
 import { WorkspaceCodexModelMigrationDialog } from '@/components/workspace/WorkspaceCodexModelMigrationDialog';
 import { WorkspaceSessionComposer } from '@/components/workspace/WorkspaceSessionComposer';
+import { captureComposerLaunchSource } from '@/components/workspace/composerLaunchTransition';
 import {
   WorkspaceForkDialog,
   getWorkspaceForkTurnPreview,
@@ -544,6 +545,7 @@ export function Workspace({
   const liveSessionsByRuntimeIdRef = useRef<WorkspaceLiveSessionsByRuntimeId>(liveSessionsByRuntimeId);
   const nativeSessionRestoreRequestSeqRef = useRef(0);
   const [activeLiveRuntimeId, setActiveLiveRuntimeId] = useState<string | null>(null);
+  const composeViewRef = useRef<HTMLDivElement | null>(null);
   const [selectedHistoryNativeRuntimeId, setSelectedHistoryNativeRuntimeId] = useState<string | null>(null);
   const [hasAttemptedNativeSessionRestore, setHasAttemptedNativeSessionRestore] = useState(false);
   const [workspaceGitSnapshot, setWorkspaceGitSnapshot] = useState<WorkspaceGitSnapshot | null>(null);
@@ -2986,6 +2988,7 @@ export function Workspace({
         setSelectedKey(nextKey);
       }
       requestWorkspaceSessionTitle(summary, previewPrompt);
+      captureComposerLaunchSource(composeViewRef.current, summary.runtime_id);
       setActiveLiveRuntimeId(summary.runtime_id);
       setWorkspaceMode('live');
       resetComposePrompt('');
@@ -3536,9 +3539,9 @@ export function Workspace({
   }, [handleWorkspaceEscapeShortcut, isActive, isActiveLiveSessionVisible]);
 
   const renderComposeView = () => (
-    <div className="flex h-full min-h-0 flex-col items-center px-4 sm:px-6 lg:px-8">
+    <div ref={composeViewRef} className="flex h-full min-h-0 flex-col items-center px-4 sm:px-6 lg:px-8">
       <div className="flex flex-1 flex-col items-center justify-end">
-        <div className="mb-6 flex max-w-full flex-wrap items-center justify-center gap-x-3 gap-y-2 text-center">
+        <div data-compose-heading className="mb-6 flex max-w-full flex-wrap items-center justify-center gap-x-3 gap-y-2 text-center">
           <h2 className="shrink-0 whitespace-nowrap text-2xl font-semibold tracking-tight text-foreground">
             {t('workspace.composeTitle')}
           </h2>
