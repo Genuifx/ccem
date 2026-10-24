@@ -210,41 +210,16 @@ test('every page uses the same top-left menu and never a permanent sidebar colum
   assert.equal(localStorage.getItem('ccem-sidebar-state'), 'expanded');
 });
 
-test('Cmd/Ctrl+B opens the same menu on normal pages', async (t) => {
-  const mounted = await start(t, 'collapsed');
-  mounted.navigate('settings');
-  await settle();
-  act(() => document.body.focus());
-  await press('b', { metaKey: true }, document.body);
-  assert.ok(menu());
-  assert.equal(sidebar(), null);
-  await press('Escape');
-  assert.equal(menu(), null);
-  assert.equal(localStorage.getItem('ccem-sidebar-state'), 'collapsed');
-});
-
-test('Cmd/Ctrl+B toggles navigation without intercepting typing or changing saved layout', async (t) => {
-  await start(t);
-  act(() => document.body.focus());
-  await press('b', { metaKey: true }, document.body);
-  assert.ok(menu());
-  await press('b', { metaKey: true });
-  assert.equal(menu(), null);
-  await press('b', { ctrlKey: true }, document.body);
-  assert.ok(menu());
-  await press('Escape');
-
-  for (const editor of [query('input'), query('[contenteditable]')]) {
-    // jsdom does not implement the browser's isContentEditable getter.
-    if (editor.hasAttribute('contenteditable')) {
-      Object.defineProperty(editor, 'isContentEditable', { value: true });
-    }
-    act(() => editor.focus());
-    const event = await press('b', { metaKey: true }, editor);
-    assert.equal(event.defaultPrevented, false);
+test('Cmd/Ctrl+B no longer opens navigation; it belongs to the page list toggle', async (t) => {
+  const mounted = await start(t);
+  for (const tab of ['workspace', 'settings']) {
+    mounted.navigate(tab);
+    await settle();
+    act(() => document.body.focus());
+    const event = await press('b', { metaKey: true }, document.body);
+    assert.equal(event.defaultPrevented, false, `${tab}: the layout leaves Cmd+B to the page`);
     assert.equal(menu(), null);
   }
-  assert.equal(localStorage.getItem('ccem-sidebar-state'), 'expanded');
 });
 
 test('clicking outside dismisses navigation and leaves workspace content interactive', async (t) => {

@@ -184,7 +184,7 @@ export function WorkspaceStatusStrip({
             data-ccem-workspace-sidebar-toggle="true"
             aria-label={t(sidebarCollapsed ? 'workspace.expandSidebar' : 'workspace.collapseSidebar')}
             aria-pressed={!sidebarCollapsed}
-            title={t(sidebarCollapsed ? 'workspace.expandSidebar' : 'workspace.collapseSidebar')}
+            title={`${t(sidebarCollapsed ? 'workspace.expandSidebar' : 'workspace.collapseSidebar')} (⌘B)`}
             onClick={onToggleSidebar}
             className={SIDEBAR_ICON_BUTTON_CLASS}
           >

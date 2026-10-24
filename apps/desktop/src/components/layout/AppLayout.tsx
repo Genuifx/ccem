@@ -150,7 +150,7 @@ function AppNavigation({ activeTab, onTabChange, onTabPrefetch }: Pick<AppLayout
             size="icon"
             data-testid="workspace-navigation-trigger"
             aria-label={label}
-            title={`${label} (⌘B)`}
+            title={label}
             className="h-7 w-7 rounded-md border-none bg-transparent p-0 text-muted-foreground/75 shadow-none hover:bg-foreground/[0.06] hover:text-foreground"
           >
             <LayoutGrid className="h-[15px] w-[15px]" />
