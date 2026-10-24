@@ -3,6 +3,7 @@ import {
   Brain,
   Check,
   ChevronDown,
+  ChevronRight,
   Gauge,
   Lock,
   Search,
@@ -25,9 +26,6 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
@@ -327,6 +325,8 @@ export function ComposerControls({
   );
   const [permissionSelectOpen, setPermissionSelectOpen] = useState(false);
   const [envEffortOpen, setEnvEffortOpen] = useState(false);
+  /** Model group whose environments are expanded inline (accordion, one at a time). */
+  const [expandedEnvGroup, setExpandedEnvGroup] = useState<string | null>(null);
   const envEffortContentRef = useRef<HTMLDivElement>(null);
 
   // Long environment lists: land the current group in view on open instead
@@ -392,7 +392,15 @@ export function ComposerControls({
 
   return (
     <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2">
-      <DropdownMenu modal={false} open={envEffortOpen} onOpenChange={setEnvEffortOpen}>
+      <DropdownMenu
+        modal={false}
+        open={envEffortOpen}
+        onOpenChange={(open) => {
+          // Reopen with the current env's group unfolded so the active pick is visible.
+          if (open) setExpandedEnvGroup(currentModel);
+          setEnvEffortOpen(open);
+        }}
+      >
         <DropdownMenuTrigger asChild>
           <button
             type="button"
@@ -486,134 +494,145 @@ export function ComposerControls({
               {groupedEnvironments.map((group) => {
                 const isCurrentGroup = currentModel === group.model;
                 const groupIconEnv = group.envs.find((e) => e.name === envName) || group.envs[0];
-                const rowClassName = cn(
-                  'h-8 cursor-pointer gap-2.5 rounded-lg px-2 text-[12.5px] leading-none',
-                  'text-foreground/85 transition-colors',
-                  'focus:bg-white/[0.05] data-[highlighted]:bg-white/[0.05]',
-                  isCurrentGroup && 'bg-primary/[0.07] focus:bg-primary/[0.1] data-[highlighted]:bg-primary/[0.1]',
-                  isEnvironmentLocked && 'opacity-70',
-                );
-                const rowLead = (
-                  <>
-                    <span className="flex h-5 w-5 shrink-0 items-center justify-center">
-                      <EnvironmentLobeIcon
-                        hint={resolveEnvironmentIconHint(groupIconEnv)}
-                        size={16}
-                      />
-                    </span>
-                    <span
-                      className={cn(
-                        'min-w-0 flex-1 truncate',
-                        isCurrentGroup && 'font-medium text-primary',
-                      )}
-                    >
-                      {group.model}
-                    </span>
-                  </>
-                );
-                // One environment behind this model: pick it directly, and show
-                // its name so the list maps back to the trigger's env label.
-                if (group.envs.length === 1) {
-                  const environment = group.envs[0];
-                  return (
-                    <DropdownMenuItem
-                      key={group.model}
-                      data-current-env-group={isCurrentGroup || undefined}
-                      disabled={isEnvironmentLocked}
-                      onSelect={() => onEnvChange(environment.name)}
-                      className={rowClassName}
-                    >
-                      {rowLead}
-                      <span
-                        className={cn(
-                          'max-w-[120px] shrink-0 truncate text-[11px]',
-                          isCurrentGroup ? 'text-primary/70' : 'text-muted-foreground/60',
-                        )}
-                      >
-                        {environment.name}
-                      </span>
-                      {isCurrentGroup ? (
-                        <Check className="h-3.5 w-3.5 shrink-0 text-primary" />
-                      ) : (
-                        <span className="w-3.5 shrink-0" />
-                      )}
-                    </DropdownMenuItem>
-                  );
-                }
+                const isSingle = group.envs.length === 1;
+                const isExpanded = !isSingle && expandedEnvGroup === group.model;
                 return (
-                  <DropdownMenuSub key={group.model}>
-                    <DropdownMenuSubTrigger
-                      data-current-env-group={isCurrentGroup || undefined}
-                      className={cn(rowClassName, 'data-[state=open]:bg-white/[0.08] [&>svg:last-child]:h-3.5 [&>svg:last-child]:w-3.5 [&>svg:last-child]:opacity-50')}
+                  <div key={group.model} data-current-env-group={isCurrentGroup || undefined}>
+                    <DropdownMenuItem
+                      disabled={isSingle && isEnvironmentLocked}
+                      aria-expanded={isSingle ? undefined : isExpanded}
+                      onSelect={(event) => {
+                        if (isSingle) {
+                          onEnvChange(group.envs[0].name);
+                          return;
+                        }
+                        // Groups unfold in place instead of closing the menu.
+                        event.preventDefault();
+                        setExpandedEnvGroup(isExpanded ? null : group.model);
+                      }}
+                      className={cn(
+                        'h-8 cursor-pointer gap-2.5 rounded-lg px-2 text-[12.5px] leading-none',
+                        'text-foreground/85 transition-colors',
+                        'focus:bg-white/[0.05] data-[highlighted]:bg-white/[0.05]',
+                        isCurrentGroup && 'bg-primary/[0.07] focus:bg-primary/[0.1] data-[highlighted]:bg-primary/[0.1]',
+                        isEnvironmentLocked && 'opacity-70',
+                      )}
                     >
-                      {rowLead}
+                      <span className="flex h-5 w-5 shrink-0 items-center justify-center">
+                        <EnvironmentLobeIcon
+                          hint={resolveEnvironmentIconHint(groupIconEnv)}
+                          size={16}
+                        />
+                      </span>
                       <span
                         className={cn(
-                          'max-w-[120px] shrink-0 truncate text-[11px]',
-                          isCurrentGroup ? 'text-primary/70' : 'text-muted-foreground/60',
+                          'min-w-0 flex-1 truncate',
+                          isCurrentGroup && 'font-medium text-primary',
                         )}
                       >
-                        {isCurrentGroup
-                          ? envName
-                          : t('workspace.environmentGroupCount', { count: group.envs.length })}
+                        {group.model}
                       </span>
-                    </DropdownMenuSubTrigger>
-                    <DropdownMenuSubContent
-                      sideOffset={8}
-                      collisionPadding={12}
-                      className="min-w-[200px] max-w-[260px] rounded-xl frosted-panel glass-noise shadow-dialog p-1"
-                    >
-                      {group.envs.map((environment) => {
-                        // Model lineup under the env name: opus · sonnet · haiku,
-                        // deduped (sonnet often aliases opus) and skipping gaps.
-                        const modelLine = [
-                          environment.defaultOpusModel,
-                          environment.defaultSonnetModel,
-                          environment.defaultHaikuModel,
-                        ]
-                          .filter((model, index, all): model is string => !!model && all.indexOf(model) === index)
-                          .join(' · ');
-                        const isActiveEnv = environment.name === envName;
-                        return (
-                          <DropdownMenuItem
-                            key={environment.name}
-                            disabled={isEnvironmentLocked}
-                            onSelect={() => {
-                              onEnvChange(environment.name);
-                            }}
+                      {/* Meta column: env name for a direct pick, a count pill for
+                          a group. Every row reserves the same trailing slot so the
+                          meta text shares one right edge. */}
+                      {isSingle ? (
+                        <span
+                          className={cn(
+                            'max-w-[96px] shrink-0 truncate text-[11px]',
+                            isCurrentGroup ? 'text-primary/65' : 'text-muted-foreground/50',
+                          )}
+                        >
+                          {group.envs[0].name}
+                        </span>
+                      ) : (
+                        <span
+                          title={t('workspace.environmentGroupCount', { count: group.envs.length })}
+                          aria-label={t('workspace.environmentGroupCount', { count: group.envs.length })}
+                          className={cn(
+                            'inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full px-1.5 text-[10px] font-medium tabular-nums',
+                            isCurrentGroup ? 'bg-primary/10 text-primary/80' : 'bg-muted/60 text-muted-foreground/70',
+                          )}
+                        >
+                          {group.envs.length}
+                        </span>
+                      )}
+                      <span className="flex w-3.5 shrink-0 justify-center">
+                        {isSingle ? (
+                          isCurrentGroup && <Check className="h-3.5 w-3.5 text-primary" />
+                        ) : (
+                          <ChevronRight
                             className={cn(
-                              'h-auto items-start gap-2 rounded-lg px-2 py-1.5 text-[12.5px]',
-                              isActiveEnv && 'bg-primary/[0.08] focus:bg-primary/[0.12] hover:bg-primary/[0.12]',
+                              'h-3.5 w-3.5 text-muted-foreground/50 transition-transform duration-200',
+                              isExpanded && 'rotate-90',
                             )}
-                          >
-                            <span className="min-w-0 flex-1">
-                              <span
-                                className={cn(
-                                  'block truncate leading-4',
-                                  isActiveEnv && 'font-medium text-primary',
-                                )}
-                              >
-                                {environment.name}
-                              </span>
-                              {modelLine && (
-                                <span
+                          />
+                        )}
+                      </span>
+                    </DropdownMenuItem>
+                    {!isSingle && (
+                      // 0fr → 1fr grid rows animate the fold to its natural height.
+                      <div
+                        className={cn(
+                          'grid transition-[grid-template-rows,opacity] duration-200 ease-out',
+                          isExpanded ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0',
+                        )}
+                      >
+                        <div className="min-h-0 overflow-hidden">
+                          <div className="ml-[18px] border-l border-border/50 py-0.5 pl-2">
+                            {group.envs.map((environment) => {
+                              // Model lineup under the env name: opus · sonnet · haiku,
+                              // deduped (sonnet often aliases opus) and skipping gaps.
+                              const modelLine = [
+                                environment.defaultOpusModel,
+                                environment.defaultSonnetModel,
+                                environment.defaultHaikuModel,
+                              ]
+                                .filter((model, index, all): model is string => !!model && all.indexOf(model) === index)
+                                .join(' · ');
+                              const isActiveEnv = environment.name === envName;
+                              return (
+                                <DropdownMenuItem
+                                  key={environment.name}
+                                  // Folded rows stay out of keyboard navigation.
+                                  disabled={!isExpanded || isEnvironmentLocked}
+                                  onSelect={() => onEnvChange(environment.name)}
                                   className={cn(
-                                    'mt-0.5 block truncate text-[10px] leading-3',
-                                    isActiveEnv ? 'text-primary/60' : 'text-muted-foreground/65',
+                                    'h-auto cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-[12px]',
+                                    'focus:bg-white/[0.05] data-[highlighted]:bg-white/[0.05]',
+                                    isActiveEnv && 'bg-primary/[0.07] focus:bg-primary/[0.1] data-[highlighted]:bg-primary/[0.1]',
                                   )}
                                 >
-                                  {modelLine}
-                                </span>
-                              )}
-                            </span>
-                            {isActiveEnv && (
-                              <Check className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
-                            )}
-                          </DropdownMenuItem>
-                        );
-                      })}
-                    </DropdownMenuSubContent>
-                  </DropdownMenuSub>
+                                  <span className="min-w-0 flex-1">
+                                    <span
+                                      className={cn(
+                                        'block truncate leading-4',
+                                        isActiveEnv ? 'font-medium text-primary' : 'text-foreground/85',
+                                      )}
+                                    >
+                                      {environment.name}
+                                    </span>
+                                    {modelLine && (
+                                      <span
+                                        className={cn(
+                                          'mt-0.5 block truncate text-[10px] leading-3',
+                                          isActiveEnv ? 'text-primary/60' : 'text-muted-foreground/60',
+                                        )}
+                                      >
+                                        {modelLine}
+                                      </span>
+                                    )}
+                                  </span>
+                                  <span className="flex w-3.5 shrink-0 justify-center">
+                                    {isActiveEnv && <Check className="h-3.5 w-3.5 text-primary" />}
+                                  </span>
+                                </DropdownMenuItem>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 );
               })}
             </div>
