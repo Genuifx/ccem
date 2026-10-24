@@ -372,7 +372,12 @@ export function ComposerControls({
       return;
     }
     const contentTop = content.getBoundingClientRect().top;
-    const height = inner.offsetHeight;
+    // The panel is border-box with its own padding + border; size it to the
+    // list plus that chrome, or `overflow: hidden` clips the last row.
+    const panelStyle = getComputedStyle(inner.parentElement!);
+    const chrome = ['paddingTop', 'paddingBottom', 'borderTopWidth', 'borderBottomWidth']
+      .reduce((sum, key) => sum + (parseFloat(panelStyle[key as 'paddingTop']) || 0), 0);
+    const height = inner.offsetHeight + chrome;
     const rowTop = envPanel.row.getBoundingClientRect().top - contentTop - 4;
     const maxTop = window.innerHeight - 12 - contentTop - height;
     setEnvPanelBox({ top: Math.max(12 - contentTop, Math.min(rowTop, maxTop)), height });
