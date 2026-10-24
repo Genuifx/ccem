@@ -178,7 +178,7 @@ export function WorkspaceStatusStrip({
       )}
     >
       {onToggleSidebar ? (
-        <div className="mr-1 flex shrink-0 items-center gap-1">
+        <div className="mr-1 flex shrink-0 items-center">
           <button
             type="button"
             data-ccem-workspace-sidebar-toggle="true"

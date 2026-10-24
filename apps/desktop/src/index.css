@@ -679,7 +679,6 @@
     + var(--ccem-sidebar-toggle-gap)
     + var(--ccem-sidebar-toggle-size)
     + var(--ccem-update-indicator-slot)
-    + var(--ccem-sidebar-toggle-gap)
   );
 }
 
