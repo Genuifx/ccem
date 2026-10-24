@@ -726,6 +726,8 @@
     "composerQueuedReady": "Ready to send",
     "composerQueuedSendAll": "Send now",
     "composerQueuedWaitAction": "Waiting",
+    "composerQueuedSteer": "Steer now",
+    "composerQueuedSteerHint": "Interrupt the current run and send the queued messages right away",
     "composerRemoveQueued": "Cancel queued message",
     "composerCancelQueuedFailed": "The message has started sending or the queue changed, so it cannot be cancelled",
     "messageQueuedBadge": "Queued",

@@ -35,6 +35,19 @@ function normalizeDeliveryState(value: string): NativeQueuedPromptDeliveryState 
 }
 
 /**
+ * Every Claude send passes through the backend queue, so an idle send is
+ * briefly `dispatching` there before helper admission. That is the send in
+ * flight, not a wait behind a turn: keep it as the transcript's optimistic row
+ * instead of bouncing it through the queue dock.
+ */
+function isDirectSendInFlight(
+  prompt: LocalUserPrompt,
+  deliveryState: NativeQueuedPromptDeliveryState,
+): boolean {
+  return prompt.queuedBehindTurn !== true && deliveryState === 'dispatching';
+}
+
+/**
  * Keeps backend-owned queued prompts in the established dock above the
  * composer. They enter the transcript only after a persisted `user_prompt`
  * event confirms helper admission and removes the matching optimistic row.
@@ -111,6 +124,10 @@ export function reconcileNativeQueuedPrompts(
         next.push(prompt);
         continue;
       }
+      if (prompt && isDirectSendInFlight(prompt, queuedDeliveryState)) {
+        next.push(prompt);
+        continue;
+      }
       if (prompt) {
         next.push({
           ...prompt,
@@ -146,6 +163,10 @@ export function reconcileNativeQueuedPrompts(
     if (item) {
       snapshotById.delete(prompt.id);
       const queuedDeliveryState = normalizeDeliveryState(item.delivery_state);
+      if (isDirectSendInFlight(prompt, queuedDeliveryState)) {
+        next.push(prompt);
+        continue;
+      }
       if (
         prompt.queuedBehindTurn !== true
         || prompt.queuedDeliveryState !== queuedDeliveryState

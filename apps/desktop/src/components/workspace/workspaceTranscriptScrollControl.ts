@@ -109,11 +109,24 @@ function cssEscape(value: string): string {
  * user intervention: the reported position is materially below (or above) the
  * exact value we assigned, which only user input (scrollbar drag, touch pan,
  * keyboard) can produce while the flag is up.
+ *
+ * Exception: content can shrink under a bottom pin (the optimistic prompt row
+ * is swapped for the persisted one), and the browser then clamps scrollTop.
+ * That moves the position too, yet the reader is still at the bottom. A user
+ * pulling away from the tail always grows `distanceFromBottom`, so a position
+ * that is still at the bottom is never an intervention.
  */
 export function isTranscriptUserScrollIntervention(params: {
   programmaticTarget: number;
   currentScrollTop: number;
+  distanceFromBottom?: number;
 }): boolean {
+  if (
+    params.distanceFromBottom != null
+    && params.distanceFromBottom <= TRANSCRIPT_USER_SCROLL_INTERVENTION_PX
+  ) {
+    return false;
+  }
   return Math.abs(params.currentScrollTop - params.programmaticTarget)
     >= TRANSCRIPT_USER_SCROLL_INTERVENTION_PX;
 }
@@ -233,15 +246,22 @@ export function attachTranscriptResizeCompensator(
   // for an empty transcript); callers re-attach across session switches. In
   // environments without ResizeObserver the exported handler can still be
   // driven directly (that is also how the jsdom regression tests exercise it).
+  // The viewport is observed too: the composer dock above the input (queue
+  // rows, questions) grows by shrinking this container from the bottom, which
+  // fires no scroll event. In follow mode that must re-pin, or the hidden gap
+  // later reads as a user scroll-away and silently detaches follow mode. In
+  // reading mode the anchor is measured from the viewport top, so a bottom-edge
+  // change is a no-op.
   let resizeObserver: ResizeObserver | null = null;
   if (typeof ResizeObserver !== 'undefined') {
+    resizeObserver = new ResizeObserver(() => {
+      handleContentResize();
+    });
     const content = getContentElement();
     if (content) {
-      resizeObserver = new ResizeObserver(() => {
-        handleContentResize();
-      });
       resizeObserver.observe(content);
     }
+    resizeObserver.observe(container);
   }
 
   return {

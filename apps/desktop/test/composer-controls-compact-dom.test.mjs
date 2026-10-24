@@ -93,13 +93,16 @@ async function importHarness() {
         import React, { act } from 'react';
         import { createRoot } from 'react-dom/client';
         import { LocaleProvider } from '@/locales';
+        import { TooltipProvider } from '@/components/ui/tooltip';
         import { WorkspaceSessionComposer } from '@/components/workspace/WorkspaceSessionComposer';
         import { ComposerControls } from '@/components/workspace/ComposerControls';
+        export { mergeQueuePresenceRows } from '@/components/workspace/composerQueueMotion';
 
-        export function mountCompactControls(container, { question = false, queue = false } = {}) {
+        export function mountCompactControls(container, { question = false, queue = false, steer = null } = {}) {
           function Harness({ question, queue }) {
             return (
               <LocaleProvider>
+              <TooltipProvider>
                 <WorkspaceSessionComposer
                 value=""
                 onValueChange={() => {}}
@@ -112,6 +115,8 @@ async function importHarness() {
                 queueCanFlush
                 onFlushQueuedMessages={() => {}}
                 onRemoveQueuedMessage={() => {}}
+                queueCanSteer={Boolean(steer)}
+                onSteerQueuedMessages={steer ?? undefined}
                 controls={(
                   <ComposerControls
                     provider="claude"
@@ -125,6 +130,7 @@ async function importHarness() {
                   />
                 )}
                 />
+              </TooltipProvider>
               </LocaleProvider>
             );
           }
@@ -291,15 +297,26 @@ function spanByText(container, text) {
     .find((node) => node.textContent === text) ?? null;
 }
 
+function assertNoNestedNativeScroller(dock) {
+  const scrollers = [...dock.querySelectorAll('.overflow-y-auto')];
+  for (const scroller of scrollers) {
+    assert.equal(
+      scroller.querySelector('.overflow-y-auto'),
+      null,
+      'attention sections must never nest one native scroller inside another',
+    );
+  }
+}
+
 // Exercise the real Composer and TriggerPopover: only the input's existing
 // callback is driven directly, so no attention-container JSX is mocked.
 for (const scenario of [
-  { name: 'trigger alone', trigger: true, question: false, queue: false, overflow: 'overflow-hidden' },
-  { name: 'long question alone', trigger: false, question: true, queue: false, overflow: 'overflow-y-auto' },
-  { name: 'queue alone', trigger: false, question: false, queue: true, overflow: 'overflow-y-auto' },
-  { name: 'trigger plus queue', trigger: true, question: false, queue: true, overflow: 'overflow-y-auto' },
-  { name: 'question plus queue', trigger: false, question: true, queue: true, overflow: 'overflow-y-auto' },
-  { name: 'question plus trigger plus queue', trigger: true, question: true, queue: true, overflow: 'overflow-y-auto' },
+  { name: 'trigger alone', trigger: true, question: false, queue: false },
+  { name: 'long question alone', trigger: false, question: true, queue: false },
+  { name: 'queue alone', trigger: false, question: false, queue: true },
+  { name: 'trigger plus queue', trigger: true, question: false, queue: true },
+  { name: 'question plus queue', trigger: false, question: true, queue: true },
+  { name: 'question plus trigger plus queue', trigger: true, question: true, queue: true },
 ]) {
   test(`attention dock preserves scroll access for ${scenario.name}`, async () => {
     const harness = await (importedHarnessPromise ??= importHarness());
@@ -311,9 +328,22 @@ for (const scenario of [
       if (scenario.trigger) mounted.showTrigger();
       const dock = container.querySelector('[data-attention-state] > div');
       assert.ok(dock, 'the actual attention dock must render');
-      assert.ok(dock.classList.contains('max-h-[min(35vh,280px)]'), 'the shared height budget remains bounded');
-      assert.ok(dock.classList.contains(scenario.overflow), `${scenario.name} must use ${scenario.overflow}`);
-      assert.equal(dock.classList.contains(scenario.overflow === 'overflow-hidden' ? 'overflow-y-auto' : 'overflow-hidden'), false);
+      assert.ok(dock.classList.contains('max-h-[min(45vh,400px)]'), 'the shared height budget remains bounded');
+      assert.ok(dock.classList.contains('flex-col'), 'sections share the budget through a flex column');
+      assert.equal(dock.classList.contains('overflow-y-auto'), false, 'the shared budget never becomes a second scroller');
+      assertNoNestedNativeScroller(dock);
+      const questionScroll = dock.querySelector('[data-composer-attention-scroll="interruption"]');
+      const queueScroll = dock.querySelector('[data-composer-attention-scroll="queue"]');
+      assert.equal(Boolean(questionScroll), scenario.question);
+      assert.equal(Boolean(queueScroll), scenario.queue);
+      if (questionScroll) {
+        assert.ok(questionScroll.classList.contains('overflow-y-auto'));
+        assert.ok(questionScroll.classList.contains('min-h-0'), 'the question flexes so later sections stay reachable');
+      }
+      if (queueScroll) {
+        assert.ok(queueScroll.classList.contains('overflow-y-auto'));
+        assert.ok(queueScroll.classList.contains('shrink-0'));
+      }
       if (scenario.trigger) assert.ok(dock.querySelector('[data-radix-scroll-area-viewport]'), 'suggestions retain their own ScrollArea');
       if (scenario.question) assert.ok([...dock.querySelectorAll('button')].some(button => button.textContent === 'answer question'));
       if (scenario.queue) assert.match(dock.textContent, /queued message/);
@@ -324,7 +354,7 @@ for (const scenario of [
   });
 }
 
-test('attention dock restores single-list scrolling when stacked panels clear without remounting', async () => {
+test('attention dock keeps the suggestion list mounted while stacked panels change', async () => {
   const harness = await (importedHarnessPromise ??= importHarness());
   const restore = installDom();
   let mounted;
@@ -335,19 +365,81 @@ test('attention dock restores single-list scrolling when stacked panels clear wi
     const dock = container.querySelector('[data-attention-state] > div');
     const viewport = dock.querySelector('[data-radix-scroll-area-viewport]');
     assert.ok(viewport);
-    assert.ok(dock.classList.contains('overflow-y-auto'));
+    assertNoNestedNativeScroller(dock);
 
     mounted.setAttentionPanels();
     assert.equal(container.querySelector('[data-attention-state] > div'), dock, 'the same dock remains mounted');
     assert.equal(dock.querySelector('[data-radix-scroll-area-viewport]'), viewport, 'the suggestion list remains mounted');
-    assert.ok(dock.classList.contains('overflow-hidden'), 'clearing other panels restores the suggestion-only scroll owner');
-    assert.equal(dock.classList.contains('overflow-y-auto'), false);
+    assert.equal(dock.querySelector('.overflow-y-auto'), null, 'a lone suggestion list owns the only scroller');
     assert.doesNotMatch(dock.textContent, /answer question|queued message/);
 
     mounted.setAttentionPanels({ queue: true });
-    assert.ok(dock.classList.contains('overflow-y-auto'), 'adding a queue restores outer scrolling');
-    assert.equal(dock.classList.contains('overflow-hidden'), false);
+    assert.ok(dock.querySelector('[data-composer-attention-scroll="queue"]'), 'adding a queue adds its own section scroller');
+    assertNoNestedNativeScroller(dock);
     assert.equal(dock.querySelector('[data-radix-scroll-area-viewport]'), viewport);
+  } finally {
+    mounted?.unmount();
+    restore();
+  }
+});
+
+test('queue dock steer interrupts once and replaces the idle flush action', async () => {
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const restore = installDom();
+  let mounted;
+  try {
+    const container = document.getElementById('root');
+    let steerCalls = 0;
+    mounted = harness.mountCompactControls(container, { queue: true, steer: () => { steerCalls += 1; } });
+    const queue = container.querySelector('[data-ccem-composer-queue]');
+    const steer = queue.querySelector('[data-ccem-composer-queue-steer]');
+    assert.ok(steer, 'a running turn with pending queue exposes steer');
+    assert.equal(steer.closest('[data-composer-attention-scroll]'), null, 'the steer header never scrolls away with the rows');
+    const buttons = [...queue.querySelectorAll('button')].filter((button) => !button.getAttribute('aria-label'));
+    assert.deepEqual(buttons, [steer], 'steer is the only list-wide action while it is available');
+    steer.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+    assert.equal(steerCalls, 1);
+    mounted.unmount();
+    mounted = harness.mountCompactControls(container, { queue: true });
+    assert.equal(container.querySelector('[data-ccem-composer-queue-steer]'), null, 'no steer without a running turn');
+  } finally {
+    mounted?.unmount();
+    restore();
+  }
+});
+
+test('queue presence keeps removed rows in place as leaving until their exit finishes', async () => {
+  const { mergeQueuePresenceRows } = await (importedHarnessPromise ??= importHarness());
+  const a = { id: 'a' };
+  const b = { id: 'b' };
+  const c = { id: 'c' };
+  const initial = mergeQueuePresenceRows([], [a, b]);
+  assert.deepEqual(initial.map((row) => [row.message.id, row.leaving]), [['a', false], ['b', false]]);
+  assert.equal(mergeQueuePresenceRows(initial, [a, b]), initial, 'an unchanged queue keeps row identity');
+
+  const dispatched = mergeQueuePresenceRows(initial, [b, c]);
+  assert.deepEqual(
+    dispatched.map((row) => [row.message.id, row.leaving]),
+    [['a', true], ['b', false], ['c', false]],
+    'the dispatched head stays first while it collapses; the new row appends',
+  );
+  const cancelledMiddle = mergeQueuePresenceRows(mergeQueuePresenceRows([], [a, b, c]), [a, c]);
+  assert.deepEqual(cancelledMiddle.map((row) => [row.message.id, row.leaving]), [['a', false], ['b', true], ['c', false]]);
+});
+
+test('queue dock unmounts once every row has left', async () => {
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const restore = installDom();
+  let mounted;
+  try {
+    const container = document.getElementById('root');
+    mounted = harness.mountCompactControls(container, { queue: true });
+    assert.ok(container.querySelector('[data-ccem-composer-queued-message="queued"]'));
+    mounted.setAttentionPanels({ queue: false });
+    assert.equal(container.querySelector('[data-ccem-composer-queue]'), null, 'no stuck leaving rows after exit');
+    assert.equal(container.querySelector('[data-attention-state]'), null);
+    mounted.setAttentionPanels({ queue: true });
+    assert.ok(container.querySelector('[data-ccem-composer-queued-message="queued"]'), 'a re-queued row renders again');
   } finally {
     mounted?.unmount();
     restore();

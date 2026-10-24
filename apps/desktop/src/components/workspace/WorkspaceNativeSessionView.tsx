@@ -3156,12 +3156,18 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
         // programmatic pin assigned → the user intervened mid-sequence
         // (scrollbar drag, touch pan). Cancel the pin immediately instead of
         // waiting for the wheel event, which never fires for those gestures.
+        const distanceFromBottom = container.scrollHeight - container.clientHeight - container.scrollTop;
         if (isTranscriptUserScrollIntervention({
           programmaticTarget: lastProgrammaticScrollTopRef.current,
           currentScrollTop: container.scrollTop,
+          distanceFromBottom,
         })) {
           cancelPendingAutoScroll();
           autoScrollDetachedRef.current = true;
+        } else {
+          // A shrink clamp moved us while staying at the tail: later checks in
+          // this sequence compare against where we actually are now.
+          lastProgrammaticScrollTopRef.current = container.scrollTop;
         }
         return;
       }
@@ -4651,6 +4657,10 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
         onFlushQueuedMessages={() => void flushQueuedMessages(true)}
         onRemoveQueuedMessage={handleRemoveQueuedMessage}
         queueCanFlush={!isSending && !isProcessingTurn && !hasBlockingAttention && !isTerminalStatus(session.status)}
+        onSteerQueuedMessages={() => void handleStop('composer_queue_steer')}
+        queueCanSteer={canStopForeground && !isStopping && composerQueuedMessages.some(
+          (message) => (message.deliveryState ?? 'pending') === 'pending',
+        )}
         annotations={sessionAnnotations.pendingAnnotations}
         onUpdateAnnotation={sessionAnnotations.updateAnnotation}
         onRemoveAnnotation={sessionAnnotations.removeAnnotation}
