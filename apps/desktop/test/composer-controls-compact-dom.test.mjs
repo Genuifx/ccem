@@ -96,6 +96,7 @@ async function importHarness() {
         import { TooltipProvider } from '@/components/ui/tooltip';
         import { WorkspaceSessionComposer } from '@/components/workspace/WorkspaceSessionComposer';
         import { ComposerControls } from '@/components/workspace/ComposerControls';
+        export { mergeQueuePresenceRows } from '@/components/workspace/composerQueueMotion';
 
         export function mountCompactControls(container, { question = false, queue = false, steer = null } = {}) {
           function Harness({ question, queue }) {
@@ -393,6 +394,7 @@ test('queue dock steer interrupts once and replaces the idle flush action', asyn
     const queue = container.querySelector('[data-ccem-composer-queue]');
     const steer = queue.querySelector('[data-ccem-composer-queue-steer]');
     assert.ok(steer, 'a running turn with pending queue exposes steer');
+    assert.equal(steer.closest('[data-composer-attention-scroll]'), null, 'the steer header never scrolls away with the rows');
     const buttons = [...queue.querySelectorAll('button')].filter((button) => !button.getAttribute('aria-label'));
     assert.deepEqual(buttons, [steer], 'steer is the only list-wide action while it is available');
     steer.dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
@@ -400,6 +402,44 @@ test('queue dock steer interrupts once and replaces the idle flush action', asyn
     mounted.unmount();
     mounted = harness.mountCompactControls(container, { queue: true });
     assert.equal(container.querySelector('[data-ccem-composer-queue-steer]'), null, 'no steer without a running turn');
+  } finally {
+    mounted?.unmount();
+    restore();
+  }
+});
+
+test('queue presence keeps removed rows in place as leaving until their exit finishes', async () => {
+  const { mergeQueuePresenceRows } = await (importedHarnessPromise ??= importHarness());
+  const a = { id: 'a' };
+  const b = { id: 'b' };
+  const c = { id: 'c' };
+  const initial = mergeQueuePresenceRows([], [a, b]);
+  assert.deepEqual(initial.map((row) => [row.message.id, row.leaving]), [['a', false], ['b', false]]);
+  assert.equal(mergeQueuePresenceRows(initial, [a, b]), initial, 'an unchanged queue keeps row identity');
+
+  const dispatched = mergeQueuePresenceRows(initial, [b, c]);
+  assert.deepEqual(
+    dispatched.map((row) => [row.message.id, row.leaving]),
+    [['a', true], ['b', false], ['c', false]],
+    'the dispatched head stays first while it collapses; the new row appends',
+  );
+  const cancelledMiddle = mergeQueuePresenceRows(mergeQueuePresenceRows([], [a, b, c]), [a, c]);
+  assert.deepEqual(cancelledMiddle.map((row) => [row.message.id, row.leaving]), [['a', false], ['b', true], ['c', false]]);
+});
+
+test('queue dock unmounts once every row has left', async () => {
+  const harness = await (importedHarnessPromise ??= importHarness());
+  const restore = installDom();
+  let mounted;
+  try {
+    const container = document.getElementById('root');
+    mounted = harness.mountCompactControls(container, { queue: true });
+    assert.ok(container.querySelector('[data-ccem-composer-queued-message="queued"]'));
+    mounted.setAttentionPanels({ queue: false });
+    assert.equal(container.querySelector('[data-ccem-composer-queue]'), null, 'no stuck leaving rows after exit');
+    assert.equal(container.querySelector('[data-attention-state]'), null);
+    mounted.setAttentionPanels({ queue: true });
+    assert.ok(container.querySelector('[data-ccem-composer-queued-message="queued"]'), 'a re-queued row renders again');
   } finally {
     mounted?.unmount();
     restore();

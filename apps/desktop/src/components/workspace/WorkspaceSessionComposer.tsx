@@ -5,9 +5,11 @@ import {
   type TextareaHTMLAttributes,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  type MutableRefObject,
 } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
@@ -91,6 +93,16 @@ import type {
 } from '@/lib/tauri-ipc';
 import { createReentryGuard, type ReentryGuard } from '@/lib/asyncGuard';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion, useGSAP } from '@/lib/gsapMotion';
+import {
+  animateQueueRowEnter,
+  animateQueueRowLeave,
+  captureQueueFlightSource,
+  isQueueFlightFresh,
+  mergeQueuePresenceRows,
+  runQueueFlight,
+  type QueueFlightSource,
+  type QueuePresenceRow,
+} from './composerQueueMotion';
 import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';
 import type { InstalledSkill, LaunchClient } from '@/store';
@@ -608,25 +620,103 @@ function queuedDeliveryKeys(state: ComposerQueuedMessage['deliveryState']) {
 }
 
 function ComposerQueueDock({
-  messages,
+  rows,
   canFlush,
   onFlush,
   onRemove,
   canSteer,
   onSteer,
+  flightSourceRef,
+  onRowLeft,
+  listMaxHeightClassName,
 }: {
-  messages: ComposerQueuedMessage[];
+  rows: QueuePresenceRow<ComposerQueuedMessage>[];
   canFlush: boolean;
   onFlush?: () => void | Promise<void>;
   onRemove?: (id: string) => void;
   canSteer: boolean;
   onSteer?: () => void | Promise<void>;
+  flightSourceRef: MutableRefObject<QueueFlightSource | null>;
+  onRowLeft: (id: string) => void;
+  /** The list scrolls under a fixed header so steer/flush never scroll away. */
+  listMaxHeightClassName: string;
 }) {
   const { t } = useLocale();
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const seenActiveIdsRef = useRef<Set<string> | null>(null);
+  const leavingIdsRef = useRef(new Set<string>());
 
-  if (messages.length === 0) {
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    if (!root) {
+      return;
+    }
+    const rowElement = (id: string) => [
+      ...root.querySelectorAll<HTMLElement>('[data-ccem-composer-queued-message]'),
+    ].find((element) => element.dataset.ccemComposerQueuedMessage === id) ?? null;
+    const activeIds = rows.filter((row) => !row.leaving).map((row) => row.message.id);
+    const seen = seenActiveIdsRef.current;
+    const entered = activeIds.filter((id) => !seen?.has(id));
+    seenActiveIdsRef.current = new Set(activeIds);
+
+    // The newest submit flies into the last row it produced; other new rows
+    // (backend snapshots, restores) only expand. A first mount without a fresh
+    // submit is a restored queue and rides the dock's own entrance.
+    const flight = isQueueFlightFresh(flightSourceRef.current) ? flightSourceRef.current : null;
+    const flightId = flight ? entered[entered.length - 1] : undefined;
+    for (const id of entered) {
+      const element = rowElement(id);
+      if (!element || (!seen && id !== flightId)) {
+        continue;
+      }
+      animateQueueRowEnter(element, { highlight: id === flightId });
+    }
+    if (flight && flightId) {
+      const text = rowElement(flightId)?.querySelector<HTMLElement>('[data-ccem-composer-queued-text]');
+      if (text) {
+        flightSourceRef.current = null;
+        runQueueFlight(flight, text);
+      }
+    }
+
+    for (const row of rows) {
+      const id = row.message.id;
+      if (!row.leaving || leavingIdsRef.current.has(id)) {
+        continue;
+      }
+      const element = rowElement(id);
+      leavingIdsRef.current.add(id);
+      const done = () => {
+        leavingIdsRef.current.delete(id);
+        onRowLeft(id);
+      };
+      if (element) {
+        animateQueueRowLeave(element, done);
+      } else {
+        done();
+      }
+    }
+
+    // When the queue is the dock's only section and it empties, fade the card
+    // with the rows so the frame does not pop out after they collapse.
+    const card = root.closest<HTMLElement>('[data-attention-state]');
+    const queueIsSoleSection = card != null
+      && !card.querySelector('[data-composer-attention-scroll="interruption"]')
+      && !card.querySelector('[data-radix-scroll-area-viewport]');
+    if (card && queueIsSoleSection && activeIds.length === 0 && !shouldReduceMotion()) {
+      gsap.to(card, { autoAlpha: 0, y: 8, duration: ccemMotion.duration.quick + 0.04, ease: ccemMotion.ease.soft });
+    } else if (card && activeIds.length > 0) {
+      gsap.killTweensOf(card);
+      gsap.set(card, { clearProps: 'opacity,visibility,transform' });
+    }
+  }, [flightSourceRef, onRowLeft, rows]);
+
+  if (rows.length === 0) {
     return null;
   }
+
+  const activeMessages = rows.filter((row) => !row.leaving).map((row) => row.message);
+  const messages = activeMessages.length > 0 ? activeMessages : rows.map((row) => row.message);
 
   const allMessagesFlushable = messages.every((message) => message.flushable !== false);
   const hasBackendOwnedMessage = messages.some((message) => message.flushable === false);
@@ -649,7 +739,7 @@ function ComposerQueueDock({
   const showFlush = Boolean(onFlush) && allMessagesFlushable && !showSteer;
 
   return (
-    <div data-ccem-composer-queue className="space-y-0.5">
+    <div ref={rootRef} data-ccem-composer-queue className="space-y-0.5">
       <div className="flex h-7 items-center gap-2 pl-1.5 pr-0.5">
         <MessageSquareQuote className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
         <div
@@ -700,8 +790,14 @@ function ComposerQueueDock({
         ) : null}
       </div>
 
-      <ol className="space-y-px">
-        {messages.map((message) => {
+      <ol
+        data-composer-attention-scroll="queue"
+        className={cn(
+          'workspace-attention-scroll shrink-0 space-y-px overflow-y-auto overscroll-contain',
+          listMaxHeightClassName,
+        )}
+      >
+        {rows.map(({ message, leaving }) => {
           const delivery = queuedDeliveryKeys(message.deliveryState);
           const fullText = message.displayText ?? message.text;
           return (
@@ -709,7 +805,12 @@ function ComposerQueueDock({
               key={message.id}
               data-ccem-composer-queued-message={message.id}
               data-delivery-state={message.deliveryState}
-              className="group flex h-7 items-center gap-2 rounded-lg pl-1.5 pr-0.5 transition-colors hover:bg-muted/45"
+              data-leaving={leaving ? '' : undefined}
+              aria-hidden={leaving || undefined}
+              className={cn(
+                'group flex h-7 items-center gap-2 overflow-hidden rounded-lg pl-1.5 pr-0.5 transition-colors hover:bg-muted/45',
+                leaving && 'pointer-events-none',
+              )}
             >
               <span className="flex h-3.5 w-3.5 shrink-0 items-center justify-center" title={t(delivery.hint)}>
                 {message.deliveryState === 'delivery_uncertain' ? (
@@ -721,7 +822,11 @@ function ComposerQueueDock({
                 )}
                 <span className="sr-only">{t(delivery.badge)}</span>
               </span>
-              <p className="min-w-0 flex-1 truncate text-[12px] leading-4 text-foreground/90" title={fullText}>
+              <p
+                data-ccem-composer-queued-text
+                className="min-w-0 flex-1 truncate text-[12px] leading-4 text-foreground/90"
+                title={fullText}
+              >
                 {fullText}
               </p>
               {message.attachments?.length ? (
@@ -738,7 +843,7 @@ function ComposerQueueDock({
                   {t('workspace.composerPlanModeShort')}
                 </span>
               ) : null}
-              {onRemove && message.removable !== false ? (
+              {onRemove && message.removable !== false && !leaving ? (
                 <button
                   type="button"
                   className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-[opacity,colors] hover:bg-muted hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
@@ -850,6 +955,7 @@ export function WorkspaceSessionComposer({
 }: WorkspaceSessionComposerProps) {
   const { t } = useLocale();
   const composerShellRef = useRef<HTMLDivElement | null>(null);
+  const queueFlightRef = useRef<QueueFlightSource | null>(null);
   const [floatingAttentionMaxHeight, setFloatingAttentionMaxHeight] = useState(440);
   useEffect(() => {
     const shell = composerShellRef.current;
@@ -1548,6 +1654,9 @@ export function WorkspaceSessionComposer({
     );
     // A thrown transport error can mean admission succeeded before ACK loss.
     // Only an explicit false result is a definite rejection.
+    // The queue row may appear before onSubmit resolves, so capture the text's
+    // position now; the dock consumes it only if a queue row actually appears.
+    queueFlightRef.current = captureQueueFlightSource(composerShellRef.current, payload.text);
     let result: ComposerSubmitResult;
     try {
       result = await onSubmit(payload);
@@ -1620,7 +1729,20 @@ export function WorkspaceSessionComposer({
     }
   }, [runComposerSubmit]);
 
-  const hasComposerAttentionPanel = queuedMessages.length > 0;
+  const [queueRows, setQueueRows] = useState<QueuePresenceRow<ComposerQueuedMessage>[]>(
+    () => queuedMessages.map((message) => ({ message, leaving: false })),
+  );
+  useLayoutEffect(() => {
+    setQueueRows((previous) => mergeQueuePresenceRows(previous, queuedMessages));
+  }, [queuedMessages]);
+  const handleQueueRowLeft = useCallback((id: string) => {
+    setQueueRows((previous) => {
+      const next = previous.filter((row) => !(row.leaving && row.message.id === id));
+      return next.length === previous.length ? previous : next;
+    });
+  }, []);
+  const hasComposerAttentionPanel = queueRows.length > 0;
+  const hasInterruptionPanel = Boolean(aboveComposer);
 
   const triggerAttentionPanel = useMemo(() => (
     triggerPanelState ? <ComposerTriggerSuggestionPanel state={triggerPanelState} /> : null
@@ -1633,22 +1755,27 @@ export function WorkspaceSessionComposer({
 
     return (
       <ComposerQueueDock
-        messages={queuedMessages}
+        rows={queueRows}
         canFlush={queueCanFlush}
         onFlush={onFlushQueuedMessages}
         onRemove={onRemoveQueuedMessage}
         canSteer={queueCanSteer}
         onSteer={onSteerQueuedMessages}
+        flightSourceRef={queueFlightRef}
+        onRowLeft={handleQueueRowLeft}
+        listMaxHeightClassName={hasInterruptionPanel ? 'max-h-[86px]' : 'max-h-[min(26vh,190px)]'}
       />
     );
   }, [
+    handleQueueRowLeft,
     hasComposerAttentionPanel,
     onFlushQueuedMessages,
     onRemoveQueuedMessage,
     onSteerQueuedMessages,
     queueCanFlush,
     queueCanSteer,
-    queuedMessages,
+    queueRows,
+    hasInterruptionPanel,
   ]);
 
   const combinedAboveComposer = useMemo(() => {
@@ -1692,15 +1819,7 @@ export function WorkspaceSessionComposer({
             <div className="h-px shrink-0 bg-border/35" aria-hidden="true" />
           ) : null}
           {composerAttentionPanel ? (
-            <div
-              data-composer-attention-scroll="queue"
-              className={cn(
-                'workspace-attention-scroll shrink-0 overflow-y-auto overscroll-contain',
-                hasInterruption ? 'max-h-[100px]' : 'max-h-[min(30vh,220px)]',
-              )}
-            >
-              {composerAttentionPanel}
-            </div>
+            <div className="shrink-0">{composerAttentionPanel}</div>
           ) : null}
         </div>
       </div>
@@ -1713,8 +1832,7 @@ export function WorkspaceSessionComposer({
   const attentionMotionKey = [
     aboveComposer ? 'interrupt' : 'base',
     triggerPanelState ? 'trigger' : 'no-trigger',
-    hasComposerAttentionPanel ? 'queue' : 'no-queue',
-    queuedMessages.length,
+    combinedAboveComposer ? 'dock' : 'no-dock',
   ].join(':');
   const attachmentMotionKey = useMemo(
     () => attachments.map((attachment) => attachment.id).join('|'),
