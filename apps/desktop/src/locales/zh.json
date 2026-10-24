@@ -582,7 +582,6 @@
     "effortMax": "极限",
     "effortLabel": "推理深度",
     "environmentLabel": "环境",
-    "environmentGroupCount": "{count} 个环境",
     "codexModelSelectorDisabledBadge": "暂未接入",
     "codexModelSelectorDisabledHint": "Codex SDK 当前不会读取这里的模型选择，会使用 ~/.codex/config.toml 或当前 Codex profile。",
     "historyRouterEnvLockedBadge": "历史快照",

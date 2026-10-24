@@ -558,35 +558,31 @@ export function ComposerControls({
               {groupedEnvironments.map((group) => {
                 const isCurrentGroup = currentModel === group.model;
                 const groupIconEnv = group.envs.find((e) => e.name === envName) || group.envs[0];
-                const isSingle = group.envs.length === 1;
                 const isPanelOpen = envPanel?.model === group.model;
                 const openPanel = (row: HTMLElement) => {
                   clearEnvPanelSwitch();
                   setEnvPanel({ model: group.model, row });
                   focusEnvPanel();
                 };
+                // Every model row opens the shared env panel, even with a single
+                // env, so the list stays one uniform column of models.
                 return (
                   <DropdownMenuItem
                     key={group.model}
                     data-current-env-group={isCurrentGroup || undefined}
                     data-env-group-row={group.model}
-                    disabled={isSingle && isEnvironmentLocked}
-                    aria-haspopup={isSingle ? undefined : 'menu'}
-                    aria-expanded={isSingle ? undefined : isPanelOpen}
+                    aria-haspopup="menu"
+                    aria-expanded={isPanelOpen}
                     onFocus={(event) => {
-                      scheduleEnvPanel(isSingle ? null : { model: group.model, row: event.currentTarget });
+                      scheduleEnvPanel({ model: group.model, row: event.currentTarget });
                     }}
                     onKeyDown={(event) => {
-                      if (!isSingle && event.key === 'ArrowRight') {
+                      if (event.key === 'ArrowRight') {
                         event.preventDefault();
                         openPanel(event.currentTarget);
                       }
                     }}
                     onSelect={(event) => {
-                      if (isSingle) {
-                        onEnvChange(group.envs[0].name);
-                        return;
-                      }
                       event.preventDefault();
                       openPanel(event.currentTarget as HTMLElement);
                     }}
@@ -613,42 +609,12 @@ export function ComposerControls({
                     >
                       {group.model}
                     </span>
-                    {/* Meta column: env name for a direct pick, a count pill for
-                        a group. Every row reserves the same trailing slot so the
-                        meta text shares one right edge. */}
-                    {isSingle ? (
-                      <span
-                        className={cn(
-                          'max-w-[96px] shrink-0 truncate text-[11px]',
-                          isCurrentGroup ? 'text-primary/65' : 'text-muted-foreground/50',
-                        )}
-                      >
-                        {group.envs[0].name}
-                      </span>
-                    ) : (
-                      <span
-                        title={t('workspace.environmentGroupCount', { count: group.envs.length })}
-                        aria-label={t('workspace.environmentGroupCount', { count: group.envs.length })}
-                        className={cn(
-                          'inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full px-1.5 text-[10px] font-medium tabular-nums',
-                          isCurrentGroup ? 'bg-primary/10 text-primary/80' : 'bg-muted/60 text-muted-foreground/70',
-                        )}
-                      >
-                        {group.envs.length}
-                      </span>
-                    )}
-                    <span className="flex w-3.5 shrink-0 justify-center">
-                      {isSingle ? (
-                        isCurrentGroup && <Check className="h-3.5 w-3.5 text-primary" />
-                      ) : (
-                        <ChevronRight
-                          className={cn(
-                            'h-3.5 w-3.5 transition-colors',
-                            isPanelOpen ? 'text-foreground/70' : 'text-muted-foreground/50',
-                          )}
-                        />
+                    <ChevronRight
+                      className={cn(
+                        'h-3.5 w-3.5 shrink-0 transition-colors',
+                        isPanelOpen ? 'text-foreground/70' : 'text-muted-foreground/40',
                       )}
-                    </span>
+                    />
                   </DropdownMenuItem>
                 );
               })}
@@ -683,10 +649,12 @@ export function ComposerControls({
                   position: 'absolute',
                   top: envPanelBox?.top ?? 0,
                   height: envPanelBox?.height,
-                  // Slide/resize between groups only; the first placement is instant.
+                  // Slide/resize between groups only. The first placement must be
+                  // `none`, not unset: `.frosted-panel` transitions `all`, which
+                  // would animate `top` from 0 and flash in from the menu top.
                   transition: envPanelWasOpenRef.current
                     ? 'top 220ms cubic-bezier(0.22, 1, 0.36, 1), height 220ms cubic-bezier(0.22, 1, 0.36, 1)'
-                    : undefined,
+                    : 'none',
                 }}
               >
                 <div ref={envPanelInnerRef}>
