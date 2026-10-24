@@ -587,10 +587,10 @@ fn invalid_ledgers_and_concurrent_metadata_changes_do_not_publish() {
 #[cfg(unix)]
 #[test]
 fn materializes_confined_symlinks_and_refuses_escape_cycle_or_destination_links() {
-    use std::os::unix::fs::symlink;
+    use crate::test_support::{symlink_dir, symlink_file};
     let (_temp, source, target) = fixture();
     let path = add_plugin(&source, "demo@fixture", "user", None, "1");
-    symlink("skills/demo/SKILL.md", path.join("linked.md")).unwrap();
+    symlink_file("skills/demo/SKILL.md", path.join("linked.md")).unwrap();
     import_plugins(&source, &target).unwrap();
     let linked = target.join("plugins/cache/fixture/demo/1/linked.md");
     assert!(!fs::symlink_metadata(&linked)
@@ -607,17 +607,17 @@ fn materializes_confined_symlinks_and_refuses_escape_cycle_or_destination_links(
         match malicious {
             "escape" => {
                 write(&source.join(".credentials.json"), "secret");
-                symlink(source.join(".credentials.json"), path.join("linked")).unwrap();
+                symlink_file(source.join(".credentials.json"), path.join("linked")).unwrap();
             }
-            "cycle" => symlink(".", path.join("linked")).unwrap(),
+            "cycle" => symlink_dir(".", path.join("linked")).unwrap(),
             "destination" => {
                 fs::create_dir_all(&target).unwrap();
-                symlink(source.join("plugins"), target.join("plugins")).unwrap();
+                symlink_dir(source.join("plugins"), target.join("plugins")).unwrap();
             }
             _ => {
                 let target_plugin = target.join("plugins/cache/fixture/demo/1");
                 fs::create_dir_all(&target_plugin).unwrap();
-                symlink("/nonexistent/fixture", target_plugin.join("unused-link")).unwrap();
+                symlink_file("/nonexistent/fixture", target_plugin.join("unused-link")).unwrap();
             }
         }
         assert!(import_plugins(&source, &target).is_err());
@@ -677,14 +677,14 @@ fn refuses_runtime_data_paths_but_imports_plugins_own_static_data_directories() 
 #[cfg(unix)]
 #[test]
 fn refuses_confined_symlinks_to_runtime_data_without_publishing_metadata() {
-    use std::os::unix::fs::symlink;
+    use crate::test_support::symlink_dir;
     let (_temp, source, target) = fixture();
     let plugin = add_plugin(&source, "demo@fixture", "user", None, "1");
     write(
         &source.join("plugins/data/secret.json"),
         "official plugin private state",
     );
-    symlink(source.join("plugins/data"), plugin.join("linked-state")).unwrap();
+    symlink_dir(source.join("plugins/data"), plugin.join("linked-state")).unwrap();
     let installed = fs::read(source.join(INSTALLED)).unwrap();
     let markets = fs::read(source.join(MARKETPLACES)).unwrap();
     assert!(import_plugins(&source, &target)

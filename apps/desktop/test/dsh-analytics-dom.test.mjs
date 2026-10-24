@@ -1,3 +1,4 @@
+import { importFixture } from './helpers/fixture-paths.mjs';
 /**
  * JSDOM + React act() behavior tests for DSH Analytics integration (Phase 3).
  * Verifies: DSH filter presence, source guard (only 'all' updates global store),
@@ -10,7 +11,6 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { build, stop as stopEsbuild } from 'esbuild';
 import { JSDOM } from 'jsdom';
-import { pathToFileURL } from 'node:url';
 
 const desktopDir = path.resolve(import.meta.dirname, '..');
 let cachedHarness;
@@ -298,8 +298,7 @@ async function createTestEnv() {
   g.React = React;
 
   // Load the bundle
-  const bundleUrl = pathToFileURL(outfile).href;
-  const mod = await import(bundleUrl);
+  const mod = await importFixture(outfile);
 
   return { dom, mod, React, ReactDOM, act: React.act, g };
 }

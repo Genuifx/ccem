@@ -962,6 +962,7 @@ mod tests {
         let outcome = extract_runtime_archive(&archive, &candidate, &artifact).unwrap();
         assert_eq!(outcome.entry_count, 2);
         assert_eq!(fs::read(candidate.join("App/Browser")).unwrap(), b"browser");
+        // test-path-allow: rust-link-target -- Archive contract requires the exact declared relative target, not an equivalent resolved path.
         assert_eq!(
             fs::read_link(candidate.join("App/Current")).unwrap(),
             PathBuf::from("Browser")
