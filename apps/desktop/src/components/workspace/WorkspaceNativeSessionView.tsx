@@ -1516,6 +1516,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
     getNativeSessionEventPage,
     sendNativeSessionInput,
     flushNativeSessionInputQueue,
+    steerNativeSessionInputQueue,
     getNativeSessionInputQueue,
     cancelNativeSessionQueuedInput,
     respondNativeSessionPermission,
@@ -4277,6 +4278,8 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
     }
   }, [pollEvents, refreshSummary, respondNativeSessionPermission, session.runtime_id, t]);
 
+  const steeringRef = useRef(false);
+  const [isSteering, setIsSteering] = useState(false);
   const handleStop = useCallback(async (source = 'native_session_stop_button') => {
     setIsStopping(true);
     try {
@@ -4293,6 +4296,32 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
       setIsStopping(false);
     }
   }, [refreshSummary, session.lifecycle?.active_command_id, session.runtime_id, stopNativeSession, t]);
+
+  const handleSteerQueuedMessages = useCallback(async () => {
+    if (steeringRef.current) return;
+    steeringRef.current = true;
+    setIsSteering(true);
+    // Capture the clicked turn. A delayed rejection must never stop its successor.
+    const expectedCommandId = session.lifecycle?.active_command_id;
+    try {
+      const outcome = session.provider === 'claude' && expectedCommandId
+        ? await steerNativeSessionInputQueue(session.runtime_id, expectedCommandId)
+        : 'fallback';
+      if (outcome === 'fallback') {
+        await stopNativeSession(session.runtime_id, 'composer_queue_steer', expectedCommandId ?? null);
+      }
+      await pollEvents();
+      await refreshSummary({ force: true });
+    } catch (error) {
+      console.error('Failed to steer queued native input:', error);
+      toast.error(t('workspace.composerQueuedSteerFailed'));
+      await refreshSummary({ force: true });
+    } finally {
+      steeringRef.current = false;
+      setIsSteering(false);
+    }
+  }, [pollEvents, refreshSummary, session.lifecycle?.active_command_id, session.provider,
+    session.runtime_id, steerNativeSessionInputQueue, stopNativeSession, t]);
 
   const handleStopBackgroundTask = useCallback(async (taskId: string) => {
     await stopNativeBackgroundTask(session.runtime_id, taskId);
@@ -4657,8 +4686,8 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
         onFlushQueuedMessages={() => void flushQueuedMessages(true)}
         onRemoveQueuedMessage={handleRemoveQueuedMessage}
         queueCanFlush={!isSending && !isProcessingTurn && !hasBlockingAttention && !isTerminalStatus(session.status)}
-        onSteerQueuedMessages={() => void handleStop('composer_queue_steer')}
-        queueCanSteer={canStopForeground && !isStopping && composerQueuedMessages.some(
+        onSteerQueuedMessages={() => void handleSteerQueuedMessages()}
+        queueCanSteer={canStopForeground && !isStopping && !isSteering && composerQueuedMessages.some(
           (message) => (message.deliveryState ?? 'pending') === 'pending',
         )}
         annotations={sessionAnnotations.pendingAnnotations}

@@ -65,6 +65,7 @@ import {
 } from './claudeBackgroundTasks';
 import { createStreamEventCoalescer } from './streamEventCoalescer';
 import { InputOperation } from './inputOperation';
+import { ClaudeSteering } from './claudeSteering';
 import { captureCodexUsageBaseline, resolveCodexTurnUsage } from './codexTurnUsage';
 
 type NativeProvider = 'claude' | 'codex';
@@ -101,6 +102,13 @@ type PromptCommand = {
   images?: PromptImage[] | null;
   command_id?: string;
   client_message_ids?: string[];
+};
+
+type SteerPromptCommand = Omit<PromptCommand, 'type' | 'command_id'> & {
+  type: 'steer_prompt';
+  command_id: string;
+  expected_command_id: string;
+  expected_query_generation: number;
 };
 
 type InteractivePromptResponseCommand = {
@@ -196,6 +204,7 @@ type StopTaskCommand = {
 type InputCommand =
   | InitCommand
   | PromptCommand
+  | SteerPromptCommand
   | InteractivePromptResponseCommand
   | PermissionResponseCommand
   | BrowserToolResponseInputCommand
@@ -313,6 +322,7 @@ let claudeForegroundPromptUuid: string | null = null;
 let claudeInputOperation: InputOperation | null = null;
 let claudeInputResultCorrelated = false;
 const promptInputOperations = new WeakMap<PromptCommand, InputOperation>();
+const claudeSteering = new ClaudeSteering();
 let claudeForegroundPromptAccepted = false;
 let claudeForegroundCommand: 'compact' | null = null;
 let claudeIngressOriginKind: string | null = null;
@@ -356,7 +366,6 @@ let claudeInitializationBarrier: Promise<void> = Promise.resolve();
 const claudeTerminalCommandIds = new Set<string>();
 // Keep bounded ownership for Results delivered after command terminal/next start.
 const claudeUsageOperations = new Map<string, InputOperation>();
-const claudeObservedResultCommandIds = new Set<string>();
 const claudeSeenNonHumanResultKeys = new Set<string>();
 let pendingClaudePromptReplay: {
   text: string;
@@ -513,7 +522,9 @@ function emitSessionMeta(providerSessionId: string) {
           query_generation: claudeQueryGeneration,
           ...(claudeSdkCapabilities === undefined
             ? {}
-            : { capabilities: claudeSdkCapabilities }),
+            : { capabilities: claudeSdkCapabilities.includes('msg_lifecycle_v1')
+                && currentClaudeQuery && claudeQueuedInterruptAdapter(currentClaudeQuery)
+                ? [...claudeSdkCapabilities, 'ccem_steer_v1'] : claudeSdkCapabilities }),
         }
       : {}),
   });
@@ -584,6 +595,7 @@ function emitClaudeInteractiveResolverExpired(
 }
 
 function beginClaudeLifecycleGeneration() {
+  claudeSteering.clear();
   for (const [toolUseId, pending] of pendingClaudeInteractivePrompts.entries()) {
     if (pending.queryGeneration === claudeQueryGeneration) {
       continue;
@@ -608,13 +620,13 @@ function beginClaudeLifecycleGeneration() {
   claudeAuthoritativeTerminalCommandId = null;
   claudeTerminalCommandIds.clear();
   claudeUsageOperations.clear();
-  claudeObservedResultCommandIds.clear();
   if (currentProviderSessionId) {
     emitSessionMeta(currentProviderSessionId);
   }
 }
 
 function armClaudeLifecycleTerminalTimer(commandId: string, reason: string) {
+  if (claudeSteering.deferredTerminal) return;
   clearClaudeLifecycleTerminalTimer();
   const generation = claudeQueryGeneration;
   claudeLifecycleTerminalTimer = setTimeout(() => {
@@ -699,6 +711,40 @@ function processNegotiatedClaudeSdkCommandLifecycle(frame: ClaudeSdkCommandLifec
   }
 
   const state = frame.state as ClaudeSdkCommandState;
+  const steered = claudeSteering.get(frame.commandId);
+  if (steered) {
+    if (steered.terminal) return;
+    emitEvent({ type: 'lifecycle', stage: 'steer_command_state', detail: state,
+      command_id: frame.commandId, query_generation: claudeQueryGeneration });
+    if (CLAUDE_SDK_TERMINAL_STATES.has(state)) {
+      claudeSteering.noteChildTerminal(frame.commandId, state, claudeInterruptRequested);
+      if (state !== 'completed' && !(state === 'cancelled' && claudeInterruptRequested)) {
+        emitEvent({ type: 'lifecycle', stage: 'steer_failed',
+          detail: `Claude steer ${frame.commandId} was ${state}; the message was not automatically retried.`,
+          command_id: frame.commandId, query_generation: claudeQueryGeneration });
+      }
+      recordCompletedClaudeSteerUsage(steered.parent);
+      const deferred = claudeSteering.deferredTerminal;
+      if (deferred && !claudeSteering.hasPending(deferred.commandId)) {
+        claudeSteering.deferredTerminal = null;
+        processNegotiatedClaudeSdkCommandLifecycle(deferred);
+      }
+      claudeSteering.prune();
+    }
+    return;
+  }
+  if (matchingForeground && CLAUDE_SDK_TERMINAL_STATES.has(state)) {
+    claudeSteering.noteRootTerminal(frame.commandId);
+  }
+  // A send can race the final tool boundary and become an SDK continuation.
+  // Keep the original owner until that accepted input settles. Buffer the raw
+  // terminal too: Rust releases on sdk_command_state, before turn_completed.
+  if (matchingForeground && CLAUDE_SDK_TERMINAL_STATES.has(state)
+    && claudeSteering.hasPending(frame.commandId)) {
+    claudeSteering.deferredTerminal = frame;
+    clearClaudeLifecycleTerminalTimer();
+    return;
+  }
   emitEvent({
     type: 'lifecycle',
     stage: 'sdk_command_state',
@@ -973,7 +1019,8 @@ function isCurrentClaudeHumanPromptEcho(message: unknown) {
   }
   const messageUuid = (message as { uuid?: unknown } | undefined)?.uuid;
   if (typeof messageUuid === 'string' && claudeForegroundPromptUuid) {
-    return messageUuid === claudeForegroundPromptUuid;
+    return messageUuid === claudeForegroundPromptUuid
+      || claudeSteering.get(messageUuid)?.parent === claudeForegroundPromptUuid;
   }
   return true;
 }
@@ -1015,7 +1062,8 @@ function isForegroundClaudeResult(message: unknown) {
 
   const resultPromptUuid = (message as { user_message_uuid?: unknown } | undefined)?.user_message_uuid;
   if (typeof resultPromptUuid === 'string' && claudeForegroundPromptUuid) {
-    return resultPromptUuid === claudeForegroundPromptUuid;
+    return resultPromptUuid === claudeForegroundPromptUuid
+      || claudeSteering.get(resultPromptUuid)?.parent === claudeForegroundPromptUuid;
   }
 
   if (originKind === 'human') {
@@ -1070,12 +1118,29 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, message: string):
   }
 }
 
+function claudeQueuedInterruptAdapter(claudeQuery: ReturnType<typeof query>) {
+  // SDK 0.3.220 implements the advertised control request but omits request()
+  // from public Query types. Feature-detect; older helpers keep interrupt fallback.
+  const adapter = claudeQuery as unknown as {
+    request?: (request: { subtype: 'interrupt'; cancel_queued: true }) => Promise<unknown>;
+  };
+  return claudeSdkCapabilities?.includes('interrupt_cancel_queued_v1')
+    && typeof adapter.request === 'function' ? adapter : null;
+}
+
 async function interruptClaudeWithTimeout(claudeQuery: ReturnType<typeof query>) {
   const timeoutMs = resolveClaudeInterruptTimeoutMs(
     process.env.CCEM_NATIVE_CLAUDE_INTERRUPT_TIMEOUT_MS,
   );
+  const parent = claudeForegroundPromptUuid;
+  const adapter = parent && claudeSteering.hasPending(parent) ? claudeQueuedInterruptAdapter(claudeQuery) : null;
+  if (adapter) {
+    // Let the streaming iterator write the input before its cancellation request.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (claudeForegroundPromptUuid !== parent) return;
+  }
   return withTimeout(
-    claudeQuery.interrupt(),
+    adapter ? adapter.request!({ subtype: 'interrupt', cancel_queued: true }) : claudeQuery.interrupt(),
     timeoutMs,
     `Claude interrupt timed out after ${timeoutMs}ms`,
   );
@@ -1417,6 +1482,11 @@ function rememberClaudeCommandId(set: Set<string>, commandId: string) {
   }
 }
 
+function recordCompletedClaudeSteerUsage(commandId: string) {
+  const tokens = claudeSteering.completedOutputTokens(commandId);
+  if (tokens !== null) claudeUsageOperations.get(commandId)?.recordOutputTokens(tokens);
+}
+
 function emitClaudeResultUsage(message: unknown, commandId: string | null) {
   const record = message as {
     usage?: Record<string, unknown>;
@@ -1428,7 +1498,12 @@ function emitClaudeResultUsage(message: unknown, commandId: string | null) {
     return;
   }
   if (commandId && record.subtype === 'success' && !record.is_error) {
-    claudeUsageOperations.get(commandId)?.recordOutputTokens(record.usage.output_tokens);
+    if (typeof record.usage.output_tokens === 'number'
+      && claudeSteering.addUsage(commandId, record.usage.output_tokens)) {
+      recordCompletedClaudeSteerUsage(commandId);
+    } else {
+      claudeUsageOperations.get(commandId)?.recordOutputTokens(record.usage.output_tokens);
+    }
   }
   const outputTokens = typeof record.usage.output_tokens === 'number'
     ? record.usage.output_tokens
@@ -1470,10 +1545,6 @@ function observeLateClaudeTurnResult(
   detail: string,
   failed: boolean,
 ) {
-  if (claudeObservedResultCommandIds.has(commandId)) {
-    return false;
-  }
-  rememberClaudeCommandId(claudeObservedResultCommandIds, commandId);
   emitEvent({
     type: 'lifecycle',
     stage: 'turn_result_observed',
@@ -1545,22 +1616,28 @@ function finishClaudeFullLifecycleTurn(state: ClaudeSdkCommandState, commandId: 
 
   const observation = claudeTurnResultObservation;
   const interruptedByRequest = claudeInterruptRequested;
+  // The original SDK root may have finished before a queued continuation was
+  // cancelled. Its raw terminal stays truthful, but the grouped user turn was
+  // interrupted and must not be presented as successfully completed.
+  const interrupted = interruptedByRequest
+    && (state !== 'completed' || claudeSteering.wasCancelledByStop(commandId));
+  recordCompletedClaudeSteerUsage(commandId);
   claudeTurnCompletionEmitted = true;
   claudeAuthoritativeTerminalCommandId = commandId;
   rememberClaudeCommandId(claudeTerminalCommandIds, commandId);
   claudeInputOperation?.observe(
-    state === 'completed' && !(claudeInputResultCorrelated && observation?.failed) ? 'completed' : 'failed',
+    state === 'completed' && !interrupted && !(claudeInputResultCorrelated && observation?.failed) ? 'completed' : 'failed',
     (claudeInputResultCorrelated && observation?.detail) || `Claude SDK command ${state}.`,
   );
   clearClaudeForegroundOwnership();
   claudeInterruptRequested = false;
 
-  if (interruptedByRequest && state !== 'completed' && !claudeInterruptCompletionEmitted) {
+  if (interrupted && !claudeInterruptCompletionEmitted) {
     claudeInterruptCompletionEmitted = true;
     emitEvent({
       type: 'lifecycle',
       stage: 'turn_interrupted',
-      detail: `Claude command ${state} after the interrupt request.`,
+      detail: `Claude turn interrupted; command ${state}, pending steer cancelled: ${claudeSteering.wasCancelledByStop(commandId)}.`,
       query_generation: claudeQueryGeneration,
       command_id: commandId,
       user_message_uuid: commandId,
@@ -1602,7 +1679,7 @@ function finishClaudeFullLifecycleTurn(state: ClaudeSdkCommandState, commandId: 
     emitStatus('processing', 'Settings will apply to the next Claude runtime.');
     return true;
   }
-  const detail = interruptedByRequest && state !== 'completed'
+  const detail = interrupted
     ? 'Turn interrupted. Ready for the next prompt.'
     : state === 'completed'
     ? 'Ready for the next prompt.'
@@ -1618,7 +1695,6 @@ function observeClaudeTurnResult(detail: string, failed: boolean) {
     return false;
   }
   claudeTurnResultObservation = { commandId, detail, failed };
-  rememberClaudeCommandId(claudeObservedResultCommandIds, commandId);
   emitEvent({
     type: 'lifecycle',
     stage: 'turn_result_observed',
@@ -3707,9 +3783,11 @@ async function consumeClaudeMessages() {
         }
         const resultOriginKind = claudeMessageOriginKind(message);
         const resultPromptUuid = (message as { user_message_uuid?: unknown }).user_message_uuid;
-        const correlatedCommandId = typeof resultPromptUuid === 'string' && resultPromptUuid.trim()
+        const resultCommandId = typeof resultPromptUuid === 'string' && resultPromptUuid.trim()
           ? resultPromptUuid.trim()
           : null;
+        const correlatedCommandId = resultCommandId
+          ? claudeSteering.get(resultCommandId)?.parent ?? resultCommandId : null;
         const resultObservation = claudeResultObservation(message);
         if (
           claudeLifecycleMode === 'full'
@@ -3718,12 +3796,15 @@ async function consumeClaudeMessages() {
           && (!resultOriginKind || resultOriginKind === 'human')
           && !claudeMessageParentToolUseId(message)
         ) {
-          const firstObservation = observeLateClaudeTurnResult(
+          if (!claudeSteering.noteResult(resultCommandId!)) continue;
+          // Distinct continuation Results retain the root's attribution even
+          // when a new foreground command has already started.
+          observeLateClaudeTurnResult(
             correlatedCommandId,
             resultObservation.detail,
             resultObservation.failed,
           );
-          if (firstObservation) emitClaudeResultUsage(message, correlatedCommandId);
+          emitClaudeResultUsage(message, correlatedCommandId);
           continue;
         }
         if (
@@ -3784,9 +3865,8 @@ async function consumeClaudeMessages() {
         pendingClaudePromptReplay = null;
         claudeForegroundPromptAccepted = true;
 
-        if (!correlatedCommandId || !claudeObservedResultCommandIds.has(correlatedCommandId)) {
-          emitClaudeResultUsage(message, correlatedCommandId);
-        }
+        if (resultCommandId && !claudeSteering.noteResult(resultCommandId)) continue;
+        emitClaudeResultUsage(message, correlatedCommandId);
         claudeInputResultCorrelated = correlatedCommandId === claudeForegroundPromptUuid;
         observeClaudeTurnResult(resultObservation.detail, resultObservation.failed);
         finishClaudeLegacyTurnAfterIdle();
@@ -3973,6 +4053,26 @@ async function ensureClaudePromptQueueReady() {
   }
 }
 
+function buildClaudeUserContent(text: string, images?: PromptImage[] | null): SDKUserMessage['message']['content'] {
+  const parts = buildPromptContentParts(text, images);
+  const hasImages = parts.some((part) => part.type === 'image');
+  return hasImages
+    ? parts.map((part) => {
+        if (part.type === 'text') {
+          return { type: 'text' as const, text: part.text };
+        }
+        return {
+          type: 'image' as const,
+          source: {
+            type: 'base64' as const,
+            media_type: part.image.mediaType,
+            data: part.image.base64Data,
+          },
+        };
+      })
+    : text.trim();
+}
+
 function enqueueClaudePrompt(
   text: string,
   images?: PromptImage[] | null,
@@ -4009,23 +4109,7 @@ function enqueueClaudePrompt(
   claudeForegroundCommand = /^\/compact(?:\s|$)/iu.test(text.trim())
     ? 'compact'
     : null;
-  const parts = buildPromptContentParts(text, images);
-  const hasImages = parts.some((part) => part.type === 'image');
-  const content = hasImages
-    ? parts.map((part) => {
-        if (part.type === 'text') {
-          return { type: 'text' as const, text: part.text };
-        }
-        return {
-          type: 'image' as const,
-          source: {
-            type: 'base64' as const,
-            media_type: part.image.mediaType,
-            data: part.image.base64Data,
-          },
-        };
-      })
-    : text.trim();
+  const content = buildClaudeUserContent(text, images);
 
   resetClaudeTurnTracking();
   claudeInputQueue.push({
@@ -4051,6 +4135,48 @@ function enqueueClaudePrompt(
     query_generation: claudeQueryGeneration,
   });
   emitStatus('processing', 'Claude is processing a turn.');
+}
+
+function steerClaudePrompt(command: SteerPromptCommand) {
+  const receipt = (stage: string, detail: string) => emitEvent({
+    type: 'lifecycle', stage, detail, command_id: command.command_id,
+    query_generation: claudeQueryGeneration,
+  });
+  // Retry of the same transport identity is idempotent, even after completion.
+  if (claudeSteering.get(command.command_id)?.parent === command.expected_command_id
+    && command.expected_query_generation === claudeQueryGeneration) {
+    receipt('steer_admitted', command.expected_command_id);
+    return;
+  }
+  if (initCommand?.provider !== 'claude' || claudeLifecycleMode !== 'full'
+    || !claudeInputQueue || !currentClaudeQuery || !claudeQueuedInterruptAdapter(currentClaudeQuery)
+    || stopped || runtimeTeardownPreparationId
+    || claudeInterruptRequested || pendingSettings || claudeForegroundCommand
+    || !claudeTurnAwaitingResult || !claudeForegroundPromptAccepted
+    || claudeTurnResultObservation || claudeSteering.deferredTerminal
+    || command.expected_command_id !== claudeForegroundPromptUuid
+    || command.expected_query_generation !== claudeQueryGeneration
+    || !command.command_id || command.command_id === claudeForegroundPromptUuid
+    || command.text.trim().startsWith('/') || (!command.text.trim() && !command.images?.length)) {
+    receipt('steer_rejected', 'Steer is unavailable for this foreground command; input was not sent.');
+    return;
+  }
+  try {
+    // No await, foreground reset, settings refresh, or interrupt in this path.
+    claudeInputQueue.push({ type: 'user', uuid: command.command_id as SDKUserMessage['uuid'],
+      priority: 'next', origin: { kind: 'human' }, parent_tool_use_id: null,
+      message: { role: 'user', content: buildClaudeUserContent(command.text, command.images) } });
+    claudeSteering.add(command.command_id, command.expected_command_id);
+    // Preserve the one root operation/metrics owner in the transcript fold.
+    for (const id of command.client_message_ids ?? []) {
+      if (claudeInputOperation && !claudeInputOperation.clientMessageIds.includes(id)) {
+        claudeInputOperation.clientMessageIds.push(id);
+      }
+    }
+    receipt('steer_admitted', command.expected_command_id);
+  } catch (error) {
+    receipt('steer_rejected', String(error));
+  }
 }
 
 function emitClaudeCommandRejected(commandId: string, detail: string) {
@@ -5214,6 +5340,11 @@ async function handleCommand(command: InputCommand) {
         );
       }
     });
+    return;
+  }
+
+  if (command.type === 'steer_prompt') {
+    steerClaudePrompt(command);
     return;
   }
 

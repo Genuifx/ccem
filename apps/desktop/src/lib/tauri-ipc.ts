@@ -387,6 +387,10 @@ export interface TauriCommands {
     void
   ];
   flush_native_session_input_queue: [{ runtimeId: string }, void];
+  steer_native_session_input_queue: [
+    { runtimeId: string; expectedCommandId: string },
+    'injected' | 'fallback' | 'unchanged'
+  ];
   get_native_session_input_queue: [{ runtimeId: string }, NativeQueuedInputSnapshotItem[]];
   cancel_native_session_queued_input: [
     { runtimeId: string; clientMessageId: string },

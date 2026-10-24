@@ -45,7 +45,7 @@ async function buildHelperWithWireMock(options = {}) {
         }));
         pluginBuild.onLoad({ filter: /^claude-agent-sdk$/, namespace: 'mock-sdk' }, () => ({
           loader: 'js',
-          contents: `
+          contents: options.sdkContents ?? `
             export function tool(name, description, inputSchema, handler) {
               return { name, description, inputSchema, handler };
             }

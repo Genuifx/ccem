@@ -142,17 +142,35 @@ export function animateQueueRowEnter(row: HTMLElement, { highlight }: { highligh
 export function animateQueueRowLeave(row: HTMLElement, onComplete: () => void) {
   if (shouldReduceMotion()) {
     onComplete();
-    return;
+    return () => {};
   }
   gsap.killTweensOf(row);
-  gsap.to(row, {
+  const duration = ccemMotion.duration.quick + 0.04;
+  let finished = false;
+  let tween: gsap.core.Tween | undefined;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    window.clearTimeout(deadline);
+    tween?.kill();
+    onComplete();
+  };
+  // Native webviews can suspend animation frames while backgrounded. Queue
+  // ownership has already changed, so removing its row cannot wait on rAF.
+  const deadline = window.setTimeout(finish, duration * 1000 + 100);
+  tween = gsap.to(row, {
     height: 0,
     autoAlpha: 0,
     x: -6,
-    duration: ccemMotion.duration.quick + 0.04,
+    duration,
     ease: ccemMotion.ease.soft,
-    onComplete,
+    onComplete: finish,
   });
+  return () => {
+    finished = true;
+    window.clearTimeout(deadline);
+    tween?.kill();
+  };
 }
 
 /**

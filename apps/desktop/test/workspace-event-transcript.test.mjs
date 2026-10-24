@@ -1610,3 +1610,82 @@ test('live turn progress follows only the active operation and clears at its ter
   state = deriveTranscriptAppend(state, [event(7, operation('b', 'started')), progressEvent(8, 'b', -1)]);
   assert.equal(state.liveProgress, undefined, 'invalid counts are ignored');
 });
+
+test('mid-turn steer renders one prompt and keeps both assistant segments on the root operation', async () => {
+  const { deriveTranscriptReset, deriveTranscriptAppend, finalizeTranscriptMessages,
+    buildMessagesFromEvents } = await importWorkspaceEventTranscript();
+  const operation = (stage) => ({ type: 'input_operation', operation_id: 'root-operation',
+    client_message_ids: ['root-client', 'steer-client'], provider: 'claude', stage,
+    command_id: 'root-command', detail: '' });
+  const local = [{ id: 'steer-client', text: '请在本轮确认 STEER_ACK', afterEventSeq: 4,
+    deferUntilPersisted: true, queuedBehindTurn: true, queuedDeliveryState: 'dispatching' }];
+  const events = [
+    event(1, { type: 'user_prompt', text: '继续读取文件', image_count: 0, client_message_id: 'root-client' }),
+    event(2, operation('started')),
+    event(3, { type: 'assistant_chunk', text: '读取中。' }),
+    event(4, { type: 'tool_use_started', tool_use_id: 'root-tool', raw_name: 'Read', input_summary: 'file.txt',
+      needs_response: false, category: { category: 'file_op', raw_name: 'Read' } }),
+    event(5, { type: 'user_prompt', text: local[0].text, image_count: 0, client_message_id: 'steer-client' }),
+    event(6, { type: 'lifecycle', stage: 'steer_admitted', command_id: 'steer-command', detail: 'root-command', query_generation: 1 }),
+    event(7, { type: 'lifecycle', stage: 'steer_command_state', command_id: 'steer-command', detail: 'started', query_generation: 1 }),
+    event(8, { type: 'tool_use_completed', tool_use_id: 'root-tool', raw_name: 'Read', result_summary: 'file read', success: true }),
+    event(9, { type: 'assistant_chunk', text: '已收到引导：STEER_ACK。' }),
+    event(10, { type: 'lifecycle', stage: 'steer_command_state', command_id: 'steer-command', detail: 'completed', query_generation: 1 }),
+    event(11, { type: 'turn_progress', provider: 'claude', operation_id: 'root-operation', output_tokens: 9 }),
+    event(12, operation('completed')),
+    event(13, { type: 'turn_metrics', provider: 'claude', operation_id: 'root-operation', output_tokens: 9, elapsed_ms: 1000 }),
+    event(14, { type: 'lifecycle', stage: 'turn_completed', command_id: 'root-command', detail: '',
+      assistant_message_uuid: 'root-final-assistant', query_generation: 1 }),
+  ];
+  // The composer partition keeps queued optimistic rows out of transcript
+  // input; the persisted user_prompt is their first transcript appearance.
+  const beforeSteer = deriveTranscriptReset([], [], events.slice(0, 4));
+  assert.equal(finalizeTranscriptMessages(beforeSteer).filter((message) => message.content === local[0].text).length, 0);
+  const inFlight = deriveTranscriptAppend(beforeSteer, events.slice(4, 11));
+  assert.equal(inFlight.activeOperationId, 'root-operation');
+  assert.deepEqual(inFlight.liveProgress, { operationId: 'root-operation', outputTokens: 9 });
+  const runningMessages = finalizeTranscriptMessages(inFlight);
+  assert.equal(runningMessages.filter((message) => message.content === local[0].text).length, 1);
+  const assistants = runningMessages.filter((message) => message.msgType === 'assistant');
+  assert.equal(assistants.length, 2);
+  assert.ok(assistants.every((message) => message.turnOperationId === 'root-operation'));
+  assert.equal(assistants[0].content.find((block) => block.id === 'root-tool')._result, 'file read',
+    'tool completion still attaches across the inserted user prompt');
+
+  const completed = deriveTranscriptAppend(inFlight, events.slice(11));
+  assert.equal(completed.activeOperationId, undefined);
+  const messages = finalizeTranscriptMessages(completed);
+  const finalAssistant = messages.at(-1);
+  assert.equal(finalAssistant.uuid, 'root-final-assistant');
+  assert.deepEqual(finalAssistant.turnMetrics, { outputTokens: 9, elapsedMs: 1000 });
+  assert.equal(messages.filter((message) => message.content === local[0].text).length, 1);
+  assert.deepEqual(buildMessagesFromEvents([], local, events), messages, 'history replay agrees with streaming append');
+});
+
+test('steer_failed renders an error while the original operation and processing state continue', async () => {
+  const { deriveTranscriptReset, deriveTranscriptAppend, finalizeTranscriptMessages,
+    shouldTreatNativeSessionAsProcessing } = await importWorkspaceEventTranscript();
+  const detail = 'Claude steer steer-command was refused; the input was not replayed.';
+  const events = [
+    event(1, { type: 'input_operation', operation_id: 'root-operation', client_message_ids: ['root-client'],
+      provider: 'claude', stage: 'started', command_id: 'root-command', detail: '' }),
+    event(2, { type: 'lifecycle', stage: 'turn_started', command_id: 'root-command', detail: '' }),
+    event(3, { type: 'assistant_chunk', text: '仍在处理原任务。' }),
+    event(4, { type: 'lifecycle', stage: 'steer_failed', command_id: 'steer-command', query_generation: 1, detail }),
+    event(5, { type: 'turn_progress', provider: 'claude', operation_id: 'root-operation', output_tokens: 12 }),
+    event(6, { type: 'assistant_chunk', text: '原任务继续完成。' }),
+    event(7, { type: 'lifecycle', stage: 'steer_failed', command_id: 'steer-command', query_generation: 1, detail }),
+  ];
+  const beforeFailure = deriveTranscriptReset([], [], events.slice(0, 3));
+  const afterFailure = deriveTranscriptAppend(beforeFailure, events.slice(3));
+  const messages = finalizeTranscriptMessages(afterFailure);
+  assert.equal(messages.filter((message) => message.content === detail).length, 1, 'a repeated failure observation is displayed once');
+  assert.equal(afterFailure.activeOperationId, 'root-operation');
+  assert.deepEqual(afterFailure.liveProgress, { operationId: 'root-operation', outputTokens: 12 });
+  const continuation = messages.find((message) => message.content === '原任务继续完成。'
+    || (Array.isArray(message.content)
+      && message.content.some((block) => block.type === 'text' && block.text === '原任务继续完成。')));
+  assert.equal(continuation?.turnOperationId, 'root-operation');
+  assert.equal(shouldTreatNativeSessionAsProcessing('processing', events,
+    Date.parse('2026-05-01T00:00:08.000Z')), true, 'a failed attached input is not a root terminal');
+});
