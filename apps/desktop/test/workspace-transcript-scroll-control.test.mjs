@@ -375,3 +375,28 @@ test('compensator re-pins follow mode when the viewport shrinks under a growing 
     dom.window.close();
   }
 });
+
+test('a shrink clamp at the tail is not a user intervention, a drag away still is', async () => {
+  const mod = await importScrollControlModule();
+  // Recorded in the dev app: pinned at 7260, the optimistic prompt swap shrank
+  // content by 50px and the browser clamped scrollTop to 7210 at the bottom.
+  assert.equal(
+    mod.isTranscriptUserScrollIntervention({ programmaticTarget: 7260, currentScrollTop: 7210, distanceFromBottom: -1 }),
+    false,
+    'clamped to the bottom by a content shrink',
+  );
+  assert.equal(
+    mod.isTranscriptUserScrollIntervention({ programmaticTarget: 7260, currentScrollTop: 7210, distanceFromBottom: 0 }),
+    false,
+  );
+  assert.equal(
+    mod.isTranscriptUserScrollIntervention({ programmaticTarget: 7260, currentScrollTop: 7100, distanceFromBottom: 160 }),
+    true,
+    'a scrollbar drag away from the tail still detaches',
+  );
+  assert.equal(
+    mod.isTranscriptUserScrollIntervention({ programmaticTarget: 1000, currentScrollTop: 960 }),
+    true,
+    'callers without the distance keep the strict comparison',
+  );
+});

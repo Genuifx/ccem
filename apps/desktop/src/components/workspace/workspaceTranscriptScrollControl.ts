@@ -109,11 +109,24 @@ function cssEscape(value: string): string {
  * user intervention: the reported position is materially below (or above) the
  * exact value we assigned, which only user input (scrollbar drag, touch pan,
  * keyboard) can produce while the flag is up.
+ *
+ * Exception: content can shrink under a bottom pin (the optimistic prompt row
+ * is swapped for the persisted one), and the browser then clamps scrollTop.
+ * That moves the position too, yet the reader is still at the bottom. A user
+ * pulling away from the tail always grows `distanceFromBottom`, so a position
+ * that is still at the bottom is never an intervention.
  */
 export function isTranscriptUserScrollIntervention(params: {
   programmaticTarget: number;
   currentScrollTop: number;
+  distanceFromBottom?: number;
 }): boolean {
+  if (
+    params.distanceFromBottom != null
+    && params.distanceFromBottom <= TRANSCRIPT_USER_SCROLL_INTERVENTION_PX
+  ) {
+    return false;
+  }
   return Math.abs(params.currentScrollTop - params.programmaticTarget)
     >= TRANSCRIPT_USER_SCROLL_INTERVENTION_PX;
 }
