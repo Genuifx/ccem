@@ -8,7 +8,7 @@ import {
   PanelLeft,
   PanelRightClose,
   PanelRightOpen,
-  Plus,
+  SquarePen,
 } from '@/lib/lucide-react';
 import { useAppStore } from '@/store';
 import { useLocale } from '@/locales';
@@ -178,7 +178,7 @@ export function WorkspaceStatusStrip({
       )}
     >
       {onToggleSidebar ? (
-        <div className="-ml-1 mr-1 flex shrink-0 items-center gap-0.5">
+        <div className="mr-1 flex shrink-0 items-center gap-1">
           <button
             type="button"
             data-ccem-workspace-sidebar-toggle="true"
@@ -197,9 +197,9 @@ export function WorkspaceStatusStrip({
               aria-label={t('workspace.newSession')}
               title={t('workspace.newSession')}
               onClick={onNewSession}
-              className={cn(SIDEBAR_ICON_BUTTON_CLASS, 'text-primary hover:text-primary')}
+              className={SIDEBAR_ICON_BUTTON_CLASS}
             >
-              <Plus className="h-[15px] w-[15px]" />
+              <SquarePen className="h-[15px] w-[15px]" />
             </button>
           ) : null}
         </div>

@@ -672,13 +672,20 @@
   --ccem-titlebar-action-top: calc(
     var(--ccem-titlebar-control-center-y) - var(--ccem-titlebar-action-half-size)
   );
+  /* Reserved slot for the update indicator; 0 unless it is showing. */
+  --ccem-update-indicator-slot: 0px;
   --ccem-sidebar-toggle-leading-space: calc(
     var(--ccem-window-controls-width, 0px)
     + var(--ccem-sidebar-toggle-gap)
     + var(--ccem-sidebar-toggle-size)
-    + var(--ccem-update-indicator-gap)
-    + var(--ccem-update-indicator-size)
-    + var(--ccem-sidebar-toggle-clearance)
+    + var(--ccem-update-indicator-slot)
+    + var(--ccem-sidebar-toggle-gap)
+  );
+}
+
+:root[data-update-indicator-visible='true'] {
+  --ccem-update-indicator-slot: calc(
+    var(--ccem-update-indicator-gap) + var(--ccem-update-indicator-size)
   );
 }
 
@@ -771,9 +778,14 @@
 }
 
 /* The navigation menu button sits beside the window controls on every page. */
-[data-sidebar-mode='floating'] .app-titlebar-row,
+/* The strip lives inside the workspace column's 0.75rem side margin. */
 [data-sidebar-mode='floating'] .workspace-status-strip {
-  padding-left: var(--ccem-sidebar-toggle-leading-space);
+  padding-left: calc(var(--ccem-sidebar-toggle-leading-space) - 0.75rem);
+}
+
+/* Page titles are text, not buttons: keep a little more air after the menu. */
+[data-sidebar-mode='floating'] .app-titlebar-row {
+  padding-left: calc(var(--ccem-sidebar-toggle-leading-space) + var(--ccem-sidebar-toggle-clearance));
 }
 
 .sidebar-top-drag-region {
