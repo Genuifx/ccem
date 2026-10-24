@@ -582,6 +582,7 @@
     "effortMax": "Max",
     "effortLabel": "Effort",
     "environmentLabel": "Environment",
+    "environmentGroupCount": "{count} envs",
     "codexModelSelectorDisabledBadge": "Not wired",
     "codexModelSelectorDisabledHint": "Codex SDK does not read this model selection yet. It uses ~/.codex/config.toml or the active Codex profile.",
     "historyRouterEnvLockedBadge": "History snapshot",

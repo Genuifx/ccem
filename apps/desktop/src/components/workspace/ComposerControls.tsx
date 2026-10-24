@@ -1,6 +1,7 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
 import {
   Brain,
+  Check,
   ChevronDown,
   Gauge,
   Lock,
@@ -326,6 +327,19 @@ export function ComposerControls({
   );
   const [permissionSelectOpen, setPermissionSelectOpen] = useState(false);
   const [envEffortOpen, setEnvEffortOpen] = useState(false);
+  const envEffortContentRef = useRef<HTMLDivElement>(null);
+
+  // Long environment lists: land the current group in view on open instead
+  // of always starting from the top.
+  useEffect(() => {
+    if (!envEffortOpen) return;
+    const frame = requestAnimationFrame(() => {
+      envEffortContentRef.current
+        ?.querySelector('[data-current-env-group]')
+        ?.scrollIntoView({ block: 'nearest' });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [envEffortOpen]);
 
   useEffect(() => {
     if (!permissionSelectOpen) {
@@ -424,12 +438,16 @@ export function ComposerControls({
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent
+          ref={envEffortContentRef}
           align="start"
           side="top"
           sideOffset={6}
-          className="w-[340px] p-0"
+          collisionPadding={12}
+          // Never taller than the room Radix measured on the open side, so the
+          // menu can't spill past the window edge; the env list absorbs it.
+          className="flex max-h-[min(480px,var(--radix-dropdown-menu-content-available-height))] w-[340px] flex-col p-0"
         >
-          <div className="px-3 pt-2.5 pb-1">
+          <div className="shrink-0 px-3 pt-2.5 pb-1">
             <div className="px-0.5 leading-4 text-2xs uppercase tracking-wider font-medium text-muted-foreground/70">
               {t('workspace.effortLabel')}
             </div>
@@ -441,8 +459,8 @@ export function ComposerControls({
               ariaLabel={t('workspace.effortLabel')}
             />
           </div>
-          <DropdownMenuSeparator className="my-1" />
-          <div className="flex items-center justify-between gap-3 px-3 py-1.5 text-2xs uppercase tracking-wider font-medium text-muted-foreground/70">
+          <DropdownMenuSeparator className="my-1 shrink-0" />
+          <div className="flex shrink-0 items-center justify-between gap-3 px-3 py-1.5 text-2xs uppercase tracking-wider font-medium text-muted-foreground/70">
             <span>{t('workspace.environmentLabel')}</span>
             {isEnvironmentLocked && (
               <span className="inline-flex items-center gap-1 rounded-full border border-border/60 bg-muted/35 px-1.5 py-0.5 normal-case tracking-normal text-muted-foreground">
@@ -452,49 +470,97 @@ export function ComposerControls({
             )}
           </div>
           {isEnvironmentLocked && (
-            <p className="mx-2.5 mb-1.5 rounded-lg border border-border/60 bg-muted/25 px-2.5 py-2 text-[11px] leading-4 text-muted-foreground">
+            <p className="mx-2.5 mb-1.5 shrink-0 rounded-lg border border-border/60 bg-muted/25 px-2.5 py-2 text-[11px] leading-4 text-muted-foreground">
               {environmentLockedHint}
             </p>
           )}
           <ScrollArea
             type="always"
             data-ccem-composer-environment-scroll
-            className="ccem-overlay-scroll min-h-0 max-h-[300px]"
-            viewportClassName="pr-1"
+            // Flex chain (content → root → viewport) lets the list shrink to
+            // whatever height the effort header leaves, then scroll.
+            className="ccem-overlay-scroll flex min-h-0 max-h-[320px] flex-1 flex-col"
+            viewportClassName="min-h-0 flex-1 pr-1"
           >
-            <div className="pb-1.5 pr-1">
+            <div className="px-1.5 pb-1.5">
               {groupedEnvironments.map((group) => {
                 const isCurrentGroup = currentModel === group.model;
                 const groupIconEnv = group.envs.find((e) => e.name === envName) || group.envs[0];
+                const rowClassName = cn(
+                  'h-8 cursor-pointer gap-2.5 rounded-lg px-2 text-[12.5px] leading-none',
+                  'text-foreground/85 transition-colors',
+                  'focus:bg-white/[0.05] data-[highlighted]:bg-white/[0.05]',
+                  isCurrentGroup && 'bg-primary/[0.07] focus:bg-primary/[0.1] data-[highlighted]:bg-primary/[0.1]',
+                  isEnvironmentLocked && 'opacity-70',
+                );
+                const rowLead = (
+                  <>
+                    <span className="flex h-5 w-5 shrink-0 items-center justify-center">
+                      <EnvironmentLobeIcon
+                        hint={resolveEnvironmentIconHint(groupIconEnv)}
+                        size={16}
+                      />
+                    </span>
+                    <span
+                      className={cn(
+                        'min-w-0 flex-1 truncate',
+                        isCurrentGroup && 'font-medium text-primary',
+                      )}
+                    >
+                      {group.model}
+                    </span>
+                  </>
+                );
+                // One environment behind this model: pick it directly, and show
+                // its name so the list maps back to the trigger's env label.
+                if (group.envs.length === 1) {
+                  const environment = group.envs[0];
+                  return (
+                    <DropdownMenuItem
+                      key={group.model}
+                      data-current-env-group={isCurrentGroup || undefined}
+                      disabled={isEnvironmentLocked}
+                      onSelect={() => onEnvChange(environment.name)}
+                      className={rowClassName}
+                    >
+                      {rowLead}
+                      <span
+                        className={cn(
+                          'max-w-[120px] shrink-0 truncate text-[11px]',
+                          isCurrentGroup ? 'text-primary/70' : 'text-muted-foreground/60',
+                        )}
+                      >
+                        {environment.name}
+                      </span>
+                      {isCurrentGroup ? (
+                        <Check className="h-3.5 w-3.5 shrink-0 text-primary" />
+                      ) : (
+                        <span className="w-3.5 shrink-0" />
+                      )}
+                    </DropdownMenuItem>
+                  );
+                }
                 return (
                   <DropdownMenuSub key={group.model}>
                     <DropdownMenuSubTrigger
-                      className={cn(
-                        'h-9 cursor-pointer gap-2.5 rounded-lg px-2.5 text-[12.5px] leading-none',
-                        'text-foreground/85 transition-colors',
-                        'focus:bg-white/[0.05] data-[highlighted]:bg-white/[0.05]',
-                        'data-[state=open]:bg-white/[0.08]',
-                        isCurrentGroup && 'bg-primary/[0.07] data-[highlighted]:bg-primary/[0.1]',
-                        isEnvironmentLocked && 'opacity-70',
-                      )}
+                      data-current-env-group={isCurrentGroup || undefined}
+                      className={cn(rowClassName, 'data-[state=open]:bg-white/[0.08] [&>svg:last-child]:h-3.5 [&>svg:last-child]:w-3.5 [&>svg:last-child]:opacity-50')}
                     >
-                      <span className="flex h-5 w-5 shrink-0 items-center justify-center">
-                        <EnvironmentLobeIcon
-                          hint={resolveEnvironmentIconHint(groupIconEnv)}
-                          size={16}
-                        />
-                      </span>
+                      {rowLead}
                       <span
                         className={cn(
-                          'min-w-0 max-w-[170px] truncate',
-                          isCurrentGroup && 'font-medium text-primary',
+                          'max-w-[120px] shrink-0 truncate text-[11px]',
+                          isCurrentGroup ? 'text-primary/70' : 'text-muted-foreground/60',
                         )}
                       >
-                        {group.model}
+                        {isCurrentGroup
+                          ? envName
+                          : t('workspace.environmentGroupCount', { count: group.envs.length })}
                       </span>
                     </DropdownMenuSubTrigger>
                     <DropdownMenuSubContent
                       sideOffset={8}
+                      collisionPadding={12}
                       className="min-w-[200px] max-w-[260px] rounded-xl frosted-panel glass-noise shadow-dialog p-1"
                     >
                       {group.envs.map((environment) => {
@@ -541,7 +607,7 @@ export function ComposerControls({
                               )}
                             </span>
                             {isActiveEnv && (
-                              <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-primary" />
+                              <Check className="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
                             )}
                           </DropdownMenuItem>
                         );
