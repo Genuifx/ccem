@@ -5,8 +5,10 @@ import {
   ClipboardCheck,
   Search,
   Command,
+  PanelLeft,
   PanelRightClose,
   PanelRightOpen,
+  Plus,
 } from '@/lib/lucide-react';
 import { useAppStore } from '@/store';
 import { useLocale } from '@/locales';
@@ -64,7 +66,15 @@ interface WorkspaceStatusStripProps {
   activeRuntimeId?: string | null;
   /** Direct-session chip target: default rules & profiles live on Environments. */
   onNavigateEnvironments?: () => void;
+  /** Conversation list visibility; the toggle lives here so collapsing hides the list entirely. */
+  sidebarCollapsed?: boolean;
+  onToggleSidebar?: () => void;
+  /** Shown only while the list is collapsed, so starting a session never needs the list. */
+  onNewSession?: () => void;
 }
+
+const SIDEBAR_ICON_BUTTON_CLASS =
+  'inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground/75 transition-colors hover:bg-foreground/[0.06] hover:text-foreground active:scale-[0.96] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring';
 
 export function WorkspaceStatusStrip({
   onNavigate,
@@ -74,6 +84,9 @@ export function WorkspaceStatusStrip({
   envContext,
   activeRuntimeId,
   onNavigateEnvironments,
+  sidebarCollapsed = false,
+  onToggleSidebar,
+  onNewSession,
 }: WorkspaceStatusStripProps) {
   const { t } = useLocale();
   const { currentEnv, environments, enabledEnvironments } = useAppStore(
@@ -164,6 +177,34 @@ export function WorkspaceStatusStrip({
         browserOpen ? 'h-10 gap-1 pr-1' : 'h-11 gap-1.5 sm:h-12 sm:gap-2.5',
       )}
     >
+      {onToggleSidebar ? (
+        <div className="-ml-1 mr-1 flex shrink-0 items-center gap-0.5">
+          <button
+            type="button"
+            data-ccem-workspace-sidebar-toggle="true"
+            aria-label={t(sidebarCollapsed ? 'workspace.expandSidebar' : 'workspace.collapseSidebar')}
+            aria-pressed={!sidebarCollapsed}
+            title={t(sidebarCollapsed ? 'workspace.expandSidebar' : 'workspace.collapseSidebar')}
+            onClick={onToggleSidebar}
+            className={SIDEBAR_ICON_BUTTON_CLASS}
+          >
+            <PanelLeft className="h-[15px] w-[15px]" />
+          </button>
+          {sidebarCollapsed && onNewSession ? (
+            <button
+              type="button"
+              data-ccem-workspace-new-session="true"
+              aria-label={t('workspace.newSession')}
+              title={t('workspace.newSession')}
+              onClick={onNewSession}
+              className={cn(SIDEBAR_ICON_BUTTON_CLASS, 'text-primary hover:text-primary')}
+            >
+              <Plus className="h-[15px] w-[15px]" />
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+
       <WorkspaceStatusCapsule onNavigate={onNavigate} compact={browserOpen} />
 
       {/* Environment quick-switch capsule — icon language matches composer env picker */}

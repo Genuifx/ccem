@@ -3940,6 +3940,9 @@ export function Workspace({
                 : null
             }
             onNavigateEnvironments={() => onNavigate('environments')}
+            sidebarCollapsed={workspaceSidebarCollapsed}
+            onToggleSidebar={() => setWorkspaceSidebarCollapsed((prev) => !prev)}
+            onNewSession={handleProjectTreeNewSession}
           />
 
           <div
@@ -3965,7 +3968,6 @@ export function Workspace({
               onNewSession={handleProjectTreeNewSession}
               width={workspaceSidebarWidth}
               collapsed={workspaceSidebarCollapsed}
-              onToggleCollapsed={() => setWorkspaceSidebarCollapsed((prev) => !prev)}
               onResizeStart={handleWorkspaceSidebarResizeStart}
             />
 
