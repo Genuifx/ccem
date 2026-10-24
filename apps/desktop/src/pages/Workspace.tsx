@@ -142,8 +142,15 @@ import {
   shouldReloadSelectedHistorySession,
   toLoadedHistorySessionVersion,
   toLiveHistorySessionItem,
+  liveSessionRuntimeSidebarKey,
+  liveSessionSidebarKey,
   type LoadedHistorySessionVersion,
 } from '@/components/workspace/workspaceSidebarSessions';
+import {
+  childKeysByProposalId,
+  type SessionParentLink,
+} from '@/components/workspace/sessionLineage';
+import type { NextStepSuggestion } from '@/components/workspace/workspaceNextSteps';
 import { launchWorkspaceTerminalSession } from '@/components/workspace/workspaceTerminalLaunch';
 import {
   formatInteractiveSessionLaunchError,
@@ -459,6 +466,8 @@ export function Workspace({
     setSessionAnnotation,
     preflightCodexModelMigration,
     createNativeSession,
+    listSessionParents,
+    recordSessionParent,
     getNativeSessionEventPage,
     getNativeSessionEvents,
     listNativeSessions,
@@ -3262,6 +3271,89 @@ export function Workspace({
   } | null>(null);
   const [isForkingTurn, setIsForkingTurn] = useState(false);
 
+  const [sessionParentLinks, setSessionParentLinks] = useState<SessionParentLink[]>([]);
+  const refreshSessionParentLinks = useCallback(async () => {
+    try {
+      setSessionParentLinks(await listSessionParents());
+    } catch (error) {
+      console.warn('Failed to load session parent links:', error);
+    }
+  }, [listSessionParents]);
+  useEffect(() => {
+    void refreshSessionParentLinks();
+  }, [refreshSessionParentLinks]);
+  const parentKeyBySessionKey = useMemo(
+    () => new Map(sessionParentLinks.map((link) => [link.childKey, link.parentKey])),
+    [sessionParentLinks],
+  );
+  const startedNextStepChildKeys = useMemo(
+    () => childKeysByProposalId(sessionParentLinks),
+    [sessionParentLinks],
+  );
+  // A child is first linked by runtime key; once its provider id appears, link
+  // that key too so nesting and Open survive the runtime ending.
+  useEffect(() => {
+    const missing: SessionParentLink[] = [];
+    for (const entry of liveSessionEntries) {
+      const runtimeKey = liveSessionRuntimeSidebarKey(entry);
+      const providerKey = liveSessionSidebarKey(entry);
+      const link = sessionParentLinks.find((candidate) => candidate.childKey === runtimeKey);
+      if (link && providerKey !== runtimeKey && !parentKeyBySessionKey.has(providerKey)) {
+        missing.push({ childKey: providerKey, parentKey: link.parentKey, proposalId: link.proposalId });
+      }
+    }
+    if (missing.length === 0) return;
+    void Promise.all(missing.map((link) => recordSessionParent(link.childKey, link.parentKey, link.proposalId)))
+      .then(refreshSessionParentLinks)
+      .catch((error) => console.warn('Failed to bind session parent provider key:', error));
+  }, [liveSessionEntries, parentKeyBySessionKey, recordSessionParent, refreshSessionParentLinks, sessionParentLinks]);
+
+  const handleStartNextStepSession = useCallback(async (
+    parent: NativeSessionSummary,
+    suggestionId: string,
+    suggestion: NextStepSuggestion,
+  ) => {
+    try {
+      const summary = await createNativeSession({
+        provider: parent.provider,
+        envName: parent.env_name,
+        permMode: parent.perm_mode,
+        runtimePermMode: parent.runtime_perm_mode ?? null,
+        workingDir: parent.project_dir,
+        initialPrompt: suggestion.prompt,
+        codexIsolated: parent.provider === 'codex' ? parent.codex_isolated ?? false : null,
+        effort: parent.effort ?? null,
+      });
+      upsertLiveSessionEntry(summary, { initialPrompt: suggestion.prompt });
+      await recordSessionParent(
+        liveSessionRuntimeSidebarKey({ session: summary }),
+        liveSessionSidebarKey({ session: parent }),
+        suggestionId,
+      );
+      await refreshSessionParentLinks();
+      scheduleWorkspaceRefresh(1200);
+    } catch (error) {
+      console.error('Failed to start next-step session:', error);
+      toast.error(t('workspace.nativeCreateFailed'));
+    }
+  }, [createNativeSession, recordSessionParent, refreshSessionParentLinks, scheduleWorkspaceRefresh, t, upsertLiveSessionEntry]);
+
+  const handleOpenSessionKey = useCallback((sessionKeys: string[]) => {
+    const keys = new Set(sessionKeys);
+    const liveEntry = liveSessionEntries.find((entry) =>
+      keys.has(liveSessionRuntimeSidebarKey(entry)) || keys.has(liveSessionSidebarKey(entry)));
+    if (liveEntry) {
+      selectNativeSessionSummary(liveEntry.session);
+      return;
+    }
+    const target = sidebarSessions.find((session) => keys.has(toSessionKey(session)));
+    if (target) {
+      void handleSelect(target);
+    } else {
+      toast.error(t('workspace.nextStepOpenMissing'));
+    }
+  }, [handleSelect, liveSessionEntries, selectNativeSessionSummary, sidebarSessions, t]);
+
   const openForkTurn = useCallback((
     request: WorkspaceForkTurnRequest,
     target: WorkspaceForkTarget,
@@ -3953,6 +4045,7 @@ export function Workspace({
               decorationsBySessionKey={decorationsBySessionKey}
               canonicalKeyBySessionKey={liveSessionTreeState.canonicalKeyBySessionKey}
               activeSessionKeys={liveSessionTreeState.activeSessionKeys}
+              parentKeyBySessionKey={parentKeyBySessionKey}
               isLoading={isLoadingSessions}
               isRefreshing={isRefreshing}
               selectedKey={selectedKey}
@@ -4037,6 +4130,9 @@ export function Workspace({
                           opencodeInstalled={opencodeInstalled}
                           onLaunchNewSession={handleNewSession}
                           onForkTurnRequest={openForkTurn}
+                          startedNextStepChildKeys={startedNextStepChildKeys}
+                          onStartNextStepSession={handleStartNextStepSession}
+                          onOpenSessionKey={handleOpenSessionKey}
                           onNavigateEnvironments={handleNavigateEnvironments}
                           onStartNew={handleLiveStartNew}
                           reviewWorkingDir={

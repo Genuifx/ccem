@@ -1,4 +1,5 @@
 import { memo, useMemo, useState, useCallback, useRef, useEffect, useLayoutEffect } from 'react';
+import { nestSessionsByParent } from './sessionLineage';
 import type { DragEvent, PointerEvent as ReactPointerEvent } from 'react';
 import { Check, Clock, Copy, FolderOpen, FolderTree, Link, PanelLeft, Pin, RefreshCw, RotateCcw, X, Plus, ShieldAlert } from '@/lib/lucide-react';
 import { cn } from '@/lib/utils';
@@ -66,6 +67,8 @@ interface ProjectTreeProps {
   decorationsBySessionKey?: Record<string, WorkspaceSessionDecoration>;
   canonicalKeyBySessionKey?: Readonly<Record<string, string | undefined>>;
   activeSessionKeys?: ReadonlySet<string>;
+  /** child session key -> parent session key (model-proposed child sessions). */
+  parentKeyBySessionKey?: ReadonlyMap<string, string>;
   isLoading: boolean;
   isRefreshing?: boolean;
   selectedKey: string | null;
@@ -505,6 +508,8 @@ function SessionAnnotationPopover({
   );
 }
 
+const EMPTY_PARENT_KEY_MAP: ReadonlyMap<string, string> = new Map();
+
 export const ProjectTree = memo(function ProjectTree({
   sessions,
   precomputedProjectNodes,
@@ -512,6 +517,7 @@ export const ProjectTree = memo(function ProjectTree({
   decorationsBySessionKey = {},
   canonicalKeyBySessionKey = EMPTY_CANONICAL_KEY_MAP,
   activeSessionKeys = EMPTY_SESSION_KEY_SET,
+  parentKeyBySessionKey = EMPTY_PARENT_KEY_MAP,
   isLoading,
   isRefreshing = false,
   selectedKey,
@@ -1141,14 +1147,45 @@ export const ProjectTree = memo(function ProjectTree({
     (project: string) => projectVisibleCount[project] ?? PROJECT_TREE_PAGE_SIZE,
     [projectVisibleCount]
   );
+  // Rows rendered indented under their parent; written by getVisibleSessions,
+  // read by renderSessionRow in the same render pass.
+  const nestedSessionRowsRef = useRef(new WeakSet<HistorySessionItem>());
   const getVisibleSessions = useCallback(
-    (node: ProjectNode) => selectVisibleProjectSessions(
-      node.sessions,
-      getVisibleCount(node.project),
-      prioritySessionKeys,
-      canonicalKeyBySessionKey,
-    ),
-    [canonicalKeyBySessionKey, getVisibleCount, prioritySessionKeys]
+    (node: ProjectNode) => {
+      const visible = selectVisibleProjectSessions(
+        node.sessions,
+        getVisibleCount(node.project),
+        prioritySessionKeys,
+        canonicalKeyBySessionKey,
+      );
+      if (parentKeyBySessionKey.size === 0) return visible;
+      const canonical = (key: string) => canonicalKeyBySessionKey[key] ?? key;
+      const parentOf = (session: HistorySessionItem) => {
+        const rawKey = toKey(session);
+        const parentKey = parentKeyBySessionKey.get(rawKey)
+          ?? parentKeyBySessionKey.get(canonical(rawKey));
+        return parentKey ? canonical(parentKey) : null;
+      };
+      // Children follow a visible parent even when they fall past the page.
+      const visibleSet = new Set(visible);
+      const visibleKeys = new Set(visible.map((session) => canonical(toKey(session))));
+      const pulled = node.sessions.filter((session) => {
+        if (visibleSet.has(session)) return false;
+        const parentKey = parentOf(session);
+        return parentKey != null && visibleKeys.has(parentKey);
+      });
+      const rows = nestSessionsByParent(
+        pulled.length > 0 ? [...visible, ...pulled] : visible,
+        (session) => canonical(toKey(session)),
+        parentOf,
+      );
+      for (const row of rows) {
+        if (row.depth === 1) nestedSessionRowsRef.current.add(row.session);
+        else nestedSessionRowsRef.current.delete(row.session);
+      }
+      return rows.map((row) => row.session);
+    },
+    [canonicalKeyBySessionKey, getVisibleCount, parentKeyBySessionKey, prioritySessionKeys]
   );
   const loadMore = useCallback(
     (project: string) =>
@@ -1383,8 +1420,10 @@ export const ProjectTree = memo(function ProjectTree({
     const decoration = decorationsBySessionKey[rawKey];
     const approvalRequired = decoration?.attentionKind === 'permission_required';
     const rowChrome = options.pinnedSection || options.recentSection ? 'mx-0' : 'mx-1';
-    const rowPadding = options.pinnedSection || options.recentSection ? 'pl-2 pr-2' : 'pl-9 pr-2';
-    const editPadding = options.pinnedSection || options.recentSection ? 'pl-2 pr-2' : 'pl-9 pr-3';
+    const flatSection = options.pinnedSection || options.recentSection;
+    const isNestedRow = !flatSection && nestedSessionRowsRef.current.has(session);
+    const rowPadding = flatSection ? 'pl-2 pr-2' : isNestedRow ? 'pl-[30px] pr-2' : 'pl-[10px] pr-2';
+    const editPadding = flatSection ? 'pl-2 pr-2' : isNestedRow ? 'pl-[30px] pr-3' : 'pl-[10px] pr-3';
 
     if (isEditing) {
       return (
@@ -1517,6 +1556,13 @@ export const ProjectTree = memo(function ProjectTree({
         )}
         {options.pinnedSection && dropTargetKey === key && dropPosition === 'after' && (
           <div className="pointer-events-none absolute inset-x-1 bottom-0 z-20 h-0.5 rounded-full bg-primary shadow-[0_0_4px_hsl(var(--primary)/0.5)]" />
+        )}
+        {isNestedRow && (
+          <span
+            aria-hidden="true"
+            data-child-session-connector="true"
+            className="pointer-events-none absolute -top-1.5 left-[20px] h-[calc(50%+6px)] w-2 rounded-bl-[5px] border-b border-l border-muted-foreground/35"
+          />
         )}
         <div className="flex min-w-0 items-center gap-1.5">
           {options.recentSection ? (

@@ -9,6 +9,7 @@ import process from 'node:process';
 import { buildIsolatedAgentEnv, getCcemAgentEnv, getCcemAgentHome } from '../../core/src/agent-home';
 import { buildClaudeQueryEnv } from './claudeEnv';
 import { generateWorkspaceTitle } from './workspaceTitleQuery';
+import { generateNextSteps } from './nextStepsQuery';
 import { resolveClaudeInterruptTimeoutMs } from './claudeInterruptTimeout';
 import { ClaudePluginRefresh } from './claudePluginRefresh';
 import { applyClaudePermissionModeToQuery } from './claudePermissionControl';
@@ -148,6 +149,15 @@ type RewindFilesCommand = {
   checkpoint_id: string;
 };
 
+type NextStepsQueryCommand = {
+  type: 'next_steps_query';
+  context: string;
+  working_dir: string;
+  env_vars?: Record<string, string>;
+  claude_path?: string | null;
+  model?: string | null;
+};
+
 type TitleQueryCommand = {
   type: 'title_query';
   title_input: string;
@@ -212,6 +222,7 @@ type InputCommand =
   | UpdateSettingsCommand
   | RewindFilesCommand
   | TitleQueryCommand
+  | NextStepsQueryCommand
   | UsageQueryCommand
   | InterruptTurnCommand
   | PrepareStopCommand
@@ -1416,6 +1427,10 @@ function resolveClaudeRuntimeModel(envVars?: Record<string, string>) {
 
 async function runWorkspaceTitleQuery(command: TitleQueryCommand) {
   emit({ type: 'title_result', title: await generateWorkspaceTitle(command) });
+}
+
+async function runNextStepsQuery(command: NextStepsQueryCommand) {
+  emit({ type: 'next_steps_result', suggestions: await generateNextSteps(command) });
 }
 
 function extractClaudeAssistantThinking(message: unknown): string[] {
@@ -4867,6 +4882,11 @@ async function prepareNativeRuntimeStop(
 async function handleCommand(command: InputCommand) {
   if (command.type === 'title_query') {
     await runWorkspaceTitleQuery(command);
+    return;
+  }
+
+  if (command.type === 'next_steps_query') {
+    await runNextStepsQuery(command);
     return;
   }
 

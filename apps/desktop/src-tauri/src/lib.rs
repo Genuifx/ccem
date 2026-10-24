@@ -53,6 +53,8 @@ mod runtime;
 mod secure_fs;
 mod session;
 mod session_annotations;
+mod session_lineage;
+mod session_next_steps;
 mod session_provenance;
 mod session_references;
 mod session_titles;
@@ -6209,6 +6211,9 @@ pub fn run_desktop_app() -> i32 {
             session_titles::generate_workspace_session_title,
             session_annotations::set_session_annotation,
             session_annotations::clear_session_annotation,
+            session_lineage::record_session_parent,
+            session_lineage::list_session_parents,
+            session_next_steps::suggest_workspace_next_steps,
             slash_commands::list_workspace_commands,
             skills::search_skills_stream,
             skills::list_installed_skills,

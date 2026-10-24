@@ -2,7 +2,6 @@ import { memo } from 'react';
 import type { ReactNode } from 'react';
 import {
   Bot,
-  ChevronRight,
   ChevronsUp,
   FlaskConical,
   FolderClosed,
@@ -239,12 +238,6 @@ export const ProjectTreeContent = memo(function ProjectTreeContent({
           title={createPath}
           className="flex min-w-0 flex-1 items-center gap-2 text-left"
         >
-          <ChevronRight
-            className={cn(
-              'h-4 w-4 shrink-0 text-muted-foreground transition-transform',
-              isExpanded && 'rotate-90'
-            )}
-          />
           {GroupIcon ? (
             <GroupIcon className="h-4 w-4 shrink-0 text-muted-foreground" />
           ) : isExpanded ? (
@@ -327,7 +320,7 @@ export const ProjectTreeContent = memo(function ProjectTreeContent({
           <div className="pb-1">
             {visible.map((session) => renderSessionRow(session))}
             {(hasMore || canCollapse) && (
-              <div className="flex items-center gap-3 pl-9 py-1.5 text-[11px]">
+              <div className="flex items-center gap-3 pl-3 py-1.5 text-[11px]">
                 {canCollapse && (
                   <button
                     type="button"

@@ -30,6 +30,48 @@ pub async fn generate_workspace_session_title(
     Ok(generated_title.and_then(|title| sanitize_generated_title(&title)))
 }
 
+/// Resolved Claude env + model for a one-shot helper query (titles, next steps).
+pub(crate) struct HelperQueryEnv {
+    pub env_vars: HashMap<String, String>,
+    pub claude_path: Option<String>,
+    pub model: String,
+    pub working_dir: String,
+}
+
+pub(crate) fn resolve_helper_query_env(
+    env_name: Option<&str>,
+    working_dir: Option<&str>,
+) -> Result<HelperQueryEnv, String> {
+    let cfg = config::read_config()?;
+    let env_name = env_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(cfg.current.as_deref())
+        .ok_or_else(|| "No current environment configured".to_string())?;
+    // resolve_claude_env owns the auth boundary, including official OAuth.
+    let resolved = config::resolve_claude_env(env_name)?;
+    let mut env_vars = resolved.env_vars;
+    force_haiku_title_model(&mut env_vars);
+    env_vars.insert("PATH".to_string(), terminal::get_user_path());
+    let model = env_vars
+        .get("ANTHROPIC_MODEL")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_HAIKU_MODEL)
+        .to_string();
+    Ok(HelperQueryEnv {
+        env_vars,
+        claude_path: terminal::resolve_claude_path(),
+        model,
+        working_dir: working_dir
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(title_query_working_dir),
+    })
+}
+
 #[derive(Debug)]
 struct TitleQueryRequest {
     title_input: String,
@@ -61,36 +103,13 @@ fn build_title_query_request(
         return Ok(None);
     }
 
-    let cfg = config::read_config()?;
-    let env_name = env_name
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .or(cfg.current.as_deref())
-        .ok_or_else(|| "No current environment configured for session titles".to_string())?;
-    // resolve_claude_env owns the auth boundary, including official OAuth.
-    let resolved = config::resolve_claude_env(env_name)?;
-    let mut env_vars = resolved.env_vars;
-    force_haiku_title_model(&mut env_vars);
-    env_vars.insert("PATH".to_string(), terminal::get_user_path());
-
-    let model = env_vars
-        .get("ANTHROPIC_MODEL")
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_HAIKU_MODEL)
-        .to_string();
-
+    let resolved = resolve_helper_query_env(env_name, working_dir)?;
     Ok(Some(TitleQueryRequest {
         title_input: input,
-        working_dir: working_dir
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(title_query_working_dir),
-        env_vars,
-        claude_path: terminal::resolve_claude_path(),
-        model,
+        working_dir: resolved.working_dir,
+        env_vars: resolved.env_vars,
+        claude_path: resolved.claude_path,
+        model: resolved.model,
     }))
 }
 
@@ -110,6 +129,17 @@ async fn run_title_query_helper(
     };
     let line = serde_json::to_string(&helper_command)
         .map_err(|error| format!("Failed to encode title query command: {}", error))?;
+    let result = run_helper_query(app, line, &request.working_dir, "title_result").await?;
+    Ok(result.and_then(|value| value.get("title").and_then(Value::as_str).map(str::to_string)))
+}
+
+/// Runs one helper query in an owned helper child and returns its `result_type` line.
+pub(crate) async fn run_helper_query(
+    app: AppHandle,
+    line: String,
+    working_dir: &str,
+    result_type: &'static str,
+) -> Result<Option<Value>, String> {
     let helper_path = native_helper_script_path(&app)?;
     let mut profile_env = HashMap::new();
     crate::agent_profile::apply_env("claude", &mut profile_env);
@@ -119,25 +149,27 @@ async fn run_title_query_helper(
         .map_err(|error| format!("Failed to resolve Node sidecar: {}", error))?
         .arg(helper_path.to_string_lossy().to_string())
         .envs(profile_env)
-        .current_dir(&request.working_dir);
+        .current_dir(working_dir);
 
     let (rx, mut child) = spawn_native_helper_process(command.into())?;
 
     if let Err(error) = child.write(format!("{}\n", line).as_bytes()) {
         let _ = child.kill();
-        return Err(format!("Failed to write title query command: {}", error));
+        return Err(format!("Failed to write helper query command: {}", error));
     }
 
     // The helper stays alive to read commands even after SDK errors. Always
     // stop this owned child on result, error, malformed output or hard timeout.
-    let result = tokio::time::timeout(TITLE_HELPER_TIMEOUT, receive_title_helper_output(rx)).await;
+    let result =
+        tokio::time::timeout(TITLE_HELPER_TIMEOUT, receive_helper_output(rx, result_type)).await;
     let _ = child.kill();
-    result.map_err(|_| "Native title helper timed out after 45s".to_string())?
+    result.map_err(|_| "Native helper query timed out after 45s".to_string())?
 }
 
-async fn receive_title_helper_output(
+async fn receive_helper_output(
     mut rx: tauri::async_runtime::Receiver<CommandEvent>,
-) -> Result<Option<String>, String> {
+    result_type: &str,
+) -> Result<Option<Value>, String> {
     let mut stdout_buffer = Vec::new();
     let mut stderr_buffer = Vec::new();
     let mut stderr_lines = Vec::new();
@@ -146,8 +178,8 @@ async fn receive_title_helper_output(
         match event {
             CommandEvent::Stdout(chunk) => {
                 for text in drain_output_lines(&mut stdout_buffer, &chunk) {
-                    if let Some(title) = process_title_helper_line(&text, &mut stderr_lines)? {
-                        return Ok(title);
+                    if let Some(value) = process_helper_line(&text, result_type, &mut stderr_lines)? {
+                        return Ok(Some(value));
                     }
                 }
             }
@@ -155,12 +187,12 @@ async fn receive_title_helper_output(
                 stderr_lines.extend(drain_output_lines(&mut stderr_buffer, &chunk));
             }
             CommandEvent::Error(error) => {
-                return Err(format!("Native title helper error: {}", error));
+                return Err(format!("Native helper query error: {}", error));
             }
             CommandEvent::Terminated(payload) => {
                 if let Some(text) = take_remaining_output_line(&mut stdout_buffer) {
-                    if let Some(title) = process_title_helper_line(&text, &mut stderr_lines)? {
-                        return Ok(title);
+                    if let Some(value) = process_helper_line(&text, result_type, &mut stderr_lines)? {
+                        return Ok(Some(value));
                     }
                 }
                 if let Some(text) = take_remaining_output_line(&mut stderr_buffer) {
@@ -173,39 +205,35 @@ async fn receive_title_helper_output(
                         format!(": {}", stderr_lines.join("\n"))
                     };
                     return Err(format!(
-                        "Native title helper exited with code {:?}{}",
+                        "Native helper query exited with code {:?}{}",
                         payload.code, suffix
                     ));
                 }
-                return Err("Native title helper exited without a title result".to_string());
+                return Err("Native helper query exited without a result".to_string());
             }
             _ => {}
         }
     }
 
-    Err("Native title helper closed without a title result".to_string())
+    Err("Native helper query closed without a result".to_string())
 }
 
-fn process_title_helper_line(
+fn process_helper_line(
     line: &str,
+    result_type: &str,
     stderr_lines: &mut Vec<String>,
-) -> Result<Option<Option<String>>, String> {
+) -> Result<Option<Value>, String> {
     let value: Value = serde_json::from_str(line)
-        .map_err(|error| format!("Failed to parse title helper output: {}", error))?;
+        .map_err(|error| format!("Failed to parse helper output: {}", error))?;
     match value.get("type").and_then(Value::as_str) {
-        Some("title_result") => Ok(Some(
-            value
-                .get("title")
-                .and_then(Value::as_str)
-                .map(|title| title.to_string()),
-        )),
+        Some(kind) if kind == result_type => Ok(Some(value)),
         Some("status") => {
             if value.get("status").and_then(Value::as_str) == Some("error") {
                 return Err(value
                     .get("detail")
                     .and_then(Value::as_str)
                     .map(str::to_string)
-                    .unwrap_or_else(|| "Native title helper reported an error.".to_string()));
+                    .unwrap_or_else(|| "Native helper query reported an error.".to_string()));
             }
             Ok(None)
         }
@@ -411,17 +439,27 @@ mod tests {
     fn title_helper_error_is_terminal_without_waiting_for_process_exit() {
         let mut stderr = Vec::new();
         assert_eq!(
-            process_title_helper_line(
+            process_helper_line(
                 r#"{"type":"status","status":"error","detail":"401 Unauthorized"}"#,
+                "title_result",
                 &mut stderr
             ),
             Err("401 Unauthorized".to_string())
         );
-        assert!(process_title_helper_line("broken JSON", &mut stderr).is_err());
+        assert!(process_helper_line("broken JSON", "title_result", &mut stderr).is_err());
+        let value = process_helper_line(
+            r#"{"type":"title_result","title":null}"#,
+            "title_result",
+            &mut stderr,
+        )
+        .unwrap()
+        .expect("result line");
+        assert!(value["title"].is_null());
+        // Another query's result type is not this query's terminal line.
         assert_eq!(
-            process_title_helper_line(r#"{"type":"title_result","title":null}"#, &mut stderr)
+            process_helper_line(r#"{"type":"next_steps_result","suggestions":[]}"#, "title_result", &mut stderr)
                 .unwrap(),
-            Some(None)
+            None
         );
     }
 
@@ -446,14 +484,14 @@ mod tests {
     fn title_helper_line_extracts_title_result() {
         let mut stderr_lines = Vec::new();
 
-        assert_eq!(
-            process_title_helper_line(
-                r#"{"type":"title_result","title":"标题：AI 生成标题。"}"#,
-                &mut stderr_lines
-            )
-            .expect("helper output should parse"),
-            Some(Some("标题：AI 生成标题。".to_string()))
-        );
+        let value = process_helper_line(
+            r#"{"type":"title_result","title":"标题：AI 生成标题。"}"#,
+            "title_result",
+            &mut stderr_lines,
+        )
+        .expect("helper output should parse")
+        .expect("result line");
+        assert_eq!(value["title"], "标题：AI 生成标题。");
     }
 
     #[cfg(unix)]
@@ -474,7 +512,7 @@ mod tests {
         for (frame, expected) in [
             (
                 r#"{"type":"title_result","title":"生成的短标题"}"#,
-                Ok(Some("生成的短标题".to_string())),
+                Ok(Some(serde_json::json!({"type":"title_result","title":"生成的短标题"}))),
             ),
             (
                 r#"{"type":"status","status":"error","detail":"401 Unauthorized"}"#,
@@ -486,7 +524,7 @@ mod tests {
             let (rx, child) = spawn_native_helper_process(command).unwrap();
             let pid = child.pid();
             let result = tauri::async_runtime::block_on(async {
-                tokio::time::timeout(Duration::from_secs(2), receive_title_helper_output(rx)).await
+                tokio::time::timeout(Duration::from_secs(2), receive_helper_output(rx, "title_result")).await
             });
             drop(child);
             assert_eq!(
@@ -505,7 +543,7 @@ mod tests {
         let (rx, child) = spawn_native_helper_process(command).unwrap();
         let pid = child.pid();
         let result = tauri::async_runtime::block_on(async {
-            tokio::time::timeout(Duration::from_millis(20), receive_title_helper_output(rx)).await
+            tokio::time::timeout(Duration::from_millis(20), receive_helper_output(rx, "title_result")).await
         });
         drop(child);
         assert!(result.is_err());

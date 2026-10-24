@@ -1,4 +1,6 @@
 import type { CronHermesNotification } from '@/lib/hermes-ipc';
+import type { SessionParentLink } from '@/components/workspace/sessionLineage';
+import type { NextStepSuggestion } from '@/components/workspace/workspaceNextSteps';
 import { invoke } from '@tauri-apps/api/core';
 import { resolveEnvConfigForRuntime } from '@ccem/core/browser';
 import type {
@@ -958,6 +960,30 @@ export function useTauriCommands() {
     });
   }, []);
 
+  const listSessionParents = useCallback(async (): Promise<SessionParentLink[]> => {
+    return invoke<SessionParentLink[]>('list_session_parents');
+  }, []);
+
+  const suggestWorkspaceNextSteps = useCallback(async (options: {
+    context: string;
+    envName?: string | null;
+    workingDir?: string | null;
+  }): Promise<NextStepSuggestion[]> => {
+    return invoke<NextStepSuggestion[]>('suggest_workspace_next_steps', {
+      context: options.context,
+      envName: options.envName ?? null,
+      workingDir: options.workingDir ?? null,
+    });
+  }, []);
+
+  const recordSessionParent = useCallback(async (
+    childKey: string,
+    parentKey: string,
+    proposalId?: string | null,
+  ): Promise<void> => {
+    await invoke('record_session_parent', { childKey, parentKey, proposalId: proposalId ?? null });
+  }, []);
+
   const createNativeSession = useCallback(async (options: {
     provider: 'claude' | 'codex';
     envName?: string;
@@ -1869,6 +1895,9 @@ export function useTauriCommands() {
     removeManagedSession,
     preflightCodexModelMigration,
     createNativeSession,
+    listSessionParents,
+    recordSessionParent,
+    suggestWorkspaceNextSteps,
     listNativeSessions,
     getNativeSessionSummary,
     sendNativeSessionInput,

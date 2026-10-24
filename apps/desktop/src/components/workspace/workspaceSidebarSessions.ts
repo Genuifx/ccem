@@ -50,7 +50,7 @@ export function liveSessionSidebarKey(entry: WorkspaceSidebarLiveSessionEntry): 
   return historySessionKey({ source: toHistorySource(entry.session.provider), id: liveSessionSidebarId(entry), codexIsolated: entry.session.codex_isolated ?? false });
 }
 
-function liveSessionRuntimeSidebarKey(entry: WorkspaceSidebarLiveSessionEntry): string {
+export function liveSessionRuntimeSidebarKey(entry: WorkspaceSidebarLiveSessionEntry): string {
   return historySessionKey({ source: toHistorySource(entry.session.provider), id: entry.session.runtime_id, codexIsolated: entry.session.codex_isolated ?? false });
 }
 

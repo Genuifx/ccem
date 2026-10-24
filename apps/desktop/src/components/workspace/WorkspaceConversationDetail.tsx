@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useTransition } from 'react';
 import { Layers3 } from '@/lib/lucide-react';
 import { WorkspaceTranscriptList } from './WorkspaceTranscriptList';
+import { buildWorkspaceTodos } from './workspaceTodos';
 import { cn } from '@/lib/utils';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { useLocale } from '@/locales';
@@ -90,6 +91,7 @@ export function WorkspaceConversationDetail({
   const scrollSettleTimeoutRef = useRef<number | null>(null);
   const messageBatchSize = getPerformanceMode() === 'reduced' ? 24 : 48;
   const mergedMessages = useMemo(() => mergeToolResults(messages), [messages]);
+  const sessionTodos = useMemo(() => buildWorkspaceTodos([], messages), [messages]);
 
   const visibleMessages = useMemo(() => {
     if (activeSegment === null) return mergedMessages;
@@ -331,7 +333,7 @@ export function WorkspaceConversationDetail({
           ) : (
             <div>
               {hasMoreMessages ? <div ref={loadMoreSentinelRef} className="h-px" /> : null}
-              <WorkspaceTranscriptList messages={displayedMessages} onForkTurn={onForkTurn} />
+              <WorkspaceTranscriptList messages={displayedMessages} onForkTurn={onForkTurn} todos={sessionTodos} />
             </div>
           )}
         </div>

@@ -862,7 +862,16 @@
     "forkTurnPromptPlaceholder": "First message for the forked session…",
     "forkTurnSubmit": "Create fork",
     "forkTurnSubmitting": "Creating…",
-    "forkTurnCreateFailed": "Failed to fork the session"
+    "forkTurnCreateFailed": "Failed to fork the session",
+    "todoListTitle": "Tasks",
+    "todoListProgress": "{done}/{total}",
+    "nextStepsTitle": "Suggested next steps",
+    "nextStepStartSession": "New session",
+    "nextStepStarting": "Starting…",
+    "nextStepDoHere": "Do it here",
+    "nextStepStarted": "Started",
+    "nextStepOpen": "Open",
+    "nextStepOpenMissing": "Couldn't find that session; it may have been deleted"
   },
   "sessions": {
     "subtitle": "Manage running Claude Code sessions",

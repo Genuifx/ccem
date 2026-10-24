@@ -6,6 +6,10 @@ import type {
 import { cn } from '@/lib/utils';
 import { TurnSpeedBadge } from './TurnSpeedBadge';
 import { WorkspacePendingResponse } from './WorkspacePendingResponse';
+import { shouldShowWorkspaceTodoList, WorkspaceTodoList } from './WorkspaceTodoList';
+import type { WorkspaceTodos } from './workspaceTodos';
+import { WorkspaceNextStepsCard, type NextStepActions } from './WorkspaceNextStepsCard';
+import type { WorkspaceNextSteps } from './workspaceNextSteps';
 import type { TurnLiveProgress } from './workspaceEventTranscript';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion, useGSAP } from '@/lib/gsapMotion';
 import {
@@ -294,6 +298,11 @@ interface WorkspaceTranscriptListProps {
    * callback: bubbles are memoized on message identity only.
    */
   onForkTurn?: (message: ConversationMessageData) => void;
+  /** Session todo list, rendered at the very tail (below the pending row). */
+  todos?: WorkspaceTodos | null;
+  /** Post-turn suggestions, rendered below the todo list once the turn is idle. */
+  nextSteps?: WorkspaceNextSteps | null;
+  nextStepActions?: NextStepActions;
 }
 
 export function WorkspaceTranscriptList({
@@ -303,6 +312,9 @@ export function WorkspaceTranscriptList({
   enableTopWindowing = false,
   viewportRef,
   onForkTurn,
+  todos,
+  nextSteps,
+  nextStepActions,
 }: WorkspaceTranscriptListProps) {
   const listRef = useRef<HTMLDivElement | null>(null);
   const previousMotionKeysRef = useRef<string[]>([]);
@@ -762,6 +774,7 @@ export function WorkspaceTranscriptList({
   const windowStartIndex = displayItems.length - windowedItems.length;
 
   return (
+    <>
     <div ref={listRef}>
       {topSpacerHeight > 0 ? (
         <div
@@ -853,5 +866,12 @@ export function WorkspaceTranscriptList({
         );
       })}
     </div>
+    {shouldShowWorkspaceTodoList(todos, isAwaitingResponse) ? (
+      <WorkspaceTodoList todos={todos} />
+    ) : null}
+    {!isAwaitingResponse && nextSteps && nextSteps.suggestions.length > 0 && nextStepActions ? (
+      <WorkspaceNextStepsCard nextSteps={nextSteps} actions={nextStepActions} />
+    ) : null}
+    </>
   );
 }

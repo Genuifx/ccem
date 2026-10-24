@@ -197,9 +197,19 @@ import {
   type WorkspaceReviewEventFold,
 } from './workspaceReview';
 import {
+  buildWorkspaceTodos,
   mergeWorkspaceReplayEvents,
   selectCachedWorkspaceEvents,
 } from './workspaceTodos';
+import type { NextStepActions } from './WorkspaceNextStepsCard';
+import {
+  buildNextStepsContext,
+  nextStepsAnchorKey,
+  readCachedNextSteps,
+  writeCachedNextSteps,
+  type NextStepSuggestion,
+  type WorkspaceNextSteps,
+} from './workspaceNextSteps';
 import { WorkspaceWecomBindDialog } from './WorkspaceWecomBindDialog';
 import { WorkspaceHermesBindDialog, WorkspaceHermesSessionBadge } from './WorkspaceHermesBindDialog';
 import { Bot as HermesBotIcon } from '@/lib/lucide-react';
@@ -299,6 +309,14 @@ interface WorkspaceNativeSessionViewProps {
   codexInstalled?: boolean;
   opencodeInstalled?: boolean;
   onLaunchNewSession?: (client: LaunchClient) => void;
+  /** suggestion id -> child session keys, for next-step cards. */
+  startedNextStepChildKeys?: Map<string, string[]>;
+  onStartNextStepSession?: (
+    parent: NativeSessionSummary,
+    suggestionId: string,
+    suggestion: NextStepSuggestion,
+  ) => Promise<void>;
+  onOpenSessionKey?: (sessionKeys: string[]) => void;
   /** Opens the fork-from-turn dialog (Claude sessions with a provider session id). */
   onForkTurnRequest?: (
     request: {
@@ -1502,6 +1520,9 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
   onForkTurnRequest,
   onNavigateEnvironments,
   reviewWorkingDir,
+  startedNextStepChildKeys,
+  onStartNextStepSession,
+  onOpenSessionKey,
 }: WorkspaceNativeSessionViewProps) {
   const { t } = useLocale();
   const reviewSession = useMemo<NativeSessionSummary>(() => (
@@ -1515,6 +1536,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
   const {
     getNativeSessionEvents,
     getNativeSessionEventPage,
+    suggestWorkspaceNextSteps,
     sendNativeSessionInput,
     flushNativeSessionInputQueue,
     steerNativeSessionInputQueue,
@@ -2492,6 +2514,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
     forkTurnImplRef.current(message);
   }, []);
 
+  const sessionTodos = useMemo(() => buildWorkspaceTodos(events, messages), [events, messages]);
   const reviewSummary = useMemo(() => {
     const previous = reviewFoldRef.current;
     if (!previous) {
@@ -4121,6 +4144,59 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
     t,
     waitForPendingEnvironmentUpdate,
   ]);
+  const sessionRef = useRef(session);
+  sessionRef.current = session;
+  const messagesRef = useRef(messages);
+  messagesRef.current = messages;
+  const sessionTodosRef = useRef(sessionTodos);
+  sessionTodosRef.current = sessionTodos;
+  const [nextSteps, setNextSteps] = useState<WorkspaceNextSteps | null>(
+    () => readCachedNextSteps(session.runtime_id),
+  );
+  // Once a Claude turn settles, ask a small model for next steps in the
+  // background. The result only shows while its turn is still the latest.
+  const wasAwaitingRef = useRef(isAwaitingResponse);
+  useEffect(() => {
+    const wasAwaiting = wasAwaitingRef.current;
+    wasAwaitingRef.current = isAwaitingResponse;
+    if (!wasAwaiting || isAwaitingResponse) return;
+    const current = sessionRef.current;
+    if (current.provider !== 'claude' || current.status === 'error' || isTerminalStatus(current.status)) return;
+    let cancelled = false;
+    // Let the final assistant events land in the transcript first.
+    const timer = window.setTimeout(() => {
+      const built = buildNextStepsContext(messagesRef.current, sessionTodosRef.current);
+      if (!built || cancelled) return;
+      void suggestWorkspaceNextSteps({
+        context: built.context,
+        envName: sessionRef.current.env_name,
+        workingDir: sessionRef.current.project_dir,
+      })
+        .then((suggestions) => {
+          const value = { anchorKey: built.anchorKey, suggestions };
+          writeCachedNextSteps(sessionRef.current.runtime_id, value);
+          if (!cancelled) setNextSteps(value);
+        })
+        .catch((error) => console.warn('Failed to suggest next steps:', error));
+    }, 1200);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [isAwaitingResponse, suggestWorkspaceNextSteps]);
+  const currentAnchorKey = useMemo(() => nextStepsAnchorKey(messages), [messages]);
+  const visibleNextSteps = nextSteps && nextSteps.anchorKey === currentAnchorKey ? nextSteps : null;
+  const nextStepActions = useMemo<NextStepActions | undefined>(() => {
+    if (!onOpenSessionKey || !onStartNextStepSession || isTerminalStatus(session.status)) return undefined;
+    return {
+      startedChildKeys: startedNextStepChildKeys ?? new Map(),
+      onStartSession: (id, suggestion) => onStartNextStepSession(sessionRef.current, id, suggestion),
+      onDoHere: async (suggestion) => {
+        await handleSend({ text: suggestion.prompt, attachments: [] });
+      },
+      onOpen: onOpenSessionKey,
+    };
+  }, [handleSend, onOpenSessionKey, onStartNextStepSession, session.status, startedNextStepChildKeys]);
 
   useEffect(() => {
     if (queuedStateRef.current.runtimeId === session.runtime_id) {
@@ -4610,6 +4686,9 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
               enableTopWindowing
               viewportRef={containerRef}
               onForkTurn={onForkTurnRequest ? handleForkTurn : undefined}
+              todos={sessionTodos}
+              nextSteps={visibleNextSteps}
+              nextStepActions={nextStepActions}
             />
           )}
         </div>

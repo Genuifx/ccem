@@ -862,7 +862,16 @@
     "forkTurnPromptPlaceholder": "输入新会话的第一条消息…",
     "forkTurnSubmit": "创建分叉会话",
     "forkTurnSubmitting": "创建中…",
-    "forkTurnCreateFailed": "分叉会话创建失败"
+    "forkTurnCreateFailed": "分叉会话创建失败",
+    "todoListTitle": "任务",
+    "todoListProgress": "{done}/{total}",
+    "nextStepsTitle": "建议的下一步",
+    "nextStepStartSession": "新会话",
+    "nextStepStarting": "正在开始…",
+    "nextStepDoHere": "在这里做",
+    "nextStepStarted": "已开始",
+    "nextStepOpen": "打开",
+    "nextStepOpenMissing": "找不到这个会话，可能已被删除"
   },
   "sessions": {
     "subtitle": "管理运行中的 Claude Code 会话",
