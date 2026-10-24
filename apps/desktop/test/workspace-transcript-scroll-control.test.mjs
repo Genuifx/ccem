@@ -326,3 +326,52 @@ test('compensator follows the tail on resize and holds the reading anchor otherw
     dom.window.close();
   }
 });
+
+test('compensator re-pins follow mode when the viewport shrinks under a growing composer dock', async () => {
+  const dom = installDom();
+  const mod = await importScrollControlModule();
+  const observed = [];
+  const callbacks = [];
+  const previousResizeObserver = globalThis.ResizeObserver;
+  globalThis.ResizeObserver = class {
+    constructor(callback) {
+      callbacks.push(callback);
+    }
+    observe(element) {
+      observed.push(element);
+    }
+    disconnect() {}
+  };
+  try {
+    const container = makeContainer({ top: 0, scrollTop: 0 });
+    const content = document.createElement('div');
+    container.appendChild(content);
+    document.body.appendChild(container);
+    let followMode = true;
+    let bottomPins = 0;
+    const controller = mod.attachTranscriptResizeCompensator({
+      container,
+      getContentElement: () => content,
+      isFollowMode: () => followMode,
+      scrollToBottom: () => {
+        bottomPins += 1;
+      },
+    });
+    assert.ok(observed.includes(content), 'content growth is still observed');
+    assert.ok(observed.includes(container), 'the viewport itself is observed');
+
+    // The dock grows: only the container's box changes, no scroll event fires.
+    for (const callback of callbacks) callback([{ target: container }]);
+    assert.equal(bottomPins, 1, 'follow mode re-pins after a viewport-only resize');
+
+    followMode = false;
+    const before = container.scrollTop;
+    for (const callback of callbacks) callback([{ target: container }]);
+    assert.equal(bottomPins, 1, 'reading mode never pins');
+    assert.equal(container.scrollTop, before, 'reading mode keeps its position on a bottom-edge resize');
+    controller.dispose();
+  } finally {
+    globalThis.ResizeObserver = previousResizeObserver;
+    dom.window.close();
+  }
+});

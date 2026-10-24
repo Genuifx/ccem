@@ -207,11 +207,33 @@ test('remount restores backend rows and stale renderer state is corrected', asyn
 
   const corrected = reconcileNativeQueuedPrompts([
     localPrompt({ queuedBehindTurn: undefined, queuedDeliveryState: undefined }),
-  ], [item], {
+  ], [snapshot({ delivery_state: 'pending' })], {
     activeCommandId: 'command-1',
     expectedQueueCount: 1,
     isTerminal: false,
   });
-  assert.equal(corrected[0].queuedBehindTurn, true);
-  assert.equal(corrected[0].queuedDeliveryState, 'dispatching');
+  assert.equal(corrected[0].queuedBehindTurn, true, 'a send the backend holds pending really waits behind a turn');
+  assert.equal(corrected[0].queuedDeliveryState, 'pending');
+});
+
+test('an idle send dispatching through the backend queue stays in the transcript', async () => {
+  const { reconcileNativeQueuedPrompts, partitionNativeQueuedPromptPresentation } = await importProjection();
+  const direct = localPrompt({ queuedBehindTurn: undefined, queuedDeliveryState: undefined });
+  for (const expectedQueueCount of [1, undefined, 2]) {
+    const next = reconcileNativeQueuedPrompts([direct], [snapshot({ delivery_state: 'dispatching' })], {
+      activeCommandId: 'command-1',
+      expectedQueueCount,
+      isTerminal: false,
+    });
+    assert.equal(next[0], direct, `dispatching must not reclassify a direct send (queue_count=${expectedQueueCount})`);
+    const { composerQueuedMessages, transcriptPrompts } = partitionNativeQueuedPromptPresentation(next);
+    assert.deepEqual(composerQueuedMessages, [], 'the queue dock never shows the in-flight direct send');
+    assert.equal(transcriptPrompts.length, 1);
+  }
+
+  const uncertain = reconcileNativeQueuedPrompts([direct], [snapshot({ delivery_state: 'delivery_uncertain' })], {
+    expectedQueueCount: 1,
+    isTerminal: false,
+  });
+  assert.equal(uncertain[0].queuedBehindTurn, true, 'an uncertain delivery still surfaces in the dock');
 });

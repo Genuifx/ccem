@@ -233,15 +233,22 @@ export function attachTranscriptResizeCompensator(
   // for an empty transcript); callers re-attach across session switches. In
   // environments without ResizeObserver the exported handler can still be
   // driven directly (that is also how the jsdom regression tests exercise it).
+  // The viewport is observed too: the composer dock above the input (queue
+  // rows, questions) grows by shrinking this container from the bottom, which
+  // fires no scroll event. In follow mode that must re-pin, or the hidden gap
+  // later reads as a user scroll-away and silently detaches follow mode. In
+  // reading mode the anchor is measured from the viewport top, so a bottom-edge
+  // change is a no-op.
   let resizeObserver: ResizeObserver | null = null;
   if (typeof ResizeObserver !== 'undefined') {
+    resizeObserver = new ResizeObserver(() => {
+      handleContentResize();
+    });
     const content = getContentElement();
     if (content) {
-      resizeObserver = new ResizeObserver(() => {
-        handleContentResize();
-      });
       resizeObserver.observe(content);
     }
+    resizeObserver.observe(container);
   }
 
   return {
