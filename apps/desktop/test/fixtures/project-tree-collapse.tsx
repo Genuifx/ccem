@@ -28,7 +28,12 @@ function Fixture() {
             <div className="flex h-full flex-col">
               <div className="flex min-h-0 flex-1 overflow-hidden">
                 <div className="mx-3 mb-3 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-                  <div className="h-8 shrink-0" />
+                  {/* Mirrors the workspace top-bar toggle that owns collapse. */}
+                  <div className="h-8 shrink-0">
+                    <button type="button" onClick={() => setCollapsed((value) => !value)}>
+                      {collapsed ? '展开侧边栏' : '收起侧边栏'}
+                    </button>
+                  </div>
                   <div className="workspace-main-container flex min-h-0 min-w-0 flex-1 overflow-hidden">
                     <ProjectTree
                       sessions={sessions}
@@ -38,7 +43,6 @@ function Fixture() {
                       onRefresh={() => {}}
                       width={280}
                       collapsed={collapsed}
-                      onToggleCollapsed={() => setCollapsed((value) => !value)}
                     />
                     <output data-testid="selection">{selectedKey ?? 'No conversation selected'}</output>
                   </div>

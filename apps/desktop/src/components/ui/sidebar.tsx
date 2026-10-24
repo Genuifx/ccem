@@ -75,35 +75,6 @@ const SidebarProvider = React.forwardRef<HTMLDivElement, SidebarProviderProps>(
       setOpen((currentOpen) => !currentOpen);
     }, [setOpen]);
 
-    React.useEffect(() => {
-      const handleKeyDown = (event: KeyboardEvent) => {
-        if (!(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey) {
-          return;
-        }
-
-        if (event.key.toLowerCase() !== 'b') {
-          return;
-        }
-
-        const target = event.target as HTMLElement | null;
-        const isEditableTarget = !!target && (
-          target.isContentEditable
-          || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)
-          || target.getAttribute('role') === 'textbox'
-        );
-
-        if (isEditableTarget) {
-          return;
-        }
-
-        event.preventDefault();
-        toggleSidebar();
-      };
-
-      window.addEventListener('keydown', handleKeyDown);
-      return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [toggleSidebar]);
-
     const state: SidebarState = open ? 'expanded' : 'collapsed';
     const sidebarShellWidth = mode === 'inline' && open ? sidebarWidth + sidebarShellPadding : 0;
 

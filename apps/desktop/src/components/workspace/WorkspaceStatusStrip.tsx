@@ -1,16 +1,14 @@
-import { useState, useCallback } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { useCallback } from 'react';
 import {
-  Radio,
-  Flame,
-  Clock,
   Check,
   Settings2,
   ClipboardCheck,
   Search,
   Command,
+  PanelLeft,
   PanelRightClose,
   PanelRightOpen,
+  SquarePen,
 } from '@/lib/lucide-react';
 import { useAppStore } from '@/store';
 import { useLocale } from '@/locales';
@@ -23,21 +21,14 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from '@/components/ui/popover';
 import { useTauriCommands } from '@/hooks/useTauriCommands';
 import { enqueueSessionRouterMutation, resolveDisplayEnv, resolveEnvSwitchAction, resolveEnvSwitchCasPatch } from '@/lib/routerProfiles';
-import { calculateContinuousUsageDays } from '@/lib/streak';
 import { toast } from 'sonner';
 import { ModelIcon } from '@/components/history/ModelIcon';
 import { resolveEnvironmentIconHint } from '@/components/workspace/sessionTreeIcons';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { StreakUsagePopoverContent } from './StreakUsagePopover';
+import { WorkspaceStatusCapsule } from './WorkspaceStatusCapsule';
 import { WorkspaceRouteChip } from './WorkspaceRouter';
-import type { UsageStats } from '@/types/analytics';
 import type { Environment } from '@/store';
 import { filterRuntimeEnvironments } from '@/lib/enabledEnvironments';
 import {
@@ -75,65 +66,15 @@ interface WorkspaceStatusStripProps {
   activeRuntimeId?: string | null;
   /** Direct-session chip target: default rules & profiles live on Environments. */
   onNavigateEnvironments?: () => void;
+  /** Conversation list visibility; the toggle lives here so collapsing hides the list entirely. */
+  sidebarCollapsed?: boolean;
+  onToggleSidebar?: () => void;
+  /** Shown only while the list is collapsed, so starting a session never needs the list. */
+  onNewSession?: () => void;
 }
 
-function StatusChip({
-  icon: Icon,
-  label,
-  color,
-  pulse,
-  onClick,
-  compact = false,
-  className,
-}: {
-  icon: React.ComponentType<{ className?: string; style?: React.CSSProperties }>;
-  label: string;
-  color?: string;
-  pulse?: boolean;
-  onClick?: () => void;
-  compact?: boolean;
-  className?: string;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        'group relative inline-flex shrink-0 items-center whitespace-nowrap rounded-full',
-        compact ? 'h-8 gap-1 px-2' : 'gap-1.5 px-2.5 py-1 sm:gap-2 sm:px-3.5 sm:py-1.5',
-        'status-chip-glass',
-        'hover:scale-[1.02] active:scale-[0.98]',
-        onClick && 'cursor-pointer',
-        className
-      )}
-    >
-      <span className="relative flex items-center justify-center w-3.5 h-3.5">
-        <Icon
-          className="w-3.5 h-3.5 transition-transform duration-200 group-hover:scale-110"
-          style={color ? { color } : undefined}
-        />
-        {pulse && (
-          <>
-            <span
-              className="absolute inset-0 rounded-full animate-ping opacity-40"
-              style={{ backgroundColor: color || 'hsl(142 71% 45%)' }}
-            />
-            <span
-              className="absolute inset-[-2px] rounded-full opacity-20 animate-pulse"
-              style={{ backgroundColor: color || 'hsl(142 71% 45%)' }}
-            />
-          </>
-        )}
-      </span>
-      <span className={cn(
-        'whitespace-nowrap text-[12px] font-medium text-foreground transition-colors group-hover:text-foreground',
-        !compact && 'sm:text-[13px]',
-      )}>
-        {label}
-      </span>
-    </button>
-  );
-}
+const SIDEBAR_ICON_BUTTON_CLASS =
+  'inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground/75 transition-colors hover:bg-foreground/[0.06] hover:text-foreground active:scale-[0.96] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring';
 
 export function WorkspaceStatusStrip({
   onNavigate,
@@ -143,17 +84,16 @@ export function WorkspaceStatusStrip({
   envContext,
   activeRuntimeId,
   onNavigateEnvironments,
+  sidebarCollapsed = false,
+  onToggleSidebar,
+  onNewSession,
 }: WorkspaceStatusStripProps) {
   const { t } = useLocale();
-  const { sessions, currentEnv, environments, enabledEnvironments, continuousUsageDays, cronTasks, usageStats } = useAppStore(
+  const { currentEnv, environments, enabledEnvironments } = useAppStore(
     (state) => ({
-      sessions: state.sessions,
       currentEnv: state.currentEnv,
       environments: state.environments,
       enabledEnvironments: state.enabledEnvironments,
-      continuousUsageDays: state.continuousUsageDays,
-      cronTasks: state.cronTasks,
-      usageStats: state.usageStats,
     }),
     shallow
   );
@@ -169,20 +109,11 @@ export function WorkspaceStatusStrip({
   const runtimeEnvironments = filterRuntimeEnvironments(environments, enabledEnvironments, {
     currentEnv: statusStripCurrentEnvs.length > 0 ? statusStripCurrentEnvs : null,
   });
-  const [streakPopoverOpen, setStreakPopoverOpen] = useState(false);
-  const [isRefreshingStreak, setIsRefreshingStreak] = useState(false);
   const { reviewEntry, reviewPanelOpen, setReviewPanelOpen } = useAppStore(
     (state) => ({
       reviewEntry: state.reviewEntry,
       reviewPanelOpen: state.reviewPanelOpen,
       setReviewPanelOpen: state.setReviewPanelOpen,
-    }),
-    shallow
-  );
-  const { setUsageStats, setContinuousUsageDays } = useAppStore(
-    (state) => ({
-      setUsageStats: state.setUsageStats,
-      setContinuousUsageDays: state.setContinuousUsageDays,
     }),
     shallow
   );
@@ -235,25 +166,6 @@ export function WorkspaceStatusStrip({
     [activeRuntimeId, activeRouter, routerStatus, updateSessionRouter, switchEnvironment, t],
   );
 
-  // Actively refresh usage stats from the backend so the streak popover
-  // reflects the latest data each time it's opened.
-  const refreshStreakUsage = useCallback(async () => {
-    setIsRefreshingStreak(true);
-    try {
-      const stats = await invoke<UsageStats>('get_usage_stats');
-      if (stats) {
-        setUsageStats(stats);
-        setContinuousUsageDays(calculateContinuousUsageDays(stats.dailyHistory));
-      }
-    } catch (err) {
-      console.debug('Failed to refresh streak usage:', err);
-    } finally {
-      setIsRefreshingStreak(false);
-    }
-  }, [setUsageStats, setContinuousUsageDays]);
-
-  const runningSessions = sessions.filter((s) => s.status === 'running');
-  const activeCronTasks = cronTasks.filter((t) => t.enabled !== false);
   const displayEnvironment = environments.find((env) => env.name === displayEnv);
 
   return (
@@ -265,18 +177,46 @@ export function WorkspaceStatusStrip({
         browserOpen ? 'h-10 gap-1 pr-1' : 'h-11 gap-1.5 sm:h-12 sm:gap-2.5',
       )}
     >
-      <StatusChip
-        icon={Radio}
-        label={
-          runningSessions.length > 0
-            ? `${runningSessions.length} ${t('workspace.statusRunning')}`
-            : t('workspace.statusIdle')
-        }
-        color={runningSessions.length > 0 ? 'hsl(142 71% 45%)' : undefined}
-        pulse={runningSessions.length > 0}
-        onClick={() => onNavigate('sessions')}
-        compact={browserOpen}
-      />
+      {onToggleSidebar ? (
+        <div className="mr-1 flex shrink-0 items-center">
+          <button
+            type="button"
+            data-ccem-workspace-sidebar-toggle="true"
+            aria-label={t(sidebarCollapsed ? 'workspace.expandSidebar' : 'workspace.collapseSidebar')}
+            aria-pressed={!sidebarCollapsed}
+            title={`${t(sidebarCollapsed ? 'workspace.expandSidebar' : 'workspace.collapseSidebar')} (⌘B)`}
+            onClick={onToggleSidebar}
+            className={SIDEBAR_ICON_BUTTON_CLASS}
+          >
+            <PanelLeft className="h-[15px] w-[15px]" />
+          </button>
+          {onNewSession ? (
+            // Always mounted: the slot's width animates 0 <-> 28px so the
+            // capsules after it slide instead of jumping on collapse/expand.
+            <div
+              aria-hidden={!sidebarCollapsed}
+              className={cn(
+                'flex shrink-0 overflow-hidden transition-[width,opacity] [transition-duration:var(--duration-base)] [transition-timing-function:var(--ease-default)] motion-reduce:transition-none',
+                sidebarCollapsed ? 'w-7 opacity-100' : 'pointer-events-none w-0 opacity-0',
+              )}
+            >
+              <button
+                type="button"
+                data-ccem-workspace-new-session="true"
+                aria-label={t('workspace.newSession')}
+                title={t('workspace.newSession')}
+                tabIndex={sidebarCollapsed ? undefined : -1}
+                onClick={onNewSession}
+                className={SIDEBAR_ICON_BUTTON_CLASS}
+              >
+                <SquarePen className="h-[15px] w-[15px]" />
+              </button>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      <WorkspaceStatusCapsule onNavigate={onNavigate} compact={browserOpen} />
 
       {/* Environment quick-switch capsule — icon language matches composer env picker */}
       <DropdownMenu>
@@ -350,52 +290,6 @@ export function WorkspaceStatusStrip({
         compact={browserOpen}
       />
 
-      {continuousUsageDays > 0 && usageStats && (
-        <Popover
-          open={streakPopoverOpen}
-          onOpenChange={(open) => {
-            setStreakPopoverOpen(open);
-            if (open) void refreshStreakUsage();
-          }}
-        >
-          <PopoverTrigger asChild>
-            <div className={cn(browserOpen ? 'inline-flex' : 'hidden md:inline-flex')}>
-              <StatusChip
-                icon={Flame}
-                label={`${continuousUsageDays} ${t('workspace.statusStreak')}`}
-                color="hsl(25 95% 53%)"
-                compact={browserOpen}
-                className={isRefreshingStreak ? 'opacity-70' : undefined}
-              />
-            </div>
-          </PopoverTrigger>
-          <PopoverContent
-            align="start"
-            sideOffset={6}
-            className="w-[360px] p-0 overflow-hidden rounded-xl border border-[hsl(var(--glass-border-light))] bg-popover shadow-lg"
-            onOpenAutoFocus={(e) => e.preventDefault()}
-          >
-            <StreakUsagePopoverContent
-              usageStats={usageStats}
-              continuousUsageDays={continuousUsageDays}
-              onNavigateAnalytics={() => {
-                setStreakPopoverOpen(false);
-                onNavigate('analytics');
-              }}
-            />
-          </PopoverContent>
-        </Popover>
-      )}
-
-      {!browserOpen && activeCronTasks.length > 0 && (
-        <StatusChip
-          icon={Clock}
-          label={`${activeCronTasks.length} ${t('workspace.statusCronActive')}`}
-          onClick={() => onNavigate('cron')}
-          className="hidden lg:inline-flex"
-        />
-      )}
-
       {/* Global search trigger — spotlight-style field, distinct from status chips */}
       <button
         type="button"
@@ -438,7 +332,7 @@ export function WorkspaceStatusStrip({
         onClick={() => setReviewPanelOpen(!reviewPanelOpen)}
         className={cn(
           'group relative inline-flex shrink-0 items-center whitespace-nowrap rounded-full cursor-pointer',
-          browserOpen ? 'h-8 w-8 min-h-[2rem] min-w-[2rem] flex-none justify-center gap-0 px-0' : 'gap-1.5 px-2.5 py-1 sm:gap-2 sm:px-3.5 sm:py-1.5',
+          'h-8 w-8 min-h-[2rem] min-w-[2rem] flex-none justify-center gap-0 px-0',
           'status-chip-glass',
           'hover:scale-[1.02] active:scale-[0.98]',
           reviewPanelOpen && 'ring-1 ring-inset ring-primary/40'
@@ -459,16 +353,11 @@ export function WorkspaceStatusStrip({
             />
           ) : null}
         </span>
-        <span className={cn(
-          'whitespace-nowrap text-[12px] font-medium text-foreground transition-colors',
-          browserOpen ? 'sr-only' : 'sm:text-[13px]',
-        )}>
-          {t('workspace.reviewEntry')}
-        </span>
+        <span className="sr-only">{t('workspace.reviewEntry')}</span>
         {reviewEntry && reviewEntry.failedTools > 0 ? (
           <span className={cn(
             'inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-destructive px-1 text-[10px] font-semibold leading-none text-destructive-foreground',
-            browserOpen ? 'absolute -right-1 -top-1' : 'ml-0.5',
+            'absolute -right-1 -top-1',
           )}>
             {reviewEntry.failedTools}
           </span>

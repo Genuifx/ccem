@@ -3537,6 +3537,22 @@ export function Workspace({
   );
   useKeyboardShortcuts(isActive ? shortcuts : {});
 
+  // Cmd/Ctrl+B toggles the conversation list, like the left column in Finder,
+  // Xcode or VS Code. Unlike the shortcuts above it also fires while typing in
+  // the composer (which runs with markdown shortcuts off), since that is where
+  // focus usually is.
+  useEffect(() => {
+    if (!isActive) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey) return;
+      if (event.key.toLowerCase() !== 'b' || event.defaultPrevented) return;
+      event.preventDefault();
+      setWorkspaceSidebarCollapsed((prev) => !prev);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isActive]);
+
   // Escape is owned by the currently visible coordinator command only. Keep
   // the last identity outside the effect so key repeat and rerenders cannot
   // send duplicate interrupt requests for the same command.
@@ -4032,6 +4048,9 @@ export function Workspace({
                 : null
             }
             onNavigateEnvironments={() => onNavigate('environments')}
+            sidebarCollapsed={workspaceSidebarCollapsed}
+            onToggleSidebar={() => setWorkspaceSidebarCollapsed((prev) => !prev)}
+            onNewSession={handleProjectTreeNewSession}
           />
 
           <div
@@ -4058,7 +4077,6 @@ export function Workspace({
               onNewSession={handleProjectTreeNewSession}
               width={workspaceSidebarWidth}
               collapsed={workspaceSidebarCollapsed}
-              onToggleCollapsed={() => setWorkspaceSidebarCollapsed((prev) => !prev)}
               onResizeStart={handleWorkspaceSidebarResizeStart}
             />
 
