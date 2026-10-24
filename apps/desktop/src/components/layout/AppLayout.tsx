@@ -1,15 +1,13 @@
-import { ReactNode } from 'react';
-import { Home, LayoutGrid } from '@/lib/lucide-react';
+import { ReactNode, useEffect } from 'react';
+import { LayoutGrid } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { SideRail } from './SideRail';
 import { MacFullscreenWindowControls } from './MacFullscreenWindowControls';
 import { GlobalUpdateIndicator } from '@/components/app-update/GlobalUpdateIndicator';
 import {
-  Sidebar,
   SidebarInset,
   SidebarProvider,
-  SidebarTrigger,
   useSidebar,
 } from '@/components/ui/sidebar';
 import { useLocale } from '@/locales';
@@ -34,7 +32,7 @@ export function AppLayout({
 }: AppLayoutProps) {
   return (
     <SidebarProvider
-      mode={activeTab === 'workspace' ? 'floating' : 'inline'}
+      mode="floating"
       className="h-screen flex overflow-hidden relative"
       data-active-tab={activeTab}
     >
@@ -63,10 +61,7 @@ function AppLayoutBody({
   const { t } = useLocale();
   const backdropRef = useNativeBrowserBackdropRef<HTMLDivElement>();
   const ambientRef = useNativeBrowserBackdropRef<HTMLDivElement>();
-  const { open, state } = useSidebar();
   const isWorkspace = activeTab === 'workspace';
-  const sidebarToggleLabel = state === 'collapsed' ? t('sideRail.expand') : t('sideRail.collapse');
-  const showWorkspaceShortcut = state === 'collapsed' && !isWorkspace;
   const titleKeyMap: Record<string, string> = {
     'proxy-debug': 'sideRail.proxyDebug',
     'chat-app': 'sideRail.chatApp',
@@ -89,27 +84,8 @@ function AppLayoutBody({
 
   return (
     <>
-      {isWorkspace ? (
-        <WorkspaceNavigation onTabChange={onTabChange} onTabPrefetch={onTabPrefetch} />
-      ) : (
-        <AppSidebarToggleAnchor label={sidebarToggleLabel} />
-      )}
-      {showWorkspaceShortcut ? (
-        <CollapsedWorkspaceShortcut
-          label={t('sideRail.backToWorkspace')}
-          onClick={() => onTabChange('workspace')}
-          onPrefetch={() => onTabPrefetch?.('workspace')}
-        />
-      ) : null}
+      <AppNavigation activeTab={activeTab} onTabChange={onTabChange} onTabPrefetch={onTabPrefetch} />
       <GlobalUpdateIndicator />
-
-      {!isWorkspace && (
-        <Sidebar>
-          {open && (
-            <SideRail activeTab={activeTab} onTabChange={onTabChange} onTabPrefetch={onTabPrefetch} glassMuted={false} />
-          )}
-        </Sidebar>
-      )}
 
       {/* Main content area — semi-transparent so ambient orbs bleed through glass panels */}
       <SidebarInset ref={backdropRef} className="app-content-shell flex-1 flex flex-col min-w-0 relative z-10 overflow-hidden">
@@ -152,10 +128,17 @@ function AppLayoutBody({
   );
 }
 
-function WorkspaceNavigation({ onTabChange, onTabPrefetch }: Pick<AppLayoutProps, 'onTabChange' | 'onTabPrefetch'>) {
+// One navigation model for every page: global destinations live in this menu,
+// so the left column stays free for each page's own list (sessions, settings sections).
+function AppNavigation({ activeTab, onTabChange, onTabPrefetch }: Pick<AppLayoutProps, 'activeTab' | 'onTabChange' | 'onTabPrefetch'>) {
   const { t } = useLocale();
   const { open, setOpen } = useSidebar();
   const label = t('sideRail.navigation');
+
+  // Route changes can also come from shortcuts; never leave a stale menu open.
+  useEffect(() => {
+    setOpen(false);
+  }, [activeTab, setOpen]);
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -183,7 +166,7 @@ function WorkspaceNavigation({ onTabChange, onTabPrefetch }: Pick<AppLayoutProps
         className="z-[125] w-56 overflow-hidden rounded-xl p-0 shadow-xl"
       >
         <SideRail
-          activeTab="workspace"
+          activeTab={activeTab}
           floating
           onTabChange={(tab) => {
             setOpen(false);
@@ -193,44 +176,5 @@ function WorkspaceNavigation({ onTabChange, onTabPrefetch }: Pick<AppLayoutProps
         />
       </PopoverContent>
     </Popover>
-  );
-}
-
-function CollapsedWorkspaceShortcut({
-  label,
-  onClick,
-  onPrefetch,
-}: {
-  label: string;
-  onClick: () => void;
-  onPrefetch?: () => void;
-}) {
-  return (
-    <div className="app-workspace-shortcut-anchor absolute z-[122]">
-      <button
-        type="button"
-        data-testid="collapsed-workspace-shortcut"
-        aria-label={label}
-        title={label}
-        onClick={onClick}
-        onMouseEnter={onPrefetch}
-        onFocus={onPrefetch}
-        className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-md border-none bg-transparent p-0 text-muted-foreground/75 shadow-none transition-[background-color,color,transform] duration-150 hover:bg-foreground/[0.06] hover:text-foreground active:scale-[0.96] active:bg-foreground/[0.1] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
-      >
-        <Home className="h-[15px] w-[15px]" />
-        <span className="sr-only">{label}</span>
-      </button>
-    </div>
-  );
-}
-
-function AppSidebarToggleAnchor({ label }: { label: string }) {
-  return (
-    <div className="app-sidebar-toggle-anchor absolute z-[120]">
-      <SidebarTrigger
-        aria-label={label}
-        title={`${label} (⌘B)`}
-      />
-    </div>
   );
 }

@@ -182,41 +182,44 @@ test('workspace omits the permanent global sidebar even with the legacy expanded
   assert.equal(localStorage.getItem('ccem-sidebar-state'), 'expanded');
 });
 
-test('menu navigation restores normal pages and returning to workspace always dismisses the menu', async (t) => {
+test('every page uses the same top-left menu and never a permanent sidebar column', async (t) => {
   const mounted = await start(t);
   await click(trigger());
   await click(query('[data-testid="nav-environments"]'));
   assert.equal(page(), 'environments');
   assert.equal(menu(), null);
-  assert.equal(sidebar().style.width, '208px');
+  assert.equal(sidebar(), null, 'normal pages keep the full width');
+  assert.ok(trigger(), 'the same menu button stays in place on normal pages');
+
+  await click(trigger());
+  assert.equal(
+    query('[data-testid="nav-environments"]').getAttribute('aria-current'),
+    'page',
+    'the menu marks the page you are on',
+  );
   await click(query('[data-testid="nav-workspace"]'));
   assert.equal(page(), 'workspace');
   assert.equal(menu(), null);
   assert.equal(sidebar(), null);
+  assert.equal(query('[data-testid="collapsed-workspace-shortcut"]'), null, 'no separate home shortcut');
 
   await click(trigger());
   mounted.navigate('history'); // The same route change can also come from a global shortcut.
   await settle();
-  assert.equal(menu(), null);
-  mounted.navigate('workspace');
-  await settle();
-  assert.equal(menu(), null, 'a shortcut departure cannot leave a stale menu open on return');
+  assert.equal(menu(), null, 'a shortcut departure cannot leave a stale menu open');
   assert.equal(localStorage.getItem('ccem-sidebar-state'), 'expanded');
 });
 
-test('floating navigation keeps the collapsed preference and normal sidebar toggles still persist', async (t) => {
-  await start(t, 'collapsed');
-  await click(trigger());
-  await click(query('[data-testid="nav-history"]'));
-  assert.equal(sidebar().style.width, '0px');
-  await click(query('[data-sidebar="trigger"]'));
-  assert.equal(sidebar().style.width, '208px');
-  assert.equal(localStorage.getItem('ccem-sidebar-state'), 'expanded');
-  await click(query('[data-sidebar="trigger"]'));
-  await click(query('[data-testid="collapsed-workspace-shortcut"]'));
-  assert.equal(page(), 'workspace');
-  await click(trigger());
+test('Cmd/Ctrl+B opens the same menu on normal pages', async (t) => {
+  const mounted = await start(t, 'collapsed');
+  mounted.navigate('settings');
+  await settle();
+  act(() => document.body.focus());
+  await press('b', { metaKey: true }, document.body);
+  assert.ok(menu());
+  assert.equal(sidebar(), null);
   await press('Escape');
+  assert.equal(menu(), null);
   assert.equal(localStorage.getItem('ccem-sidebar-state'), 'collapsed');
 });
 

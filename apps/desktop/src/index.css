@@ -660,8 +660,6 @@
   --ccem-sidebar-toggle-gap: 4px;
   --ccem-update-indicator-size: 28px;
   --ccem-update-indicator-gap: 0px;
-  --ccem-workspace-shortcut-size: 28px;
-  --ccem-workspace-shortcut-gap: 4px;
   --ccem-sidebar-toggle-clearance: 10px;
   --ccem-titlebar-control-center-y: 24px;
   --ccem-titlebar-action-half-size: 14px;
@@ -682,16 +680,6 @@
     + var(--ccem-update-indicator-size)
     + var(--ccem-sidebar-toggle-clearance)
   );
-  --ccem-sidebar-toggle-leading-space-with-workspace-update: calc(
-    var(--ccem-window-controls-width, 0px)
-    + var(--ccem-sidebar-toggle-gap)
-    + var(--ccem-sidebar-toggle-size)
-    + var(--ccem-workspace-shortcut-gap)
-    + var(--ccem-workspace-shortcut-size)
-    + var(--ccem-update-indicator-gap)
-    + var(--ccem-update-indicator-size)
-    + var(--ccem-sidebar-toggle-clearance)
-  );
 }
 
 .app-sidebar-toggle-anchor {
@@ -702,22 +690,6 @@
 }
 
 .app-sidebar-toggle-anchor * {
-  -webkit-app-region: no-drag;
-}
-
-.app-workspace-shortcut-anchor {
-  top: var(--ccem-titlebar-action-top);
-  left: calc(
-    var(--ccem-window-controls-width, 0px)
-    + var(--ccem-sidebar-toggle-gap)
-    + var(--ccem-sidebar-toggle-size)
-    + var(--ccem-workspace-shortcut-gap)
-  );
-  pointer-events: auto;
-  -webkit-app-region: no-drag;
-}
-
-.app-workspace-shortcut-anchor * {
   -webkit-app-region: no-drag;
 }
 
@@ -798,27 +770,10 @@
   padding-right: 1rem;
 }
 
-[data-sidebar-state='collapsed'] .app-titlebar-row,
-[data-sidebar-state='collapsed'] .workspace-status-strip,
+/* The navigation menu button sits beside the window controls on every page. */
+[data-sidebar-mode='floating'] .app-titlebar-row,
 [data-sidebar-mode='floating'] .workspace-status-strip {
   padding-left: var(--ccem-sidebar-toggle-leading-space);
-}
-
-:root[data-update-indicator-visible='true']
-[data-sidebar-state='collapsed']:not([data-active-tab='workspace'])
-.app-titlebar-row {
-  padding-left: var(--ccem-sidebar-toggle-leading-space-with-workspace-update);
-}
-
-[data-sidebar-state='collapsed']:not([data-active-tab='workspace']) .app-update-indicator-anchor {
-  left: calc(
-    var(--ccem-window-controls-width, 0px)
-    + var(--ccem-sidebar-toggle-gap)
-    + var(--ccem-sidebar-toggle-size)
-    + var(--ccem-workspace-shortcut-gap)
-    + var(--ccem-workspace-shortcut-size)
-    + var(--ccem-update-indicator-gap)
-  );
 }
 
 .sidebar-top-drag-region {

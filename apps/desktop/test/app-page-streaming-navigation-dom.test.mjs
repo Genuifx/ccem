@@ -210,6 +210,9 @@ test('navigation commits while a native transcript streams, including a delayed 
   // Normal scheduling: exercise every page while the source keeps producing,
   // then prove hidden polling pauses and catches up on return, without remount.
   for (const tab of Object.values(pages)) {
+    // Global navigation lives behind the same top-left menu on every page.
+    await click('[data-testid="workspace-navigation-trigger"]');
+    await waitFor(() => query(`[data-testid="nav-${tab}"]`), 'application menu opens');
     await click(`[data-testid="nav-${tab}"]`);
     await waitFor(() => query(`[data-page="${tab}"]`), `${tab} content appears`);
     assert.doesNotMatch(text(), /Loading\.\.\./);
@@ -220,6 +223,8 @@ test('navigation commits while a native transcript streams, including a delayed 
   assert.equal(reads, hiddenReads, 'hidden native session does not keep polling');
   for (let round = 0; round < 3; round++) {
     const before = chunks;
+    await click('[data-testid="workspace-navigation-trigger"]');
+    await waitFor(() => query('[data-testid="nav-workspace"]'), 'application menu opens');
     await click('[data-testid="nav-workspace"]');
     await waitFor(() => text().includes(`流式${before}`), 'returning session catches up with live source');
     assert.equal(query('[contenteditable="true"]'), editor, 'navigation preserves the native composer');

@@ -1021,9 +1021,9 @@ export function Settings() {
   };
 
   return (
-    <div className="flex h-full">
-      {/* Left Navigation */}
-      <nav className="w-52 shrink-0 border-r border-border-subtle bg-surface-sunken/50 p-3 space-y-0.5">
+    <div className="workspace-main-container mx-3 mb-3 flex h-[calc(100%-0.75rem)] overflow-hidden">
+      {/* Left Navigation — same list column surface as the workspace session list */}
+      <nav className="w-52 shrink-0 bg-sidebar p-2 space-y-0.5 overflow-y-auto">
         {sections.map((item) => {
           const Icon = item.icon;
           const isActive = activeSection === item.id;

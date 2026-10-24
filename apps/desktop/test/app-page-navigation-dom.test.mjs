@@ -180,6 +180,11 @@ function click(selector) {
   assert.ok(button, `click target exists: ${selector}`);
   act(() => button.click());
 }
+// Global navigation lives behind the same top-left menu on every page.
+function navTo(tab) {
+  if (!query('[data-testid="workspace-navigation-menu"]')) click('[data-testid="workspace-navigation-trigger"]');
+  click(`[data-testid="nav-${tab}"]`);
+}
 async function start(t) {
   localStorage.clear();
   localStorage.setItem('ccem-sidebar-state', 'expanded');
@@ -204,9 +209,7 @@ test('primary pages remain usable when cold page imports never settle', async (t
   pendingPageImports = 0;
   const draft = query('input');
   draft.value = 'preserve my workspace';
-  click('[data-testid="workspace-navigation-trigger"]');
-  await settle();
-  click('[data-testid="nav-settings"]');
+  navTo('settings');
 
   // A mere first-frame assertion does not distinguish a flash from a hang.
   // Observe the destination after timers continue to run without releasing
@@ -214,18 +217,16 @@ test('primary pages remain usable when cold page imports never settle', async (t
   await new Promise(resolve => setTimeout(resolve, 1200));
   assertPage('settings');
   assert.equal(pendingPageImports, 0, 'navigation must not depend on a cold page import');
-  click('[data-testid="nav-workspace"]');
+  navTo('workspace');
   assertPage('workspace');
   assert.equal(query('input'), draft);
   assert.equal(draft.value, 'preserve my workspace');
   click('[data-testid="incoming-event"]');
   assert.equal(query('[data-testid="incoming-event"]').textContent, '1');
-  click('[data-testid="workspace-navigation-trigger"]');
-  await settle();
-  click('[data-testid="nav-settings"]');
+  navTo('settings');
   assertPage('settings');
   for (const tab of Object.values(pages).filter(tab => tab !== 'settings')) {
-    click(`[data-testid="nav-${tab}"]`);
+    navTo(tab);
     assertPage(tab);
   }
 });
@@ -234,14 +235,12 @@ test('first clicks render every primary page immediately without needing a hover
   await start(t);
   const draft = query('input');
   draft.value = 'keep this draft';
-  click('[data-testid="workspace-navigation-trigger"]');
-  await settle();
   for (const tab of ['settings', ...Object.values(pages).filter(tab => tab !== 'settings')]) {
-    click(`[data-testid="nav-${tab}"]`);
+    navTo(tab);
     assertPage(tab); // Deliberately before flushing promises or Suspense retries.
     await settle();
   }
-  click('[data-testid="nav-workspace"]');
+  navTo('workspace');
   assertPage('workspace');
   assert.equal(query('input'), draft);
   assert.equal(draft.value, 'keep this draft');
@@ -251,13 +250,11 @@ test('repeated settings switches remain immediate while workspace event updates 
   await start(t);
   for (let i = 0; i < 5; i += 1) {
     click('[data-testid="incoming-event"]');
-    click('[data-testid="workspace-navigation-trigger"]');
-    await settle();
-    click('[data-testid="nav-settings"]');
+    navTo('settings');
     assertPage('settings');
     click('[data-testid="incoming-event"]');
     assertPage('settings');
-    click('[data-testid="nav-workspace"]');
+    navTo('workspace');
     assertPage('workspace');
     await settle();
   }
