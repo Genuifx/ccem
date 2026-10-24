@@ -1666,6 +1666,23 @@ fn get_native_session_input_queue(
 }
 
 #[tauri::command]
+async fn steer_native_session_input_queue(
+    window: tauri::WebviewWindow,
+    app: tauri::AppHandle,
+    native_state: State<'_, Arc<NativeRuntimeManager>>,
+    runtime_id: String,
+    expected_command_id: String,
+) -> Result<String, String> {
+    if window.label() != "main" {
+        return Err("Native queued prompts can be steered only from the main workspace".into());
+    }
+    let native_state = Arc::clone(native_state.inner());
+    tauri::async_runtime::spawn_blocking(move ||
+        native_state.steer_queued_input(&app, &runtime_id, &expected_command_id))
+        .await.map_err(|error| format!("Native steer task failed: {error}"))?
+}
+
+#[tauri::command]
 async fn cancel_native_session_queued_input(
     window: tauri::WebviewWindow,
     native_state: State<'_, Arc<NativeRuntimeManager>>,
@@ -6130,6 +6147,7 @@ pub fn run_desktop_app() -> i32 {
             flush_native_session_input_queue,
             get_native_session_input_queue,
             cancel_native_session_queued_input,
+            steer_native_session_input_queue,
             respond_native_session_permission,
             respond_native_session_prompt,
             rewind_native_session_files,

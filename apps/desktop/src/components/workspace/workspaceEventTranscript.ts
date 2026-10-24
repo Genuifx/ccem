@@ -1489,7 +1489,7 @@ function foldTranscriptEvents(
         break;
       }
       case 'lifecycle': {
-        if (event.payload.stage === 'error') {
+        if (event.payload.stage === 'error' || event.payload.stage === 'steer_failed') {
           foldAppendErrorMessage(
             state,
             `runtime-error-${event.seq}`,

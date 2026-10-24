@@ -70,6 +70,7 @@ use tauri_plugin_shell::{
 
 mod browser_activation;
 mod terminal_handoff;
+mod steering;
 use terminal_handoff::TerminalHandoffPreparation;
 
 const NATIVE_STOP_GRACE_PERIOD: Duration = Duration::from_secs(10);
@@ -692,6 +693,14 @@ enum HelperInputCommand<'a> {
         client_message_ids: Option<&'a [String]>,
         #[serde(skip_serializing_if = "Option::is_none")]
         images: Option<&'a [PromptImage]>,
+    },
+    SteerPrompt {
+        command_id: &'a str,
+        expected_command_id: &'a str,
+        expected_query_generation: u64,
+        text: &'a str,
+        images: Option<&'a [Value]>,
+        client_message_ids: &'a [String],
     },
     PermissionResponse {
         request_id: &'a str,
@@ -1376,6 +1385,7 @@ fn helper_command_kind(command: &HelperInputCommand<'_>) -> &'static str {
     match command {
         HelperInputCommand::Init { .. } => "init",
         HelperInputCommand::Prompt { .. } => "prompt",
+        HelperInputCommand::SteerPrompt { .. } => "steer_prompt",
         HelperInputCommand::PermissionResponse { .. } => "permission_response",
         HelperInputCommand::InteractivePromptResponse { .. } => "interactive_prompt_response",
         HelperInputCommand::UpdateSettings { .. } => "update_settings",
@@ -1501,6 +1511,20 @@ fn helper_output_requests_queue_autodrain(line: &str) -> bool {
     })
 }
 
+fn helper_output_has_steer_receipt(line: &str) -> bool {
+    line.lines().map(str::trim).any(|entry| {
+        let Ok(value) = serde_json::from_str::<Value>(entry) else {
+            return false;
+        };
+        value.get("type").and_then(Value::as_str) == Some("event")
+            && value["payload"]["type"].as_str() == Some("lifecycle")
+            && matches!(
+                value["payload"]["stage"].as_str(),
+                Some("steer_admitted" | "steer_rejected")
+            )
+    })
+}
+
 fn helper_output_reports_initialization_failure(line: &str) -> bool {
     line.lines().map(str::trim).any(|entry| {
         let Ok(value) = serde_json::from_str::<Value>(entry) else {
@@ -1538,6 +1562,23 @@ fn lifecycle_transition_unblocked_queue(
             && after.adapter == AdapterKind::FullLifecycle.as_str()
             && after.active_command_id.is_none()
             && !after.settings_pending)
+}
+
+fn queue_head_transition_unblocked_queue(
+    before: Option<&crate::native_input_queue::QueuedNativeInput>,
+    after: Option<&crate::native_input_queue::QueuedNativeInput>,
+    lifecycle: Option<&NativeLifecycleProjection>,
+) -> bool {
+    let (Some(before), Some(after), Some(lifecycle)) = (before, after, lifecycle) else {
+        return false;
+    };
+    matches!(
+        before.delivery_state(),
+        QueuedInputDeliveryState::Dispatching | QueuedInputDeliveryState::DeliveryUncertain
+    ) && after.delivery_state() == QueuedInputDeliveryState::Pending
+        && lifecycle.adapter == AdapterKind::FullLifecycle.as_str()
+        && lifecycle.active_command_id.is_none()
+        && !lifecycle.settings_pending
 }
 
 fn spawn_queue_autodrain(dispatch: impl FnOnce() + Send + 'static) {
@@ -8107,6 +8148,11 @@ impl NativeRuntimeManager {
                         .ok_or_else(|| format!("lifecycle stage {stage} omitted command_id"))
                 };
                 match stage.as_str() {
+                    "steer_admitted" | "steer_rejected" => match (command(), generation()) {
+                        (Ok(id), Ok(generation)) => self.lifecycle.note_steer_receipt(
+                            runtime_id, helper_incarnation, id, generation, stage == "steer_admitted"),
+                        _ => LifecycleDecision::Ignored,
+                    },
                     "command_admitted" => match (command(), generation()) {
                         (Ok(command_id), Ok(generation)) => self.lifecycle.note_command_admitted(
                             runtime_id,
@@ -8326,6 +8372,10 @@ impl NativeRuntimeManager {
         {
             if let Some(command_id) = command_id.as_deref() {
                 let queue_changed = match stage.as_str() {
+                    "steer_admitted" if matches!(&decision, LifecycleDecision::Updated) =>
+                        self.project_admitted_queued_prompts(runtime_id, command_id),
+                    "steer_rejected" if matches!(&decision, LifecycleDecision::Updated) =>
+                        self.input_queue.confirm_rejected(runtime_id, command_id),
                     "command_rejected"
                         if matches!(&decision, LifecycleDecision::Released { .. }) =>
                     {
@@ -8460,10 +8510,29 @@ impl NativeRuntimeManager {
         }
         let defer_queue_autodrain = helper_output_defers_queue_autodrain(line);
         let request_queue_autodrain = helper_output_requests_queue_autodrain(line);
+        let has_steer_receipt = helper_output_has_steer_receipt(line);
+        // Queue snapshots may contain image payloads. Only steer receipts can
+        // heal this separate input lane, so avoid cloning them for other output.
+        let queue_before = if has_steer_receipt {
+            self.input_queue.peek(runtime_id)
+        } else {
+            None
+        };
         let initialization_failed = helper_output_reports_initialization_failure(line);
         let before = self.lifecycle.projection(runtime_id);
         let result = self.process_helper_stdout_with_app(app, runtime_id, line, handle.generation);
         let after = self.lifecycle.projection(runtime_id);
+        let queue_after = if has_steer_receipt {
+            self.input_queue.peek(runtime_id)
+        } else {
+            None
+        };
+        let steer_receipt_unblocked_queue = result.is_ok()
+            && queue_head_transition_unblocked_queue(
+                queue_before.as_ref(),
+                queue_after.as_ref(),
+                after.as_ref(),
+            );
         if initialization_failed {
             let dropped = self.input_queue.clear(runtime_id);
             if dropped > 0 {
@@ -8502,6 +8571,7 @@ impl NativeRuntimeManager {
         }
         if let Some(app) = app.filter(|_| {
             request_queue_autodrain
+                || steer_receipt_unblocked_queue
                 || (!defer_queue_autodrain
                     && lifecycle_transition_unblocked_queue(before.as_ref(), after.as_ref()))
         }) {

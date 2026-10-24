@@ -94,6 +94,7 @@ commands.allow = [
   "reject_native_browser_activation",
   "send_native_session_input",
   "flush_native_session_input_queue",
+  "steer_native_session_input_queue",
   "get_native_session_input_queue",
   "cancel_native_session_queued_input",
   "respond_native_session_permission",

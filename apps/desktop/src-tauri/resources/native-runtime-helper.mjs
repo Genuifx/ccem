@@ -45188,6 +45188,81 @@ var InputOperation = class {
   }
 };
 
+// src/claudeSteering.ts
+var ClaudeSteering = class {
+  inputs = /* @__PURE__ */ new Map();
+  roots = /* @__PURE__ */ new Map();
+  results = /* @__PURE__ */ new Set();
+  deferredTerminal = null;
+  add(id, parent) {
+    this.inputs.set(id, { parent, terminal: false, needsResult: false });
+    if (!this.roots.has(parent)) this.roots.set(parent, { terminal: false, outputTokens: 0, hasUsage: false, cancelledByStop: false });
+  }
+  get(id) {
+    return this.inputs.get(id);
+  }
+  hasPending(parent) {
+    return [...this.inputs.values()].some((input) => input.parent === parent && !input.terminal);
+  }
+  noteRootTerminal(parent) {
+    const root = this.roots.get(parent);
+    if (root) root.terminal = true;
+    for (const input of this.inputs.values()) {
+      if (input.parent === parent && !input.terminal) input.needsResult = true;
+    }
+  }
+  noteChildTerminal(id, state, interruptRequested) {
+    const input = this.inputs.get(id);
+    if (!input) return;
+    input.terminal = true;
+    if (state !== "completed") input.needsResult = false;
+    if (state === "cancelled" && interruptRequested) this.roots.get(input.parent).cancelledByStop = true;
+  }
+  wasCancelledByStop(parent) {
+    return this.roots.get(parent)?.cancelledByStop === true;
+  }
+  noteResult(id) {
+    if (this.results.has(id)) return false;
+    this.results.add(id);
+    if (this.results.size > 128) this.results.delete(this.results.values().next().value);
+    return true;
+  }
+  addUsage(parent, outputTokens) {
+    const root = this.roots.get(parent);
+    if (!root) return false;
+    root.outputTokens += outputTokens;
+    root.hasUsage = true;
+    return true;
+  }
+  completedOutputTokens(parent) {
+    const root = this.roots.get(parent);
+    if (!root?.terminal || !root.hasUsage) return null;
+    for (const [id, input] of this.inputs) {
+      if (input.parent === parent && (!input.terminal || input.needsResult && !this.results.has(id))) return null;
+    }
+    return root.outputTokens;
+  }
+  clear() {
+    this.inputs.clear();
+    this.roots.clear();
+    this.results.clear();
+    this.deferredTerminal = null;
+  }
+  prune() {
+    if (this.inputs.size <= 64) return;
+    for (const [id, input] of this.inputs) {
+      if (input.terminal && this.roots.get(input.parent)?.terminal && (!input.needsResult || this.results.has(id))) this.inputs.delete(id);
+      if (this.inputs.size <= 64) break;
+    }
+    if (this.roots.size > 64) {
+      for (const [id, root] of this.roots) {
+        if (root.terminal && ![...this.inputs.values()].some((input) => input.parent === id)) this.roots.delete(id);
+        if (this.roots.size <= 64) break;
+      }
+    }
+  }
+};
+
 // src/codexTurnUsage.ts
 import fs9 from "node:fs";
 import path11 from "node:path";
@@ -45425,6 +45500,7 @@ var claudeForegroundPromptUuid = null;
 var claudeInputOperation = null;
 var claudeInputResultCorrelated = false;
 var promptInputOperations = /* @__PURE__ */ new WeakMap();
+var claudeSteering = new ClaudeSteering();
 var claudeForegroundPromptAccepted = false;
 var claudeForegroundCommand = null;
 var claudeIngressOriginKind = null;
@@ -45449,7 +45525,6 @@ var resolveClaudeInitialization = null;
 var claudeInitializationBarrier = Promise.resolve();
 var claudeTerminalCommandIds = /* @__PURE__ */ new Set();
 var claudeUsageOperations = /* @__PURE__ */ new Map();
-var claudeObservedResultCommandIds = /* @__PURE__ */ new Set();
 var claudeSeenNonHumanResultKeys = /* @__PURE__ */ new Set();
 var pendingClaudePromptReplay = null;
 var claudeSeenMessageIds = /* @__PURE__ */ new Set();
@@ -45567,7 +45642,7 @@ function emitSessionMeta(providerSessionId) {
     provider_session_id: providerSessionId,
     ...claudeMeta ? {
       query_generation: claudeQueryGeneration,
-      ...claudeSdkCapabilities === void 0 ? {} : { capabilities: claudeSdkCapabilities }
+      ...claudeSdkCapabilities === void 0 ? {} : { capabilities: claudeSdkCapabilities.includes("msg_lifecycle_v1") && currentClaudeQuery && claudeQueuedInterruptAdapter(currentClaudeQuery) ? [...claudeSdkCapabilities, "ccem_steer_v1"] : claudeSdkCapabilities }
     } : {}
   });
 }
@@ -45625,6 +45700,7 @@ function emitClaudeInteractiveResolverExpired(toolUseId, pending, command) {
   });
 }
 function beginClaudeLifecycleGeneration() {
+  claudeSteering.clear();
   for (const [toolUseId, pending] of pendingClaudeInteractivePrompts.entries()) {
     if (pending.queryGeneration === claudeQueryGeneration) {
       continue;
@@ -45649,12 +45725,12 @@ function beginClaudeLifecycleGeneration() {
   claudeAuthoritativeTerminalCommandId = null;
   claudeTerminalCommandIds.clear();
   claudeUsageOperations.clear();
-  claudeObservedResultCommandIds.clear();
   if (currentProviderSessionId) {
     emitSessionMeta(currentProviderSessionId);
   }
 }
 function armClaudeLifecycleTerminalTimer(commandId, reason) {
+  if (claudeSteering.deferredTerminal) return;
   clearClaudeLifecycleTerminalTimer();
   const generation = claudeQueryGeneration;
   claudeLifecycleTerminalTimer = setTimeout(() => {
@@ -45716,6 +45792,45 @@ function processNegotiatedClaudeSdkCommandLifecycle(frame) {
     return;
   }
   const state = frame.state;
+  const steered = claudeSteering.get(frame.commandId);
+  if (steered) {
+    if (steered.terminal) return;
+    emitEvent({
+      type: "lifecycle",
+      stage: "steer_command_state",
+      detail: state,
+      command_id: frame.commandId,
+      query_generation: claudeQueryGeneration
+    });
+    if (CLAUDE_SDK_TERMINAL_STATES.has(state)) {
+      claudeSteering.noteChildTerminal(frame.commandId, state, claudeInterruptRequested);
+      if (state !== "completed" && !(state === "cancelled" && claudeInterruptRequested)) {
+        emitEvent({
+          type: "lifecycle",
+          stage: "steer_failed",
+          detail: `Claude steer ${frame.commandId} was ${state}; the message was not automatically retried.`,
+          command_id: frame.commandId,
+          query_generation: claudeQueryGeneration
+        });
+      }
+      recordCompletedClaudeSteerUsage(steered.parent);
+      const deferred = claudeSteering.deferredTerminal;
+      if (deferred && !claudeSteering.hasPending(deferred.commandId)) {
+        claudeSteering.deferredTerminal = null;
+        processNegotiatedClaudeSdkCommandLifecycle(deferred);
+      }
+      claudeSteering.prune();
+    }
+    return;
+  }
+  if (matchingForeground && CLAUDE_SDK_TERMINAL_STATES.has(state)) {
+    claudeSteering.noteRootTerminal(frame.commandId);
+  }
+  if (matchingForeground && CLAUDE_SDK_TERMINAL_STATES.has(state) && claudeSteering.hasPending(frame.commandId)) {
+    claudeSteering.deferredTerminal = frame;
+    clearClaudeLifecycleTerminalTimer();
+    return;
+  }
   emitEvent({
     type: "lifecycle",
     stage: "sdk_command_state",
@@ -45921,7 +46036,7 @@ function isCurrentClaudeHumanPromptEcho(message) {
   }
   const messageUuid = message?.uuid;
   if (typeof messageUuid === "string" && claudeForegroundPromptUuid) {
-    return messageUuid === claudeForegroundPromptUuid;
+    return messageUuid === claudeForegroundPromptUuid || claudeSteering.get(messageUuid)?.parent === claudeForegroundPromptUuid;
   }
   return true;
 }
@@ -45954,7 +46069,7 @@ function isForegroundClaudeResult(message) {
   }
   const resultPromptUuid = message?.user_message_uuid;
   if (typeof resultPromptUuid === "string" && claudeForegroundPromptUuid) {
-    return resultPromptUuid === claudeForegroundPromptUuid;
+    return resultPromptUuid === claudeForegroundPromptUuid || claudeSteering.get(resultPromptUuid)?.parent === claudeForegroundPromptUuid;
   }
   if (originKind === "human") {
     return claudeForegroundPromptAccepted;
@@ -45998,12 +46113,22 @@ async function withTimeout(promise2, ms, message) {
     }
   }
 }
+function claudeQueuedInterruptAdapter(claudeQuery) {
+  const adapter = claudeQuery;
+  return claudeSdkCapabilities?.includes("interrupt_cancel_queued_v1") && typeof adapter.request === "function" ? adapter : null;
+}
 async function interruptClaudeWithTimeout(claudeQuery) {
   const timeoutMs = resolveClaudeInterruptTimeoutMs(
     process5.env.CCEM_NATIVE_CLAUDE_INTERRUPT_TIMEOUT_MS
   );
+  const parent = claudeForegroundPromptUuid;
+  const adapter = parent && claudeSteering.hasPending(parent) ? claudeQueuedInterruptAdapter(claudeQuery) : null;
+  if (adapter) {
+    await new Promise((resolve2) => setImmediate(resolve2));
+    if (claudeForegroundPromptUuid !== parent) return;
+  }
   return withTimeout(
-    claudeQuery.interrupt(),
+    adapter ? adapter.request({ subtype: "interrupt", cancel_queued: true }) : claudeQuery.interrupt(),
     timeoutMs,
     `Claude interrupt timed out after ${timeoutMs}ms`
   );
@@ -46213,13 +46338,21 @@ function rememberClaudeCommandId(set2, commandId) {
     set2.delete(oldest);
   }
 }
+function recordCompletedClaudeSteerUsage(commandId) {
+  const tokens = claudeSteering.completedOutputTokens(commandId);
+  if (tokens !== null) claudeUsageOperations.get(commandId)?.recordOutputTokens(tokens);
+}
 function emitClaudeResultUsage(message, commandId) {
   const record3 = message;
   if (!record3.usage) {
     return;
   }
   if (commandId && record3.subtype === "success" && !record3.is_error) {
-    claudeUsageOperations.get(commandId)?.recordOutputTokens(record3.usage.output_tokens);
+    if (typeof record3.usage.output_tokens === "number" && claudeSteering.addUsage(commandId, record3.usage.output_tokens)) {
+      recordCompletedClaudeSteerUsage(commandId);
+    } else {
+      claudeUsageOperations.get(commandId)?.recordOutputTokens(record3.usage.output_tokens);
+    }
   }
   const outputTokens = typeof record3.usage.output_tokens === "number" ? record3.usage.output_tokens : 0;
   emitEvent({
@@ -46242,10 +46375,6 @@ function claudeResultObservation(message) {
   };
 }
 function observeLateClaudeTurnResult(commandId, detail, failed) {
-  if (claudeObservedResultCommandIds.has(commandId)) {
-    return false;
-  }
-  rememberClaudeCommandId(claudeObservedResultCommandIds, commandId);
   emitEvent({
     type: "lifecycle",
     stage: "turn_result_observed",
@@ -46299,21 +46428,23 @@ function finishClaudeFullLifecycleTurn(state, commandId) {
   }
   const observation = claudeTurnResultObservation;
   const interruptedByRequest = claudeInterruptRequested;
+  const interrupted = interruptedByRequest && (state !== "completed" || claudeSteering.wasCancelledByStop(commandId));
+  recordCompletedClaudeSteerUsage(commandId);
   claudeTurnCompletionEmitted = true;
   claudeAuthoritativeTerminalCommandId = commandId;
   rememberClaudeCommandId(claudeTerminalCommandIds, commandId);
   claudeInputOperation?.observe(
-    state === "completed" && !(claudeInputResultCorrelated && observation?.failed) ? "completed" : "failed",
+    state === "completed" && !interrupted && !(claudeInputResultCorrelated && observation?.failed) ? "completed" : "failed",
     claudeInputResultCorrelated && observation?.detail || `Claude SDK command ${state}.`
   );
   clearClaudeForegroundOwnership();
   claudeInterruptRequested = false;
-  if (interruptedByRequest && state !== "completed" && !claudeInterruptCompletionEmitted) {
+  if (interrupted && !claudeInterruptCompletionEmitted) {
     claudeInterruptCompletionEmitted = true;
     emitEvent({
       type: "lifecycle",
       stage: "turn_interrupted",
-      detail: `Claude command ${state} after the interrupt request.`,
+      detail: `Claude turn interrupted; command ${state}, pending steer cancelled: ${claudeSteering.wasCancelledByStop(commandId)}.`,
       query_generation: claudeQueryGeneration,
       command_id: commandId,
       user_message_uuid: commandId,
@@ -46345,7 +46476,7 @@ function finishClaudeFullLifecycleTurn(state, commandId) {
     emitStatus("processing", "Settings will apply to the next Claude runtime.");
     return true;
   }
-  const detail = interruptedByRequest && state !== "completed" ? "Turn interrupted. Ready for the next prompt." : state === "completed" ? "Ready for the next prompt." : `Claude command ${state}. Ready for the next prompt.`;
+  const detail = interrupted ? "Turn interrupted. Ready for the next prompt." : state === "completed" ? "Ready for the next prompt." : `Claude command ${state}. Ready for the next prompt.`;
   emitStatus("ready", detail);
   scheduleClaudeIdleClose();
   return true;
@@ -46356,7 +46487,6 @@ function observeClaudeTurnResult(detail, failed) {
     return false;
   }
   claudeTurnResultObservation = { commandId, detail, failed };
-  rememberClaudeCommandId(claudeObservedResultCommandIds, commandId);
   emitEvent({
     type: "lifecycle",
     stage: "turn_result_observed",
@@ -47967,15 +48097,17 @@ async function consumeClaudeMessages() {
         }
         const resultOriginKind = claudeMessageOriginKind(message);
         const resultPromptUuid = message.user_message_uuid;
-        const correlatedCommandId = typeof resultPromptUuid === "string" && resultPromptUuid.trim() ? resultPromptUuid.trim() : null;
+        const resultCommandId = typeof resultPromptUuid === "string" && resultPromptUuid.trim() ? resultPromptUuid.trim() : null;
+        const correlatedCommandId = resultCommandId ? claudeSteering.get(resultCommandId)?.parent ?? resultCommandId : null;
         const resultObservation = claudeResultObservation(message);
         if (claudeLifecycleMode === "full" && correlatedCommandId && claudeTerminalCommandIds.has(correlatedCommandId) && (!resultOriginKind || resultOriginKind === "human") && !claudeMessageParentToolUseId(message)) {
-          const firstObservation = observeLateClaudeTurnResult(
+          if (!claudeSteering.noteResult(resultCommandId)) continue;
+          observeLateClaudeTurnResult(
             correlatedCommandId,
             resultObservation.detail,
             resultObservation.failed
           );
-          if (firstObservation) emitClaudeResultUsage(message, correlatedCommandId);
+          emitClaudeResultUsage(message, correlatedCommandId);
           continue;
         }
         if (claudeLifecycleMode === "full" && !correlatedCommandId && resultOriginKind === "human" && claudeTerminalCommandIds.size > 0) {
@@ -48015,9 +48147,8 @@ async function consumeClaudeMessages() {
         claudePendingNonHumanResultCount = 0;
         pendingClaudePromptReplay = null;
         claudeForegroundPromptAccepted = true;
-        if (!correlatedCommandId || !claudeObservedResultCommandIds.has(correlatedCommandId)) {
-          emitClaudeResultUsage(message, correlatedCommandId);
-        }
+        if (resultCommandId && !claudeSteering.noteResult(resultCommandId)) continue;
+        emitClaudeResultUsage(message, correlatedCommandId);
         claudeInputResultCorrelated = correlatedCommandId === claudeForegroundPromptUuid;
         observeClaudeTurnResult(resultObservation.detail, resultObservation.failed);
         finishClaudeLegacyTurnAfterIdle();
@@ -48162,6 +48293,23 @@ async function ensureClaudePromptQueueReady() {
     await ensureClaudeSession();
   }
 }
+function buildClaudeUserContent(text, images) {
+  const parts = buildPromptContentParts(text, images);
+  const hasImages = parts.some((part) => part.type === "image");
+  return hasImages ? parts.map((part) => {
+    if (part.type === "text") {
+      return { type: "text", text: part.text };
+    }
+    return {
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: part.image.mediaType,
+        data: part.image.base64Data
+      }
+    };
+  }) : text.trim();
+}
 function enqueueClaudePrompt(text, images, commandId, legacyReplayMessageId, operation) {
   if (!claudeInputQueue) {
     throw new Error("Claude streaming input queue is not ready");
@@ -48189,21 +48337,7 @@ function enqueueClaudePrompt(text, images, commandId, legacyReplayMessageId, ope
   claudeForegroundCoordinatorStamped = coordinatorStamped;
   claudeForegroundPromptAccepted = false;
   claudeForegroundCommand = /^\/compact(?:\s|$)/iu.test(text.trim()) ? "compact" : null;
-  const parts = buildPromptContentParts(text, images);
-  const hasImages = parts.some((part) => part.type === "image");
-  const content = hasImages ? parts.map((part) => {
-    if (part.type === "text") {
-      return { type: "text", text: part.text };
-    }
-    return {
-      type: "image",
-      source: {
-        type: "base64",
-        media_type: part.image.mediaType,
-        data: part.image.base64Data
-      }
-    };
-  }) : text.trim();
+  const content = buildClaudeUserContent(text, images);
   resetClaudeTurnTracking();
   claudeInputQueue.push({
     type: "user",
@@ -48226,6 +48360,42 @@ function enqueueClaudePrompt(text, images, commandId, legacyReplayMessageId, ope
     query_generation: claudeQueryGeneration
   });
   emitStatus("processing", "Claude is processing a turn.");
+}
+function steerClaudePrompt(command) {
+  const receipt = (stage, detail) => emitEvent({
+    type: "lifecycle",
+    stage,
+    detail,
+    command_id: command.command_id,
+    query_generation: claudeQueryGeneration
+  });
+  if (claudeSteering.get(command.command_id)?.parent === command.expected_command_id && command.expected_query_generation === claudeQueryGeneration) {
+    receipt("steer_admitted", command.expected_command_id);
+    return;
+  }
+  if (initCommand?.provider !== "claude" || claudeLifecycleMode !== "full" || !claudeInputQueue || !currentClaudeQuery || !claudeQueuedInterruptAdapter(currentClaudeQuery) || stopped || runtimeTeardownPreparationId || claudeInterruptRequested || pendingSettings || claudeForegroundCommand || !claudeTurnAwaitingResult || !claudeForegroundPromptAccepted || claudeTurnResultObservation || claudeSteering.deferredTerminal || command.expected_command_id !== claudeForegroundPromptUuid || command.expected_query_generation !== claudeQueryGeneration || !command.command_id || command.command_id === claudeForegroundPromptUuid || command.text.trim().startsWith("/") || !command.text.trim() && !command.images?.length) {
+    receipt("steer_rejected", "Steer is unavailable for this foreground command; input was not sent.");
+    return;
+  }
+  try {
+    claudeInputQueue.push({
+      type: "user",
+      uuid: command.command_id,
+      priority: "next",
+      origin: { kind: "human" },
+      parent_tool_use_id: null,
+      message: { role: "user", content: buildClaudeUserContent(command.text, command.images) }
+    });
+    claudeSteering.add(command.command_id, command.expected_command_id);
+    for (const id of command.client_message_ids ?? []) {
+      if (claudeInputOperation && !claudeInputOperation.clientMessageIds.includes(id)) {
+        claudeInputOperation.clientMessageIds.push(id);
+      }
+    }
+    receipt("steer_admitted", command.expected_command_id);
+  } catch (error48) {
+    receipt("steer_rejected", String(error48));
+  }
 }
 function emitClaudeCommandRejected(commandId, detail) {
   emitEvent({
@@ -49225,6 +49395,10 @@ async function handleCommand(command) {
         );
       }
     });
+    return;
+  }
+  if (command.type === "steer_prompt") {
+    steerClaudePrompt(command);
     return;
   }
   if (command.type === "prompt") {

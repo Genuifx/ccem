@@ -50,6 +50,7 @@ fn trusted_app_acl_manifest_includes_environment_router_references() {
     for command in ["hermes_status", "hermes_action", "hermes_notification_targets"] {
         assert!(allowed.iter().any(|entry| entry.as_str() == Some(command)));
     }
+    assert!(allowed.iter().any(|entry| entry.as_str() == Some("steer_native_session_input_queue")));
 }
 
 fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
@@ -122,6 +123,7 @@ fn remote_browser_child_webview_cannot_invoke_app_or_plugin_commands() {
         for command in [
             "greet",
             "get_environment_router_references",
+            "steer_native_session_input_queue",
             "hermes_status",
             "hermes_notification_targets",
             "hermes_action",

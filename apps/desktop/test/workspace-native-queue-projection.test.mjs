@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import ts from 'typescript';
+import { build } from 'esbuild';
 import { pathToFileURL } from 'node:url';
 
 const desktopDir = path.resolve(import.meta.dirname, '..');
@@ -44,6 +45,22 @@ function snapshot(overrides = {}) {
     delivery_state: 'pending',
     ...overrides,
   };
+}
+
+async function importTranscript(t) {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-steer-queue-transcript-'));
+  t.after(() => fs.rm(tempDir, { recursive: true, force: true }));
+  const outfile = path.join(tempDir, 'transcript.mjs');
+  await build({
+    entryPoints: [path.join(desktopDir, 'src', 'components', 'workspace', 'workspaceEventTranscript.ts')],
+    outfile,
+    bundle: true,
+    platform: 'node',
+    format: 'esm',
+    target: 'node20',
+    logLevel: 'silent',
+  });
+  return import(pathToFileURL(outfile).href);
 }
 
 test('queue reconciliation tracks delivery state and preserves rich optimistic payloads', async () => {
@@ -236,4 +253,55 @@ test('an idle send dispatching through the backend queue stays in the transcript
     isTerminal: false,
   });
   assert.equal(uncertain[0].queuedBehindTurn, true, 'an uncertain delivery still surfaces in the dock');
+});
+
+test('steer admission removes the dock row once while the same root remains active', async (t) => {
+  const { reconcileNativeQueuedPrompts, partitionNativeQueuedPromptPresentation } = await importProjection();
+  const { filterConfirmedLocalUserPrompts, buildMessagesFromEvents, dedupeEvents } = await importTranscript(t);
+  const activeCommandId = 'running-root';
+  const prompt = localPrompt({ id: 'steer-client', text: '本轮请确认 STEER_ACK', afterEventSeq: 10 });
+  let local = reconcileNativeQueuedPrompts([prompt], [snapshot({
+    client_message_id: prompt.id,
+    display_text: prompt.text,
+    delivery_state: 'dispatching',
+  })], { activeCommandId, expectedQueueCount: 1, isTerminal: false });
+  assert.equal(partitionNativeQueuedPromptPresentation(local).composerQueuedMessages.length, 1);
+  assert.equal(partitionNativeQueuedPromptPresentation(local).transcriptPrompts.length, 0);
+
+  const acceptedEvents = [{
+    runtime_id: 'runtime-1', seq: 11, occurred_at: '2026-05-01T00:00:11.000Z',
+    payload: { type: 'user_prompt', text: prompt.text, image_count: 0, client_message_id: prompt.id },
+  }, {
+    runtime_id: 'runtime-1', seq: 12, occurred_at: '2026-05-01T00:00:12.000Z',
+    payload: { type: 'lifecycle', stage: 'steer_admitted', command_id: 'steer-wire',
+      detail: activeCommandId, query_generation: 1 },
+  }];
+  const sameRootSnapshot = { activeCommandId, expectedQueueCount: 0, isTerminal: false,
+    observedClientMessageIds: new Set([prompt.id]) };
+  const beforeReactCommit = reconcileNativeQueuedPrompts(local, [], sameRootSnapshot);
+  assert.equal(beforeReactCommit, local, 'transport observation keeps the row until its persisted prompt reaches the renderer');
+
+  local = filterConfirmedLocalUserPrompts(beforeReactCommit, acceptedEvents);
+  assert.deepEqual(partitionNativeQueuedPromptPresentation(local).composerQueuedMessages, []);
+  assert.deepEqual(partitionNativeQueuedPromptPresentation(local).transcriptPrompts, []);
+  for (let replay = 0; replay < 2; replay += 1) {
+    const repeated = filterConfirmedLocalUserPrompts(
+      reconcileNativeQueuedPrompts(local, [], sameRootSnapshot), acceptedEvents,
+    );
+    assert.equal(repeated, local, 'repeated ACK/snapshot observation cannot resurrect or remove another row');
+    const messages = buildMessagesFromEvents([], repeated, dedupeEvents([...acceptedEvents, ...acceptedEvents]));
+    const userMessages = messages.filter((message) => message.msgType === 'user');
+    assert.equal(userMessages.length, 1);
+    assert.equal(userMessages[0].content, prompt.text);
+    assert.equal(userMessages[0].uuid, 'user-prompt-11');
+  }
+
+  // A stale queue snapshot can still arrive after the prompt event. The same
+  // reconcile-then-confirm order used by the view must keep the dock empty.
+  const staleSnapshot = reconcileNativeQueuedPrompts(local, [snapshot({
+    client_message_id: prompt.id, display_text: prompt.text, delivery_state: 'dispatching',
+  })], { activeCommandId, expectedQueueCount: 1, isTerminal: false });
+  const confirmed = filterConfirmedLocalUserPrompts(staleSnapshot, acceptedEvents);
+  assert.deepEqual(partitionNativeQueuedPromptPresentation(confirmed).composerQueuedMessages, []);
+  assert.equal(buildMessagesFromEvents([], confirmed, acceptedEvents).filter((message) => message.msgType === 'user').length, 1);
 });

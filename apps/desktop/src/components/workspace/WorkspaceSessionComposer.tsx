@@ -644,7 +644,12 @@ function ComposerQueueDock({
   const { t } = useLocale();
   const rootRef = useRef<HTMLDivElement | null>(null);
   const seenActiveIdsRef = useRef<Set<string> | null>(null);
-  const leavingIdsRef = useRef(new Set<string>());
+  const leavingRowsRef = useRef(new Map<string, () => void>());
+
+  useLayoutEffect(() => () => {
+    leavingRowsRef.current.forEach((cancel) => cancel());
+    leavingRowsRef.current.clear();
+  }, []);
 
   useLayoutEffect(() => {
     const root = rootRef.current;
@@ -655,6 +660,15 @@ function ComposerQueueDock({
       ...root.querySelectorAll<HTMLElement>('[data-ccem-composer-queued-message]'),
     ].find((element) => element.dataset.ccemComposerQueuedMessage === id) ?? null;
     const activeIds = rows.filter((row) => !row.leaving).map((row) => row.message.id);
+    for (const id of activeIds) {
+      const cancel = leavingRowsRef.current.get(id);
+      if (cancel) {
+        cancel();
+        leavingRowsRef.current.delete(id);
+        const element = rowElement(id);
+        if (element) gsap.set(element, { clearProps: 'height,opacity,visibility,transform' });
+      }
+    }
     const seen = seenActiveIdsRef.current;
     const entered = activeIds.filter((id) => !seen?.has(id));
     seenActiveIdsRef.current = new Set(activeIds);
@@ -681,17 +695,19 @@ function ComposerQueueDock({
 
     for (const row of rows) {
       const id = row.message.id;
-      if (!row.leaving || leavingIdsRef.current.has(id)) {
+      if (!row.leaving || leavingRowsRef.current.has(id)) {
         continue;
       }
       const element = rowElement(id);
-      leavingIdsRef.current.add(id);
+      leavingRowsRef.current.set(id, () => {});
       const done = () => {
-        leavingIdsRef.current.delete(id);
+        leavingRowsRef.current.delete(id);
         onRowLeft(id);
       };
       if (element) {
-        animateQueueRowLeave(element, done);
+        const cancel = animateQueueRowLeave(element, done);
+        // Reduced motion completes synchronously before a cleanup is stored.
+        if (leavingRowsRef.current.has(id)) leavingRowsRef.current.set(id, cancel);
       } else {
         done();
       }

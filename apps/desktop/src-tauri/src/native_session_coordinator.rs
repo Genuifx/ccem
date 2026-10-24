@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 mod control_ops;
 mod projection_ops;
+mod steer_ops;
+pub use steer_ops::SteerState;
 
 pub const MSG_LIFECYCLE_CAPABILITY: &str = "msg_lifecycle_v1";
 pub const GENERIC_READY_STATUS: &str = "ready";
@@ -228,6 +230,7 @@ struct SessionCoordination {
     adapter: AdapterKind,
     capabilities: Vec<String>,
     active: Option<ActiveCommand>,
+    steer: Option<steer_ops::SteerAdmission>,
     last_terminal: Option<CommandFence>,
     last_reset: Option<CommandFence>,
     pending_settings: Option<PendingSettingsOp>,
@@ -252,6 +255,7 @@ impl SessionCoordination {
             adapter: AdapterKind::Negotiating,
             capabilities: Vec::new(),
             active: None,
+            steer: None,
             last_terminal: None,
             last_reset: None,
             pending_settings: None,
@@ -298,6 +302,7 @@ pub struct NativeSessionCoordinator {
     inner: Mutex<HashMap<String, SessionCoordination>>,
     settings_signal: Condvar,
     interactive_signal: Condvar,
+    steer_signal: Condvar,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
