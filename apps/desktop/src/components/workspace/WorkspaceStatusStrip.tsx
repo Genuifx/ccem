@@ -190,17 +190,28 @@ export function WorkspaceStatusStrip({
           >
             <PanelLeft className="h-[15px] w-[15px]" />
           </button>
-          {sidebarCollapsed && onNewSession ? (
-            <button
-              type="button"
-              data-ccem-workspace-new-session="true"
-              aria-label={t('workspace.newSession')}
-              title={t('workspace.newSession')}
-              onClick={onNewSession}
-              className={SIDEBAR_ICON_BUTTON_CLASS}
+          {onNewSession ? (
+            // Always mounted: the slot's width animates 0 <-> 28px so the
+            // capsules after it slide instead of jumping on collapse/expand.
+            <div
+              aria-hidden={!sidebarCollapsed}
+              className={cn(
+                'flex shrink-0 overflow-hidden transition-[width,opacity] [transition-duration:var(--duration-base)] [transition-timing-function:var(--ease-default)] motion-reduce:transition-none',
+                sidebarCollapsed ? 'w-7 opacity-100' : 'pointer-events-none w-0 opacity-0',
+              )}
             >
-              <SquarePen className="h-[15px] w-[15px]" />
-            </button>
+              <button
+                type="button"
+                data-ccem-workspace-new-session="true"
+                aria-label={t('workspace.newSession')}
+                title={t('workspace.newSession')}
+                tabIndex={sidebarCollapsed ? undefined : -1}
+                onClick={onNewSession}
+                className={SIDEBAR_ICON_BUTTON_CLASS}
+              >
+                <SquarePen className="h-[15px] w-[15px]" />
+              </button>
+            </div>
           ) : null}
         </div>
       ) : null}

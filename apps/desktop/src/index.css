@@ -651,7 +651,7 @@
 
 .app-titlebar-row,
 .workspace-status-strip {
-  transition: padding-left var(--duration-normal) var(--ease-decelerate);
+  transition: padding-left var(--duration-base) var(--ease-default);
 }
 
 :root {
