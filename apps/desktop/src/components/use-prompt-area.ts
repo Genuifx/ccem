@@ -38,6 +38,7 @@ import {
   getDirectChildContaining,
   indexOfChildNode,
   normalizeEditorDOM,
+  removeEmptyEditorPlaceholderBR,
   normalizePromptAreaSentinels,
   syncTrailingSentinel,
   decorateURLsInEditor,
@@ -507,6 +508,7 @@ export function usePromptArea({
     if (editor) {
       // Normalize browser-inserted block elements (div, p, font, a, etc.)
       editorDomChanged = normalizeEditorDOM(editor)
+      editorDomChanged = removeEmptyEditorPlaceholderBR(editor) || editorDomChanged
       editorDomChanged = syncTrailingSentinel(editor) || editorDomChanged
     }
 

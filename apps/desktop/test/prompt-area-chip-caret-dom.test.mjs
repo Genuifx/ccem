@@ -123,6 +123,28 @@ async function importHarness() {
                 input(editor, 'insertText', text);
               });
             },
+            // WebKit's Cmd+Delete on the only line can leave a placeholder <br>
+            // in the emptied editor instead of removing every child.
+            deleteLineLeavingPlaceholderBr() {
+              act(() => {
+                editor.focus();
+                while (editor.firstChild) editor.removeChild(editor.firstChild);
+                editor.appendChild(document.createElement('br'));
+                setCaret(editor, 0);
+                input(editor, 'deleteSoftLineBackward');
+              });
+            },
+            placeCaretAtEnd() {
+              act(() => {
+                editor.focus();
+                setCaret(editor, editor.childNodes.length);
+              });
+            },
+            pressShiftEnter() {
+              act(() => {
+                editor.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', shiftKey: true, bubbles: true, cancelable: true }));
+              });
+            },
             placeCaretAtStartOfTextAfterFirstChip() {
               act(() => {
                 editor.focus();
@@ -426,4 +448,41 @@ test('arrow left from the trailing sentinel crosses the chip in one press', asyn
   assert.ok(selection.anchorNode === promptArea.editor.firstChild, 'caret lands before the chip, not on the invisible anchor');
   assert.equal(selection.anchorOffset, '先看 '.length);
   assert.equal(promptArea.getPlainText(), '先看 /dev-desktop');
+});
+
+test('Cmd+Delete leaving a WebKit placeholder <br> keeps the caret on the first line', async (t) => {
+  const { container, restore } = installDom();
+  let promptArea;
+  t.after(() => {
+    promptArea?.unmount();
+    restore();
+  });
+
+  const importedHarness = await getImportedHarness();
+  promptArea = importedHarness.harness.mount(container, [{ type: 'text', text: 'hello' }]);
+
+  promptArea.deleteLineLeavingPlaceholderBr();
+
+  assert.equal(promptArea.getPlainText(), '', 'an emptied editor must not become a newline');
+  assert.equal(promptArea.editor.querySelector('[data-sentinel="true"]'), null, 'no second-line caret anchor');
+  assert.equal(promptArea.editor.querySelector('br'), null);
+});
+
+test('Shift+Enter in an empty editor still inserts a real newline', async (t) => {
+  const { container, restore } = installDom();
+  let promptArea;
+  t.after(() => {
+    promptArea?.unmount();
+    restore();
+  });
+
+  const importedHarness = await getImportedHarness();
+  promptArea = importedHarness.harness.mount(container, []);
+
+  promptArea.placeCaretAtEnd();
+  promptArea.pressShiftEnter();
+
+  assert.equal(promptArea.getPlainText(), '\n');
+  assert.ok(promptArea.editor.querySelector('br'));
+  assert.ok(promptArea.editor.querySelector('[data-sentinel="true"]'), 'a typed trailing newline keeps its caret anchor');
 });

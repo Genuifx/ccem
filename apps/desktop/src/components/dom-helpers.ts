@@ -260,6 +260,28 @@ export function syncTrailingSentinel(editor: HTMLElement): boolean {
 }
 
 /**
+ * WebKit can leave a placeholder <br> after a native delete empties the editor
+ * (e.g. Cmd+Delete on the only line). Typed newlines always render as
+ * <br> + sentinel, so a lone <br> means "empty"; keeping it would turn into a
+ * "\n" segment and a second-line caret anchor.
+ */
+export function removeEmptyEditorPlaceholderBR(editor: HTMLElement): boolean {
+  let br: Node | null = null
+  for (let i = 0; i < editor.childNodes.length; i++) {
+    const child = editor.childNodes[i]
+    if (isBRElement(child) && !br) {
+      br = child
+      continue
+    }
+    if (isTextNode(child) && (child.textContent ?? '') === '') continue
+    return false
+  }
+  if (!br) return false
+  while (editor.firstChild) editor.removeChild(editor.firstChild)
+  return true
+}
+
+/**
  * Normalizes the editor DOM after browser mutations.
  *
  * Browsers insert various wrapper elements on Enter/paste:
