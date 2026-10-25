@@ -23,7 +23,7 @@
 >
 > **Suggested file:** `screenshots/hero.webp` · 2400×1500 · light theme on a soft macOS wallpaper
 >
-> **Shows:** The CCEM Desktop main window, front and center, on the **Workspace** page. Glass sidebar on the left (Workspace, Sessions, Environments, Skills, History, Cron, Chat Apps, Analytics, Proxy Debug, Settings). The center shows a live Claude session with a short streamed transcript: a user prompt, an assistant reply with a tool call card (for example an `Edit` on `src/app.ts`) and a todo checklist. The composer at the bottom shows the **Claude / Codex / OpenCode** agent switcher, an environment chip (for example `KIMI`), a permission chip (`dev`), an effort selector and a **Dynamic routing** chip. The **side panel** on the right is open on the **Browser** tab and shows a localhost page. In the lower-right corner of the desktop, outside the window, the **Desktop Cat** sits with two small session bubbles stacked beside it.
+> **Shows:** The CCEM Desktop main window, front and center, on the **Workspace** page. The top bar has the top-left navigation menu button and the status capsule (running sessions, cron, streak). The conversation list sits on the left. The center shows a live Claude session with a short streamed transcript: a user prompt, an assistant reply with a tool call card (for example an `Edit` on `src/app.ts`), the todo card at the tail of the transcript and a **Suggested next steps** card below it. The composer at the bottom shows the **Claude / Codex / OpenCode** agent switcher, an environment chip (for example `KIMI`), a permission chip (`auto`), an effort selector and a **Dynamic routing** chip. The **side panel** on the right is open on the **Browser** tab and shows a localhost page. In the lower-right corner of the desktop, outside the window, the **Desktop Cat** sits with two small session bubbles stacked beside it.
 >
 > **Caption:** *Pick a model, pick an agent, ship. CCEM Desktop in action.*
 
@@ -39,6 +39,7 @@
 - [External Control: JSON-RPC, Deeplinks & CLI](#external-control-json-rpc-deeplinks--cli)
 - [How ccem Compares](#how-ccem-compares)
 - [Data Storage](#data-storage)
+- [Agent Data & Sign-in](#agent-data--sign-in)
 - [Tech Stack](#tech-stack)
 - [Contributing](#contributing)
 - [License](#license)
@@ -64,7 +65,8 @@ Claude Code is great. Using it seriously every day is where things get messy.
 | | CLI | Desktop |
 |---|:---:|:---:|
 | **11 provider presets** (GLM, KIMI, DeepSeek, Qwen/Bailian, MiniMax, MiMo, OpenRouter, Ollama, …) with Opus / Sonnet / Haiku tier mapping | ✅ | ✅ |
-| **6 permission modes**: `yolo` · `dev` · `readonly` · `safe` · `ci` · `audit` | ✅ | ✅ |
+| **5 permission modes**: `yolo` · `auto` · `dev` · `readonly` · `safe` | ✅ | ✅ |
+| **Separate agent profiles**: CCEM's Claude Code data stays apart from the official app; Codex can opt in | ✅ `ccem auth` | ✅ |
 | **Usage & cost analytics** with a calendar heatmap | ✅ | ✅ Claude + Codex + OpenCode |
 | **Skill installer**: 20 curated presets + any GitHub URL | ✅ | ✅ Streaming search |
 | **Encrypted team config sharing** (`ccem load`) | ✅ | ✅ |
@@ -75,7 +77,7 @@ Claude Code is great. Using it seriously every day is where things get messy.
 | **Three agents in one workspace**: Claude Code, Codex, OpenCode | — | ✅ |
 | **Per-subagent model routing** through a local routing proxy | — | ✅ |
 | **Built-in browser side panel** the agent can drive, with you able to pause it | — | ✅ |
-| **Fork a session from any turn** and **rewind to file checkpoints** | — | ✅ |
+| **Steer a running turn**, **fork from any turn** and **rewind to file checkpoints** | — | ✅ |
 | **Session Review**: diffs, todos, artifacts, subagent traces | — | ✅ |
 | **Chat bots**: Hermes-powered WeCom & Feishu, plus Telegram / WeChat / WeCom bridges | — | ✅ |
 | **Desktop Cat**: an always-on-top companion that stacks your running and finished sessions | — | ✅ |
@@ -157,15 +159,15 @@ Each preset fills in the base URL and maps Claude Code's **Opus / Sonnet / Haiku
 |---|---|---|---|---|
 | GLM (Zhipu) | `https://open.bigmodel.cn/api/anthropic` | glm-5.3[1m] | glm-5.3[1m] | glm-5.3-flash |
 | KIMI (Moonshot) | `https://api.moonshot.cn/anthropic` | kimi-k3[1m] | kimi-k3[1m] | kimi-k2.7-code |
-| Kimi Code Plan | `https://api.kimi.com/coding/` | kimi-for-coding | kimi-for-coding | kimi-for-coding |
-| MiniMax | `https://api.minimax.cn/anthropic` | MiniMax-M3[1m] | MiniMax-M3[1m] | MiniMax-M3[1m] |
-| DeepSeek | `https://api.deepseek.com/anthropic` | deepseek-v4-pro[1m] | deepseek-v4-pro[1m] | deepseek-v4-flash |
+| Kimi Code Plan | `https://api.kimi.com/coding/` | k3[1m] | k3[1m] | k3[1m] |
+| MiniMax | `https://api.minimax.cn/anthropic` | MiniMax-M3.1-Flash[1m] | MiniMax-M3.1-Flash[1m] | MiniMax-M3.1-Flash[1m] |
+| DeepSeek | `https://api.deepseek.com/anthropic` | deepseek-flash[1m] | deepseek-flash[1m] | deepseek-flash |
 | Bailian (Aliyun) | `https://dashscope.aliyuncs.com/apps/anthropic` | qwen3.7-max | qwen3.7-max | qwen3.6-flash |
 | Bailian Coding Plan | `https://coding.dashscope.aliyuncs.com/apps/anthropic` | qwen3.7-plus | qwen3.7-plus | qwen3.7-plus |
-| OpenRouter | `https://openrouter.ai/api` | anthropic/claude-opus-5 | anthropic/claude-sonnet-5 | anthropic/claude-haiku-4.5 |
+| OpenRouter | `https://openrouter.ai/api` | ~anthropic/claude-opus-latest[1m] | ~anthropic/claude-sonnet-latest[1m] | ~anthropic/claude-haiku-latest |
 | Ollama (local) | `http://localhost:11434` | gemma4:31b | gemma4:26b | gemma4:e4b |
-| MiMo (Xiaomi) | `https://api.xiaomimimo.com/anthropic` | mimo-v2.5-pro | mimo-v2.5-pro | mimo-v2.5 |
-| MiMo Token Plan | `https://token-plan-cn.xiaomimimo.com/anthropic` | mimo-v2.5-pro | mimo-v2.5-pro | mimo-v2.5-pro |
+| MiMo (Xiaomi) | `https://api.xiaomimimo.com/anthropic` | mimo-v2.6-pro | mimo-v2.6-pro | mimo-v2.6-pro |
+| MiMo Token Plan | `https://token-plan-cn.xiaomimimo.com/anthropic` | mimo-v2.6-pro | mimo-v2.6-pro | mimo-v2.6-pro |
 
 Any other Anthropic-compatible endpoint works too: just enter the base URL, key and models yourself. API keys are encrypted at rest.
 
@@ -190,24 +192,25 @@ Then `source ~/.zshrc`.
 
 ## Permission Modes
 
-Six presets that sit between "approve everything" and "approve nothing".
+Five presets that sit between "approve everything" and "approve nothing".
 
 | Mode | What it allows | Use it for |
 |---|---|---|
 | **yolo** | Everything | Your own project, full trust |
+| **auto** | The model judges each action's risk and lets low-risk ones through (Claude Code's Auto mode) | Long runs where you don't want to babysit approvals |
 | **dev** | Normal development, sensitive files blocked | Daily work |
-| **readonly** | Reading only | Code review, learning a codebase |
-| **safe** | Restricted network and writes | Unfamiliar or untrusted repos |
-| **ci** | A CI-friendly tool set | Automation pipelines |
-| **audit** | Read and search only | Security audits |
+| **readonly** | Reading and searching only | Code review, audits, learning a codebase |
+| **safe** | Restricted network and writes | Unfamiliar or untrusted repos, automation |
 
 ```bash
-ccem yolo | dev | readonly | safe | ci | audit   # Apply temporarily; reverted when Claude Code exits
-ccem setup perms --dev                            # Write it into the project's .claude/settings.json
-ccem setup default-mode --dev                     # Make it the default
-ccem --mode                                       # Show the current mode
-ccem --list-modes                                 # Show all modes
+ccem yolo | auto | dev | readonly | safe           # Apply temporarily; reverted when Claude Code exits
+ccem setup perms --dev                           # Write it into the project's .claude/settings.json
+ccem setup default-mode --dev                    # Make it the default
+ccem --mode                                      # Show the current mode
+ccem --list-modes                                # Show all modes
 ```
+
+The retired `ci` and `audit` modes still resolve: saved defaults and API callers that use them get `safe` and `readonly`.
 
 ## Usage Analytics
 
@@ -216,7 +219,7 @@ ccem usage          # Interactive view with a calendar heatmap
 ccem usage --json   # Machine-readable
 ```
 
-ccem parses Claude Code's JSONL logs under `~/.claude/projects/` and calculates tokens and cost from cached LiteLLM model prices.
+ccem parses Claude Code's JSONL logs from the CCEM profile (`~/.ccem/agents/claude/projects/`) and the official `~/.claude/projects/`, and calculates tokens and cost from cached LiteLLM model prices.
 
 ## Skill Management
 
@@ -238,6 +241,17 @@ ccem also ships skills that teach Claude Code to use ccem itself:
 ccem setup cron       # Installs the ccem-cron skill: Claude can schedule tasks for you
 ccem setup bot-bind   # Installs the ccem-bot-bind skill: Claude can attach a session to a chat bot
 ```
+
+## Agent Profiles & Sign-in
+
+Claude Code launched through ccem uses its own profile, so your official Claude Code setup is left alone. Codex shares the official profile by default. See [Agent Data & Sign-in](#agent-data--sign-in) for details.
+
+```bash
+ccem auth claude      # Sign in to the CCEM Claude Code profile (for an official subscription)
+ccem auth codex       # Sign in to whichever Codex profile is selected
+```
+
+API keys from your ccem environments work without signing in.
 
 ## DeepSeek Harness (`dsh`)
 
@@ -315,7 +329,8 @@ ccem desktop open 'ccem://workspace/session?…'         # Focus a session in De
 | `ccem env [--json]` | Print env vars |
 | `ccem run <cmd>` | Run a command with env vars injected |
 | `ccem load <url>` | Load encrypted remote config |
-| `ccem yolo/dev/readonly/safe/ci/audit` | Launch Claude Code with a permission mode |
+| `ccem yolo/auto/dev/readonly/safe` | Launch Claude Code with a permission mode |
+| `ccem auth claude\|codex` | Sign in to the CCEM agent profile |
 | `ccem --mode` / `--list-modes` | Current mode / all modes |
 | `ccem setup perms --<mode>` / `--reset` | Write project permissions |
 | `ccem setup default-mode --<mode>` | Set the default mode |
@@ -352,6 +367,9 @@ The Workspace isn't just a launcher. It's where you start, steer and review agen
 
 - **Three agents**: start a **Claude Code**, **Codex** or **OpenCode** session from the same composer. Claude and Codex run in the native GUI. OpenCode sessions open in OpenCode Web.
 - **A detailed composer**: `$skill` tokens, `/slash` commands (scanned from your installed Claude Code commands and `.claude/commands/`), `@file` mentions, image and file drops, and model, provider and effort selectors.
+- **Steer mid-turn**: send a message while Claude is working and it is delivered into the running turn without an interrupt. **Stop** still cancels.
+- **Todo card & next steps**: the agent's todo list stays at the bottom of the transcript. When a turn ends, ccem suggests up to two follow-ups that you can run here or as a new session.
+- **Annotations**: highlight any part of a reply in five colors and attach notes to it.
 - **Fork from any turn**: branch a new Claude session that keeps the full context up to that turn, leaving the original unchanged.
 - **File checkpoints & rewind**: restore the working tree to any Claude file checkpoint from the transcript.
 - **Built-in browser side panel**: an embedded browser with **isolated login profiles**, so your own Chrome data stays untouched. The agent can drive it. You can pause it, take over, and review its screenshots, console logs and an action audit trail.
@@ -389,8 +407,9 @@ Routing is opt-in for each session, and sessions that don't use it run direct.
 > **Caption:** *Know exactly what the agent did before you merge.*
 
 - Grid or list view of every session, showing project, environment, permission mode, agent and where it was started (Desktop, CLI, chat bot or cron).
-- **Session Review**: a todo progress snapshot, changed files from Git and the SDK with inline diffs, generated artifacts (HTML, images, reports), failed tool calls, and a trace of each subagent.
+- **Session Review**: a todo progress snapshot, changed files from Git and the SDK grouped into per-file diffs, generated artifacts (HTML, images, reports), failed tool calls, and a trace of each subagent.
 - **Interactive events** for tmux sessions: structured tool prompts, plan reviews and terminal approvals.
+- A live token counter while a turn runs, and the average token speed once it finishes.
 - Desktop notifications when a task completes or fails, or when a plan, question or permission prompt needs you.
 
 ## Remote Control: Chat Bots
@@ -473,7 +492,7 @@ Costs come from the usage records ccem can read and known model prices. Where a 
 - **Proxy Debug**: a live request list (method, URL, status, size) with a JSON and SSE-aware detail viewer, and separate upstream URLs for Claude and Codex.
 - **Environments & Skills**: visual versions of the CLI features, with one-click presets, remote config sync and streaming skill search.
 - **Auto-update**: background downloads on **stable** or **beta** channels, then restart when it's ready.
-- **Settings**: light, dark or system theme. Chinese or English. Default permission mode and working directory. Terminal choice: Terminal.app, iTerm2 or Ghostty. Launch at login. Notifications. An AI-enhancement environment. Dependency checks for the ccem CLI, `claude`, `codex`, OpenCode and tmux.
+- **Settings**: light, dark or system theme. Chinese or English. Default permission mode and working directory. Terminal choice: Terminal.app, iTerm2 or Ghostty. Launch at login. Notifications. An AI-enhancement environment. Agent data & sign-in. Dependency checks for the ccem CLI, `claude`, `codex`, OpenCode and tmux.
 
 ### Keyboard Shortcuts
 
@@ -482,6 +501,7 @@ Costs come from the usage records ccem can read and known model prices. Where a 
 | <kbd>Cmd</kbd>+<kbd>1</kbd>…<kbd>9</kbd> | Workspace, Sessions, Environments, Skills, History, Cron, Chat Apps, Analytics, Proxy Debug |
 | <kbd>Cmd</kbd>+<kbd>Enter</kbd> / <kbd>Cmd</kbd>+<kbd>N</kbd> | Launch session |
 | <kbd>Cmd</kbd>+<kbd>K</kbd> | Global search |
+| <kbd>Cmd</kbd>+<kbd>B</kbd> | Open navigation / toggle the conversation list |
 | <kbd>Cmd</kbd>+<kbd>,</kbd> | Settings |
 | <kbd>Cmd</kbd>+<kbd>Q</kbd> | Quit |
 
@@ -515,7 +535,7 @@ While Desktop is running, it serves a **token-authenticated JSON-RPC endpoint on
 | | ccem | Vanilla Claude Code |
 |---|---|---|
 | Multi-provider switching | 11 presets with tier mapping, CLI + GUI | Manual `export` |
-| Permission presets | 6 modes | Built-in modes, configured manually |
+| Permission presets | 5 one-word modes, including Auto | Built-in modes, configured manually |
 | Agents | Claude Code, Codex, OpenCode (+ DeepSeek Harness via CLI) | Claude Code |
 | Per-subagent model routing | Local routing proxy, profiles, templates | — |
 | Remote control | Hermes WeCom/Feishu, Telegram, WeChat, WeCom | — |
@@ -532,12 +552,24 @@ While Desktop is running, it serves a **token-authenticated JSON-RPC endpoint on
 | Path | Contents |
 |---|---|
 | `~/.ccem/config.json` | Environments (API keys encrypted) and settings, shared by CLI and Desktop |
+| `~/.ccem/agents/claude/` | CCEM's Claude Code profile: config, login, history, memory |
+| `~/.codex/` (or `CODEX_HOME`) | Codex profile, shared with the official app by default |
+| `~/.ccem/agents/codex/` | Optional isolated Codex profile |
+| `~/.ccem/agents/profiles.json` | Codex isolation preference, shared by CLI and Desktop |
 | `~/.ccem/cron-tasks.json` | Scheduled tasks |
 | `~/.ccem/usage-cache.json` | Usage cache |
 | `~/.ccem/model-prices.json` | Model price cache |
 | `~/.ccem/control.json` | Local JSON-RPC endpoint descriptor (while Desktop runs) |
 | `.claude/settings.json` | Project permission config |
 | `~/.claude/skills/`, `.claude/skills/` | Installed skills |
+
+### Agent Data & Sign-in
+
+- **Claude Code** always runs from a CCEM-owned profile. **Codex** reuses the official configuration, login, history and memory unless you turn on **Settings → Agent data & sign-in → Isolate Codex data**. The setting applies to new sessions. Running sessions keep their profile through reconnects and terminal handoff.
+- The first time an isolated profile is used, ccem copies your existing conversations and memories into it and keeps the session IDs. Claude plugins are imported too. Credentials, global settings and plugin registries are not copied.
+- After that the profiles change independently. If you turn isolation off, the isolated copy stays on disk and is used again if you turn it back on.
+- Your ccem API keys work in every profile. An official subscription needs one sign-in for each isolated profile, from Settings or `ccem auth claude` / `ccem auth codex`.
+- Finish any sessions started by an older ccem before the first migration so that their last turns are copied. Isolation covers app data only. It doesn't restrict the agent's access to the filesystem. To use a different agent data root, set `CCEM_AGENT_HOME` to an absolute path.
 
 ---
 
