@@ -19,15 +19,7 @@
   <a href="https://github.com/Genuifx/ccem/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" /></a>
 </p>
 
-> **🖼️ IMAGE PLACEHOLDER 1 — Hero shot** (replaces `screenshots/shots.webp`)
->
-> **Suggested file:** `screenshots/hero.webp` · 2880×1800 (1440×900 window at 2×) · light theme on a soft macOS wallpaper
->
-> **Shows:** CCEM Desktop on the **Workspace** page. The window uses an overlay title bar: there is no separate title row, and the macOS traffic lights sit inside the top-left corner on the same row as the toolbar. **Top bar, left to right:** traffic lights, the navigation-menu and conversation-list buttons, the status capsule ("Idle · 🔥 45"), the environment chip (`KIMI`), the routing chip (**Direct**), then on the right the search field, the **Review** icon and the side-panel toggle. **Left:** the conversation list grouped by project, newest session on top. **Center:** a finished Claude turn: the collapsed tool summary ("Processed · 19s · 5 calls · Bash · Read"), a short structured answer, and the **Suggested next steps** card with two suggestions, each with **New session** / **Do it here**. **Bottom:** the composer with the environment · effort chip (for example `KIMI · Max`) and the permission picker (**Auto**).
->
-> **Capture note:** the next-steps card only appears right after a live turn finishes and only on the latest turn, so capture it immediately after running a short read-only prompt in a demo project.
->
-> **Caption:** *Pick a model, pick an agent, ship. CCEM Desktop in action.*
+![CCEM Desktop](./screenshots/shots.webp)
 
 ---
 
@@ -128,15 +120,7 @@ npm install -g ccem
 # or just: npx ccem
 ```
 
-> **🖼️ IMAGE PLACEHOLDER 2 — CLI interactive menu** (replaces `screenshots/cli-index.webp`)
->
-> **Suggested file:** `screenshots/cli-menu.webp` · terminal at 120×36, dark theme, line height 1.0 so the pixel logo has no gaps
->
-> **Shows:** Running `ccem` with no arguments. **Top left:** the colored pixel-art CCEM logo. **To its right:** `CCEM  Claude Code Env Manager`, then `Env: KIMI [自动模式]`, `URL`, `Run: opus  Opus: kimi-k3[1m]`, `Haiku` and a masked `Token: sk••••xxxx`. **Below:** the `Usage:` line (Today / Week / Total with cost) and a divider. **Then** the Inquirer menu `? Select action` with the cursor on **Start Claude Code (自动模式)**, followed by Switch Environment, Permission Mode, View Usage, Set Default Mode and Exit. **Second window, bottom right:** `ccem ls` output, a cli-table3 table (Name / Base URL / Opus) with 5–6 preset environments and the current one marked `*`.
->
-> **Capture note:** use a demo config (fake keys, preset environments) so no private endpoints or key suffixes show; a config with some usage history makes the Usage line more convincing than all zeros.
->
-> **Caption:** *`npx ccem`: everything one keystroke away.*
+![ccem CLI](./screenshots/cli-index.webp)
 
 ## Environment Management
 
@@ -358,15 +342,7 @@ A native app built on **Tauri 2** (a Rust backend and a React frontend, not an E
 
 ## Workspace: Claude Code, Codex & OpenCode in One Place
 
-> **🖼️ IMAGE PLACEHOLDER 3 — Composer, annotations & browser panel** (replaces `screenshots/sessions.webp`)
->
-> **Suggested file:** `screenshots/workspace.webp` · 2880×1800 · dark theme · overlay title bar with inset traffic lights
->
-> **Shows:** One Claude session mid-turn. **Center:** a reply with one passage highlighted and the **annotation toolbar** above it (Copy, marker/wave style, five colors), and a hover menu on an earlier turn showing **Fork a session from this turn**. **Bottom:** the composer with a queued message in the dock waiting to steer the running turn, a `$skill` token, an `@src/auth.ts` file chip, a pasted image thumbnail, the environment · effort chip with its menu open (Effort: Low → Max, then the environment list), and the permission picker. **Right:** the side panel (tabs **Browser · Changes · Browse · Agents**) on **Browser**, with a URL bar, back/forward/reload, the amber **Agent controlling** pill and the **Pause Agent control** button.
->
-> **Capture note:** the embedded browser is a native view, so a webview screenshot shows it blank; use a macOS window screenshot for this one.
->
-> **Caption:** *Steer the agent mid-turn, mark up its answers, and watch it drive the browser.*
+![Workspace](./screenshots/sessions.webp)
 
 The Workspace isn't just a launcher. It's where you start, steer and review agent runs.
 
@@ -383,14 +359,6 @@ The Workspace isn't just a launcher. It's where you start, steer and review agen
 
 ## Per-Subagent Model Routing
 
-> **🖼️ IMAGE PLACEHOLDER 4 — Dynamic routing popover**
->
-> **Suggested file:** `screenshots/routing.webp` · 1600×1000 · light theme, cropped to the top bar and transcript
->
-> **Shows:** The **Dynamic routing** popover opened from the routing chip in the top bar (the chip reads **Direct** or **Routed**). At the top, the route state and the **Route profile** selector (My defaults · Main env only · Budget chores) with "Budget chores" selected. **Custom bindings** expanded: **Bindings by type** with *Explore → GLM*, *Background tasks → DeepSeek*, *Other agents → Follow default*. Under that, the **Allow agent self re-routing** toggle and an **Agent may reroute to** list with 3 envs checked. Footer buttons: **Apply changes** and **Save as my default**. Optional inset: the session usage panel's **Sub-route usage (Router-observed)** breakdown.
->
-> **Caption:** *Keep the main thread on your best model and send busywork to cheaper ones.*
-
 Why pay top-model prices for `grep`? Turn on **Dynamic routing** for a Claude session and ccem runs it through a local routing proxy (bound to `127.0.0.1`) that splits the work across environments:
 
 - Bind **subagent types** (for example `Explore`) and **background tasks** to different environments. The main thread follows the composer's environment.
@@ -403,14 +371,6 @@ Routing is opt-in for each session, and sessions that don't use it run direct. T
 
 ## Sessions & Session Review
 
-> **🖼️ IMAGE PLACEHOLDER 5 — Session Review & Changes**
->
-> **Suggested file:** `screenshots/session-review.webp` · 2880×1800 · dark theme · overlay title bar with inset traffic lights
->
-> **Shows:** A finished session with two things open. **Session Review**, a popover anchored under the **Review** icon in the top bar: header "Session Review · <env> · claude", **Task progress**, then **Evidence** rows for **Changed files**, **Artifacts**, **Failed tools** and **Subagents** with counts, and the environment and branch in the footer. **Right:** the side panel on **Changes** with the **All / Session / Git** filter and counts, a filter field, the file list grouped by directory, and the selected file's diff with green/red lines and an **Open** button.
->
-> **Caption:** *Know exactly what the agent did before you merge.*
-
 - Grid or list view of every session, showing project, environment, permission mode, agent and where it was started (Desktop, CLI, chat bot or cron).
 - **Session Review** (the Review icon in the top bar): a todo progress snapshot, changed files from Git and the SDK grouped into per-file diffs, generated artifacts (HTML, images, reports), failed tool calls, and a trace of each subagent.
 - **Interactive events** for tmux sessions: structured tool prompts, plan reviews and terminal approvals.
@@ -419,15 +379,7 @@ Routing is opt-in for each session, and sessions that don't use it run direct. T
 
 ## Remote Control: Chat Bots
 
-> **🖼️ IMAGE PLACEHOLDER 6 — Remote Control / Hermes bots** (replaces `screenshots/telegram.webp`)
->
-> **Suggested file:** `screenshots/chat-bots.webp` · composite: desktop window on the left (60%), phone frame on the right (40%)
->
-> **Shows:** *Left:* the **Remote Control** page, section **Bots**, with the **Hermes chat component** card (installed, with its version) and **Your bots**: a **WeCom** bot ("Account paired · Access to 2 workspaces", mode **CCEM sessions only**) and a **Feishu** bot (mode **Full Hermes**). A collapsed **Other connection methods** row sits below. *Right:* a phone showing a Feishu or WeCom chat: the user asks "run the tests in ccem-web and fix failures", the bot replies with a task card showing the session status, then a short summary of the result.
->
-> **Capture note:** needs the Hermes chat component installed and at least one paired bot; on a fresh install the page only shows the install card.
->
-> **Caption:** *Your agents, reachable from the chat app you already use.*
+![Remote Control](./screenshots/telegram.webp)
 
 Continue workspace tasks from your phone, using **any API key you've configured** rather than only an Anthropic subscription.
 
@@ -443,13 +395,7 @@ Remote control works best with tmux installed (resume and multi-terminal workflo
 
 ## Cron: Scheduled Automation
 
-> **🖼️ IMAGE PLACEHOLDER 7 — Cron Tasks page** (replaces `screenshots/cron.webp`)
->
-> **Suggested file:** `screenshots/cron.webp` · 2880×1800 · light theme · overlay title bar with inset traffic lights
->
-> **Shows:** The **Cron Tasks** page. **Top right:** **AI Create** and **Add Task**. **Top:** a 24-hour timeline with a dot for each of today's runs and a marker for the current time. **Left:** **Upcoming**: 5 tasks, each with its next run time, name, cron expression (for example `0 9 * * 1-5`) and a status badge (Success / Timed out), then a **Disabled** group. **Right:** **Recent runs** with Today / 7 days / All filters, each row showing status, task name, start time, duration and an **Open session** link.
->
-> **Caption:** *Set it once and wake up to finished work.*
+![Cron Tasks](./screenshots/cron.webp)
 
 - **Five-field cron** expressions on local time, with a preview of upcoming runs.
 - **Quick templates**: PR Review, Test Runner, Doc Generation, Security Audit, Changelog.
@@ -466,13 +412,7 @@ Scheduled runs need the Desktop app running.
 
 ## Analytics: Claude + Codex + OpenCode
 
-> **🖼️ IMAGE PLACEHOLDER 8 — Analytics & share poster** (replaces `screenshots/analytics.webp`)
->
-> **Suggested file:** `screenshots/analytics.webp` · 2880×1800 · dark theme · overlay title bar with inset traffic lights
->
-> **Shows:** The **Analytics** page. **Top card:** the source switcher (All / Claude / Codex / OpenCode / DSH) with refresh and share buttons, the total token count with a week-over-week change badge, known cost (with an "unpriced tokens" note), this week's tokens and the **Streak** with a flame, and on the right the **Activity Heatmap (Calendar)**. **Below:** the token consumption chart with Hour / Day / Week / Month tabs. Overlaid on the right, the **Share Poster** dialog with a **Terminal**-style preview, a "Gold Coder" rank badge and style tabs Classic / Terminal / Data Ink.
->
-> **Caption:** *Every token across every agent in one view, ready to share.*
+![Analytics](./screenshots/analytics.webp)
 
 - A daily activity heatmap, token and cost trends by model, and streaks and week-over-week trends.
 - Switch between **All, Claude, Codex, OpenCode or DSH** (DeepSeek Harness) in one click.
@@ -481,16 +421,6 @@ Scheduled runs need the Desktop app running.
 Costs come from the usage records ccem can read and known model prices. Where a price is missing, ccem shows the known cost and a count of unpriced tokens instead of guessing. Treat these figures as an estimate, not a provider bill.
 
 ## Tray Cockpit
-
-> **🖼️ IMAGE PLACEHOLDER 9 — Tray Cockpit**
->
-> **Suggested file:** `screenshots/tray-cockpit.webp` · 1200×1400 · macOS menu bar on a plain wallpaper, no main window
->
-> **Shows:** The menu-bar **Tray Cockpit** dropped down: **Env** and **Perm** chips, **Tokens Today** and **Cost Today** with "this month" underneath, the **Token Trend** chart with **Hour / Day** tabs, the **Model Type Split** bar, **Active Projects** with status dots, **Scheduled Tasks**, the health row (tmux ok · bridge online · cron ok · version) and the **Workspace / Sessions / Diagnostics** buttons.
->
-> **Capture note:** the tray is a separate native window; capture it with a macOS screenshot.
->
-> **Caption:** *Today's tokens, cost and running work, one click from the menu bar.*
 
 A menu-bar mini dashboard showing the current env and permission mode, today's tokens and cost, an hourly or daily trend, the split by model type, active projects, upcoming cron tasks, health checks (tmux, bridge, cron, version) and quick-launch buttons.
 
