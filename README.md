@@ -23,7 +23,7 @@
 >
 > **Suggested file:** `screenshots/hero.webp` · 2400×1500 · light theme on a soft macOS wallpaper
 >
-> **Shows:** The CCEM Desktop main window, front and center, on the **Workspace** page. The top bar has the top-left navigation menu button and the status capsule (running sessions, cron, streak). The conversation list sits on the left. The center shows a live Claude session with a short streamed transcript: a user prompt, an assistant reply with a tool call card (for example an `Edit` on `src/app.ts`), the todo card at the tail of the transcript and a **Suggested next steps** card below it. The composer at the bottom shows the **Claude / Codex / OpenCode** agent switcher, an environment chip (for example `KIMI`), a permission chip (`auto`), an effort selector and a **Dynamic routing** chip. The **side panel** on the right is open on the **Browser** tab and shows a localhost page. In the lower-right corner of the desktop, outside the window, the **Desktop Cat** sits with two small session bubbles stacked beside it.
+> **Shows:** The CCEM Desktop main window on the **Workspace** page, full width (no app sidebar). **Top bar:** the top-left navigation menu button, the conversation-list toggle, the session title, the single **status capsule** (for example "2 running · streak 12d"), the **Review** icon button and the side-panel toggle. **Left:** the conversation list, sessions grouped by origin, with status dots. **Center:** a live Claude session: a user prompt, an assistant reply with a tool call card (for example an `Edit` on `src/app.ts`), the live token counter on the running turn, the todo card at the tail of the transcript and a **Suggested next steps** card with **New session** / **Do it here**. **Bottom:** the composer with the **Claude / Codex / OpenCode** switcher, an environment chip (for example `KIMI`), a permission chip (`auto`), the **Effort** selector and a **Dynamic routing** chip. **Right:** the side panel open on the **Browser** tab (tabs Browser · Files · Agents · Changes) showing a localhost page.
 >
 > **Caption:** *Pick a model, pick an agent, ship. CCEM Desktop in action.*
 
@@ -80,7 +80,6 @@ Claude Code is great. Using it seriously every day is where things get messy.
 | **Steer a running turn**, **fork from any turn** and **rewind to file checkpoints** | — | ✅ |
 | **Session Review**: diffs, todos, artifacts, subagent traces | — | ✅ |
 | **Chat bots**: Hermes-powered WeCom & Feishu, plus Telegram / WeChat / WeCom bridges | — | ✅ |
-| **Desktop Cat**: an always-on-top companion that stacks your running and finished sessions | — | ✅ |
 | **Tray cockpit**, **Proxy Debug**, **share posters**, **auto-update** | — | ✅ |
 
 The CLI and Desktop read the same config file (`~/.ccem/config.json`), so an environment you add in one shows up in the other immediately.
@@ -131,7 +130,7 @@ npm install -g ccem
 >
 > **Suggested file:** `screenshots/cli-menu.webp` · terminal at ~120×36, dark theme, a readable monospace font
 >
-> **Shows:** Running `ccem` with no arguments. At the top, the ASCII/pixel CCEM logo. Under it, a status line with the current environment (for example `KIMI`) and the permission mode (`dev`). Then the Ink-rendered interactive menu with the cursor on an item such as *Switch environment*, and other items visible (add environment, permission modes, usage, skills, etc.). Optionally, a second pane or inset shows `ccem ls` output: a cli-table3 table listing 4–5 environments with names, base URLs and models, the active one highlighted.
+> **Shows:** Running `ccem` with no arguments. At the top, the ASCII/pixel CCEM logo. Under it, a status line with the current environment (for example `KIMI`) and the permission mode (`auto`). Then the Ink-rendered interactive menu with the cursor on *Switch environment*, and other items visible (add environment, permission modes, usage, skills, etc.). Optional inset: `ccem ls` output, a cli-table3 table of 4–5 environments with names, base URLs and models, the active one highlighted.
 >
 > **Caption:** *`npx ccem`: everything one keystroke away.*
 
@@ -355,13 +354,13 @@ A native app built on **Tauri 2** (a Rust backend and a React frontend, not an E
 
 ## Workspace: Claude Code, Codex & OpenCode in One Place
 
-> **🖼️ IMAGE PLACEHOLDER 3 — Workspace with composer & side panel** (replaces `screenshots/sessions.webp`)
+> **🖼️ IMAGE PLACEHOLDER 3 — Composer, annotations & browser panel** (replaces `screenshots/sessions.webp`)
 >
 > **Suggested file:** `screenshots/workspace.webp` · 2400×1500 · dark theme
 >
-> **Shows:** The Workspace page with a project list on the left and several sessions grouped under one project, with status dots for running, waiting for approval and done. In the center, an active Claude session's transcript with a hover menu on one turn showing **"Fork a session from this turn"**. The composer at the bottom has a `$skill` token, an `@src/auth.ts` file chip, a pasted image thumbnail, the **Claude / Codex / OpenCode** switcher, an environment chip, a permission chip and the **Effort** dropdown open (Minimal → Max). The side panel on the right is open on the **Browser** tab with a URL bar, back/forward/reload, and an amber **"Agent controlling"** pill with a **Pause Agent control** button.
+> **Shows:** One Claude session mid-turn. **Center:** a reply with one passage highlighted and the **annotation toolbar** above it (Copy, marker/wave style, five colors), and a hover menu on an earlier turn showing **Fork a session from this turn**. **Bottom:** the composer with a queued message in the dock waiting to steer the running turn, a `$skill` token, an `@src/auth.ts` file chip, a pasted image thumbnail, the agent switcher, environment and permission chips, and the **Effort** dropdown open (Minimal → Max). **Right:** the side panel on the **Browser** tab with a URL bar, back/forward/reload, the amber **Agent controlling** pill and the **Pause Agent control** button.
 >
-> **Caption:** *Three agents, one composer, a browser the agent can drive.*
+> **Caption:** *Steer the agent mid-turn, mark up its answers, and watch it drive the browser.*
 
 The Workspace isn't just a launcher. It's where you start, steer and review agent runs.
 
@@ -378,11 +377,11 @@ The Workspace isn't just a launcher. It's where you start, steer and review agen
 
 ## Per-Subagent Model Routing
 
-> **🖼️ IMAGE PLACEHOLDER 4 — Model routing popover**
+> **🖼️ IMAGE PLACEHOLDER 4 — Dynamic routing popover**
 >
 > **Suggested file:** `screenshots/routing.webp` · 1600×1000 · light theme, cropped to the composer area
 >
-> **Shows:** The **Dynamic routing** popover open above the composer. At the top, a **Route profile** selector showing "Budget chores". Below it, **Bindings by type**: *Main thread → KIMI*, *Explore → GLM*, *Background tasks → DeepSeek*, *Other agents → Follow default*. Under that, an **Allow agent self re-routing** toggle and an **Agent may reroute to** list with 3 envs checked. Footer buttons: **Apply changes** and **Save as my default**. Optionally, an inset of the session's usage panel with the **Sub-route usage (Router-observed)** breakdown.
+> **Shows:** The **Dynamic routing** popover open above the composer. At the top, the **Route profile** selector (My defaults · Main env only · Budget chores) with "Budget chores" selected and "3 task routes" under it. **Custom bindings** expanded below: **Bindings by type** with *Explore → GLM*, *Background tasks → DeepSeek*, *Other agents → Follow default*. Under that, the **Allow agent self re-routing** toggle and an **Agent may reroute to** list with 3 envs checked. Footer buttons: **Apply changes** and **Save as my default**. Optional inset: the session usage panel's **Sub-route usage (Router-observed)** breakdown.
 >
 > **Caption:** *Keep the main thread on your best model and send busywork to cheaper ones.*
 
@@ -398,11 +397,11 @@ Routing is opt-in for each session, and sessions that don't use it run direct.
 
 ## Sessions & Session Review
 
-> **🖼️ IMAGE PLACEHOLDER 5 — Session Review drawer**
+> **🖼️ IMAGE PLACEHOLDER 5 — Session Review & Changes**
 >
 > **Suggested file:** `screenshots/session-review.webp` · 2400×1500 · dark theme
 >
-> **Shows:** The **Session Review** drawer open over a finished session. The header shows a **Task progress · 5/6** bar, the environment and the Git branch. The left column has sections **Changed files** (4 files with +/- counts), **Subagents** (two entries) and **Artifacts** (an HTML report and a PNG). The right pane shows the selected file's diff with green and red lines and an **Open in editor** button. A **Failed tools** chip shows one failure.
+> **Shows:** **Session Review** opened from the top-bar **Review** icon on a finished session. The header shows **Task progress · 5/6**, the **Environment** and the **Branch**. The left column lists **Changed files** (4 files with +/- counts), **Subagents** (two entries), **Artifacts** (an HTML report and a PNG) and a **Failed tools** entry with one failure. The right pane shows the selected file's diff with an **Open in editor** button. Optional inset: the side panel's **Changes** tab with the **All / Session / Git** filter and per-file grouped diffs.
 >
 > **Caption:** *Know exactly what the agent did before you merge.*
 
@@ -418,7 +417,7 @@ Routing is opt-in for each session, and sessions that don't use it run direct.
 >
 > **Suggested file:** `screenshots/chat-bots.webp` · composite: desktop window on the left (60%), phone frame on the right (40%)
 >
-> **Shows:** *Left:* the **Chat Apps** page with the **Bots** panel showing the **Hermes chat component** with its version and **Your bots**: a **WeCom** bot ("Account paired · Access to 2 workspaces") and a **Feishu** bot. A collapsed **Other connection methods** row is visible below. *Right:* a phone showing a Feishu or WeCom chat in which the user asks "run the tests in ccem-web and fix failures", and the bot replies with a task card showing the session status, then a short summary of the result.
+> **Shows:** *Left:* the **Chat Apps** page on **Bots**, with the **Hermes chat component** card and its version, then **Your bots**: a **WeCom** bot ("Account paired · Access to 2 workspaces", mode **CCEM sessions only**) and a **Feishu** bot (mode **Full Hermes**). A collapsed **Other connection methods** row sits below. *Right:* a phone showing a Feishu or WeCom chat: the user asks "run the tests in ccem-web and fix failures", the bot replies with a task card showing the session status, then a short summary of the result.
 >
 > **Caption:** *Your agents, reachable from the chat app you already use.*
 
@@ -440,13 +439,13 @@ Remote control works best with tmux installed (resume and multi-terminal workflo
 >
 > **Suggested file:** `screenshots/cron.webp` · 2400×1500 · light theme
 >
-> **Shows:** The **Cron Tasks** page. Left: a list of 4 tasks (for example "Nightly tests · `0 2 * * *`", "Weekday PR review · `0 9 * * 1-5`") with enable toggles and **next run** times. Right: the create/edit form with the **Quick Templates** row (PR Review, Test Runner, Doc Generation, Security Audit, Changelog), a natural-language **AI generate** input, the cron expression, the working directory, the **Execution Profile** segmented control (Conservative / Standard / Autonomous) with its description, and a **Budget Cap** field. Bottom: **Run history** with ✓/✗ status, duration and a **Retry** button on a failed run.
+> **Shows:** The **Cron Tasks** page. Left: 4 tasks (for example "Nightly tests · `0 2 * * *`", "Weekday PR review · `0 9 * * 1-5`") with enable toggles and **Next Run** times. Right: the create/edit form with the **Quick Templates** row (PR Review, Test Runner, Doc Generation, Security Audit, Changelog), the **AI Create** input, the cron expression with upcoming-run preview, the working directory, the **Execution Profile** control (Conservative / Standard / Autonomous) and a **Budget Cap** field. Bottom: **Run History** with ✓/✗ status, duration and a **Retry** button on a failed run.
 >
 > **Caption:** *Set it once and wake up to finished work.*
 
 - **Five-field cron** expressions on local time, with a preview of upcoming runs.
 - **Quick templates**: PR Review, Test Runner, Doc Generation, Security Audit, Changelog.
-- **AI generation**: describe the job in plain language and get a cron expression and prompt back.
+- **AI Create**: describe the job in plain language and get a cron expression and prompt back.
 - **Execution profiles**:
   - **Conservative**: read, search, edit and write only, with a lower budget and no shell or web.
   - **Standard**: adds Bash and web tools.
@@ -463,7 +462,7 @@ Scheduled runs need the Desktop app running.
 >
 > **Suggested file:** `screenshots/analytics.webp` · 2400×1500 · dark theme
 >
-> **Shows:** The **Analytics** page with a source switcher at the top (All / Claude / Codex / OpenCode) and stat cards for tokens, cost, **Streak** and week-over-week trend arrows. Below them, a GitHub-style **Activity Heatmap (Calendar)** and a stacked token/cost trend chart by model. Overlaid on the right, the **Share Poster** dialog showing a poster preview in the **Terminal** style with a "Gold Coder" rank badge, and style tabs Classic / Terminal / Data Ink.
+> **Shows:** The **Analytics** page with the source switcher (All / Claude / Codex / OpenCode) and stat cards for tokens, cost, **Streak** and week-over-week trend arrows. Below them, the **Activity Heatmap (Calendar)** and a stacked token/cost trend chart by model. Overlaid on the right, the **Share Poster** dialog with a **Terminal**-style preview, a "Gold Coder" rank badge, and style tabs Classic / Terminal / Data Ink.
 >
 > **Caption:** *Every token across every agent in one view, ready to share.*
 
@@ -473,18 +472,17 @@ Scheduled runs need the Desktop app running.
 
 Costs come from the usage records ccem can read and known model prices. Where a price is missing, ccem shows the known cost and a count of unpriced tokens instead of guessing. Treat these figures as an estimate, not a provider bill.
 
-## Desktop Cat & Tray Cockpit
+## Tray Cockpit
 
-> **🖼️ IMAGE PLACEHOLDER 9 — Desktop Cat + Tray Cockpit**
+> **🖼️ IMAGE PLACEHOLDER 9 — Tray Cockpit**
 >
-> **Suggested file:** `screenshots/cat-and-tray.webp` · 1800×1100 · macOS desktop with a plain wallpaper and no main window
+> **Suggested file:** `screenshots/tray-cockpit.webp` · 1200×1400 · macOS menu bar on a plain wallpaper, no main window
 >
-> **Shows:** *Top right:* the menu-bar **Tray Cockpit** dropped down, showing Env and Perm chips, **Tokens Today** and **Cost Today**, a **Token Trend** chart with Hour/Day tabs, a **Model Type Split** bar, **Active Projects** with status dots, **Scheduled Tasks**, a health row (tmux ok · bridge online · cron ok · version) and launch buttons (Workspace, Sessions, Diagnostics). *Bottom right:* the always-on-top **Desktop Cat** with three stacked session bubbles beside it: two running sessions (spinner) and one with an unread "completed" badge.
+> **Shows:** The menu-bar **Tray Cockpit** dropped down: **Env** and **Perm** chips, **Tokens Today** and **Cost Today** with "this month" underneath, the **Token Trend** chart with **Hour / Day** tabs, the **Model Type Split** bar, **Active Projects** with status dots, **Scheduled Tasks**, the health row (tmux ok · bridge online · cron ok · version) and the **Workspace / Sessions / Diagnostics** buttons.
 >
-> **Caption:** *Glance at the menu bar or the cat to see what your agents are doing.*
+> **Caption:** *Today's tokens, cost and running work, one click from the menu bar.*
 
-- **Desktop Cat** (Settings → Desktop Cat): an always-on-top companion with your running sessions and unread finished sessions stacked beside it. Click one to jump straight to it.
-- **Tray Cockpit**: a menu-bar mini dashboard showing the current env and permission mode, today's tokens and cost, an hourly or daily trend, the split by model type, active projects, upcoming cron tasks, health checks (tmux, bridge, cron, version) and quick-launch buttons.
+A menu-bar mini dashboard showing the current env and permission mode, today's tokens and cost, an hourly or daily trend, the split by model type, active projects, upcoming cron tasks, health checks (tmux, bridge, cron, version) and quick-launch buttons.
 
 ## Also in the Box
 
