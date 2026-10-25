@@ -34,11 +34,10 @@ const DEFAULT_USER_ACCESS_POLICY =
 
 const MODE_DISPLAY_NAMES: Record<PermissionModeName, string> = {
   yolo: 'YOLO',
+  auto: 'Auto',
   dev: 'Developer',
   readonly: 'Read Only',
   safe: 'Safe',
-  ci: 'CI / CD',
-  audit: 'Audit',
 };
 
 function blankBot(): WecomBotConfig {

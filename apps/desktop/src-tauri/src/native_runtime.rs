@@ -9060,7 +9060,7 @@ impl NativeRuntimeManager {
             .map_err(|_| "Failed to lock sending session")?;
         let mode =
             effective_native_perm_mode(&record.perm_mode, record.runtime_perm_mode.as_deref());
-        if !matches!(mode, "dev" | "yolo" | "bypassPermissions") {
+        if !matches!(mode, "dev" | "auto" | "yolo" | "bypassPermissions") {
             return Err(format!("Session handoff is not allowed in {mode} mode"));
         }
         if record.provider != NativeProvider::Claude
@@ -13518,7 +13518,7 @@ mod tests {
             .lock()
             .unwrap()
             .insert(record.runtime_id.clone(), Arc::clone(&handle));
-        for mode in ["dev", "yolo", "bypassPermissions"] {
+        for mode in ["dev", "auto", "yolo", "bypassPermissions"] {
             handle.record.lock().unwrap().perm_mode = mode.into();
             assert!(manager
                 .session_handoff_source_workspace(&record.runtime_id, &handle)

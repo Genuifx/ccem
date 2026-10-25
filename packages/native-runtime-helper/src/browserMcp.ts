@@ -116,7 +116,12 @@ export function browserToolNamesForPermissionMode(permMode: string): BrowserTool
   ) {
     return [...READ_TOOLS];
   }
-  if (permMode === 'dev' || permMode === 'yolo' || permMode === 'bypassPermissions') {
+  if (
+    permMode === 'dev'
+    || permMode === 'auto'
+    || permMode === 'yolo'
+    || permMode === 'bypassPermissions'
+  ) {
     return [...ALL_TOOLS];
   }
   return [...READ_TOOLS];

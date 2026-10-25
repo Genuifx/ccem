@@ -1993,12 +1993,15 @@ fn resolve_current_env() -> Option<String> {
 }
 
 /// Known permission mode names accepted by external control.
-const KNOWN_PERM_MODES: &[&str] = &["yolo", "dev", "readonly", "safe", "ci", "audit"];
+const KNOWN_PERM_MODES: &[&str] = &["yolo", "auto", "dev", "readonly", "safe"];
 
 fn is_known_perm_mode(mode: &str) -> bool {
-    KNOWN_PERM_MODES
-        .iter()
-        .any(|known| known.eq_ignore_ascii_case(mode))
+    // Retired modes ("ci" -> safe, "audit" -> readonly); keep accepting them from older callers.
+    mode.eq_ignore_ascii_case("ci")
+        || mode.eq_ignore_ascii_case("audit")
+        || KNOWN_PERM_MODES
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(mode))
 }
 
 /// Validate and resolve the working directory for external control.
@@ -2037,7 +2040,7 @@ fn resolve_default_perm_mode() -> String {
 
 /// Validate and resolve permission mode for external control.
 /// - If `perm_mode` is `None` or empty: falls back to config default → "dev".
-/// - If provided: must be one of [`yolo`, `dev`, `readonly`, `safe`, `ci`, `audit`].
+/// - If provided: must be one of [`yolo`, `auto`, `dev`, `readonly`, `safe`] (legacy `ci` / `audit` still accepted).
 fn resolve_effective_perm_mode(perm_mode: Option<String>) -> Result<String, String> {
     let trimmed = perm_mode
         .map(|mode| mode.trim().to_string())
@@ -2712,7 +2715,7 @@ mod tests {
 
     #[test]
     fn test_known_perm_modes_accepted() {
-        for mode in ["yolo", "dev", "readonly", "safe", "ci", "audit"] {
+        for mode in ["yolo", "auto", "dev", "readonly", "safe", "ci", "audit"] {
             assert!(is_known_perm_mode(mode), "{} should be known", mode);
         }
         // Case-insensitive

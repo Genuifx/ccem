@@ -6,12 +6,12 @@ import {
   ChevronRight,
   Gauge,
   Lock,
-  Search,
   Shield,
   ShieldAlert,
   ShieldBan,
   ShieldCheck,
   ShieldOff,
+  Sparkles,
   Zap,
 } from '@/lib/lucide-react';
 import { ModelIcon } from '@/components/history/ModelIcon';
@@ -62,11 +62,10 @@ const EFFORT_I18N_KEYS: Record<EffortLevel, string> = {
 function getModeIcon(mode: WorkspacePermissionModeName): typeof Shield {
   const iconMap: Record<WorkspacePermissionModeName, typeof Shield> = {
     yolo: ShieldOff,
+    auto: Sparkles,
     dev: ShieldCheck,
     readonly: ShieldBan,
     safe: ShieldAlert,
-    ci: ShieldCheck,
-    audit: Search,
   };
   return iconMap[mode] || Shield;
 }

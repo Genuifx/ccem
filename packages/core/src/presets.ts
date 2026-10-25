@@ -170,6 +170,30 @@ export const PERMISSION_PRESETS: Record<PermissionModeName, PermissionPreset> = 
     }
   },
 
+  'auto': {
+    name: '自动模式',
+    description: '由模型逐次判断操作风险，低风险自动放行',
+    permissionMode: 'auto',
+    permissions: {
+      allow: [
+        'Read',
+        'Glob',
+        'Grep',
+        'LSP'
+      ],
+      deny: [
+        'Read(.env)',
+        'Read(.env.*)',
+        'Read(**/secrets/**)',
+        'Read(**/*.pem)',
+        'Read(**/*.key)',
+        'Read(**/*credential*)',
+        'Bash(rm -rf:*)',
+        'Bash(sudo:*)'
+      ]
+    }
+  },
+
   'dev': {
     name: '开发模式',
     description: '日常开发权限，保护敏感文件',
@@ -314,80 +338,6 @@ export const PERMISSION_PRESETS: Record<PermissionModeName, PermissionPreset> = 
         'WebFetch(*)'
       ]
     }
-  },
-
-  'ci': {
-    name: 'CI/CD 模式',
-    description: '适合自动化流水线的权限',
-    permissionMode: 'default',
-    permissions: {
-      allow: [
-        'Read',
-        'Edit',
-        'Write',
-        'Glob',
-        'Grep',
-        'LSP',
-        'Bash(npm:*)',
-        'Bash(pnpm:*)',
-        'Bash(yarn:*)',
-        'Bash(node:*)',
-        'Bash(git:*)',
-        'Bash(docker:*)',
-        'Bash(make:*)',
-        'Bash(cargo:*)',
-        'Bash(go:*)',
-        'Bash(python:*)',
-        'Bash(pip:*)',
-        'Bash(pytest:*)',
-        'Bash(jest:*)',
-        'Bash(vitest:*)'
-      ],
-      deny: [
-        'Read(.env.local)',
-        'Read(**/secrets/**)',
-        'Bash(sudo:*)',
-        'Bash(ssh:*)',
-        'Bash(scp:*)',
-        'WebFetch(*)',
-        'WebSearch'
-      ]
-    }
-  },
-
-  'audit': {
-    name: '审计模式',
-    description: '仅读取和搜索，用于安全审计',
-    permissionMode: 'plan',
-    permissions: {
-      allow: [
-        'Read',
-        'Glob',
-        'Grep',
-        'LSP',
-        'Bash(git log:*)',
-        'Bash(git blame:*)',
-        'Bash(git show:*)',
-        'Bash(git diff:*)',
-        'Bash(ls:*)',
-        'Bash(find:*)',
-        'Bash(wc:*)',
-        'Bash(file:*)',
-        'Bash(stat:*)'
-      ],
-      deny: [
-        'Edit(*)',
-        'Write(*)',
-        'NotebookEdit(*)',
-        'Bash(rm:*)',
-        'Bash(mv:*)',
-        'Bash(cp:*)',
-        'Bash(curl:*)',
-        'Bash(wget:*)',
-        'Bash(ssh:*)',
-        'WebFetch(*)'
-      ]
-    }
   }
 };
 
@@ -406,6 +356,25 @@ export const normalizePermissionAllowRules = (rules: string[]): string[] => {
   return [...new Set(normalized)];
 };
 
+// 已下线的权限模式 → 当前替代模式（兼容旧配置、旧会话和旧命令）
+const LEGACY_PERMISSION_MODE_ALIASES: Record<string, PermissionModeName> = {
+  ci: 'safe',
+  audit: 'readonly',
+};
+
+/**
+ * 把任意字符串解析为当前有效的权限模式名称；无法识别时返回 null
+ */
+export const resolvePermissionModeName = (name: string | null | undefined): PermissionModeName | null => {
+  if (!name) return null;
+  if (Object.prototype.hasOwnProperty.call(PERMISSION_PRESETS, name)) {
+    return name as PermissionModeName;
+  }
+  return Object.prototype.hasOwnProperty.call(LEGACY_PERMISSION_MODE_ALIASES, name)
+    ? LEGACY_PERMISSION_MODE_ALIASES[name]
+    : null;
+};
+
 // 获取所有权限模式名称
 export const getPermissionModeNames = (): PermissionModeName[] => {
   return Object.keys(PERMISSION_PRESETS) as PermissionModeName[];
@@ -414,11 +383,10 @@ export const getPermissionModeNames = (): PermissionModeName[] => {
 // 权限模式图标
 const MODE_ICONS: Record<PermissionModeName, string> = {
   yolo: '🔓',
+  auto: '🤖',
   dev: '💻',
   readonly: '👀',
-  safe: '🛡️',
-  ci: '🔧',
-  audit: '🔍'
+  safe: '🛡️'
 };
 
 /**

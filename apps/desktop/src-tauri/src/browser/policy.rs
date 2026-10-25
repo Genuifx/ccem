@@ -41,7 +41,7 @@ pub(crate) fn authorize_browser_tool(permission_mode: &str, tool: &str) -> Resul
     }
     if !matches!(
         permission_mode,
-        "dev" | "yolo" | "bypassPermissions" | "readonly" | "audit" | "plan" | "safe" | "ci"
+        "dev" | "auto" | "yolo" | "bypassPermissions" | "readonly" | "audit" | "plan" | "safe" | "ci"
     ) && !READ_ONLY_BROWSER_TOOLS.contains(&tool)
     {
         return Err(format!(
@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn development_modes_allow_semantic_browser_tools() {
-        for mode in ["dev", "yolo", "bypassPermissions"] {
+        for mode in ["dev", "auto", "yolo", "bypassPermissions"] {
             for tool in [
                 "navigate",
                 "get_url",

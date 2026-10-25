@@ -119,10 +119,10 @@ export interface PermissionConfig {
 }
 
 // 权限模式名称
-export type PermissionModeName = 'yolo' | 'dev' | 'readonly' | 'safe' | 'ci' | 'audit';
+export type PermissionModeName = 'yolo' | 'auto' | 'dev' | 'readonly' | 'safe';
 
 // Claude Code 官方 permission mode
-export type OfficialPermissionMode = 'default' | 'acceptEdits' | 'plan' | 'dontAsk' | 'bypassPermissions';
+export type OfficialPermissionMode = 'default' | 'acceptEdits' | 'plan' | 'dontAsk' | 'bypassPermissions' | 'auto';
 
 // 权限预设类型
 export interface PermissionPreset {
