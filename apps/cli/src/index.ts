@@ -32,6 +32,7 @@ import {
   recoverEnvConfigFromLegacy,
   resolveEnvConfigForRuntime,
   PERMISSION_PRESETS,
+  resolvePermissionModeName,
   getCcemConfigDir,
   ensureCcemDir,
   ensureCcemAgentHome,
@@ -386,7 +387,11 @@ const promptForEnvironmentConfig = async (
 };
 
 // 权限模式列表
-const PERMISSION_MODES: PermissionModeName[] = ['yolo', 'dev', 'readonly', 'safe', 'ci', 'audit'];
+const PERMISSION_MODES: PermissionModeName[] = ['yolo', 'auto', 'dev', 'readonly', 'safe'];
+
+// 读取默认权限模式（兼容已下线的 ci 等旧值）
+const getDefaultMode = (): PermissionModeName | null =>
+  resolvePermissionModeName(config.get('defaultMode') as string | null);
 
 // 缓存 usage stats
 let usageStats: UsageStats | null = null;
@@ -466,7 +471,7 @@ const showCurrentEnv = (usageStats: UsageStats | null, usageLoading: boolean) =>
   const current = config.get('current') as string;
   const registries = getRegistries();
   const env = registries[current];
-  const defaultMode = config.get('defaultMode') as PermissionModeName | null;
+  const defaultMode = getDefaultMode();
 
   if (!env) return;
 
@@ -1047,11 +1052,10 @@ setupCmd
   .command('perms')
   .description('永久配置权限模式')
   .option('--yolo', '应用 YOLO 模式（全部放开）')
+  .option('--auto', '应用自动模式（模型判断权限）')
   .option('--dev', '应用开发模式')
   .option('--readonly', '应用只读模式')
   .option('--safe', '应用安全模式')
-  .option('--ci', '应用 CI/CD 模式')
-  .option('--audit', '应用审计模式')
   .option('--reset', '重置权限配置')
   .action(function(this: any) {
     const options = this.opts();
@@ -1078,11 +1082,10 @@ setupCmd
   .command('default-mode')
   .description('设置默认权限模式')
   .option('--yolo', 'YOLO 模式')
+  .option('--auto', '自动模式')
   .option('--dev', '开发模式')
   .option('--readonly', '只读模式')
   .option('--safe', '安全模式')
-  .option('--ci', 'CI/CD 模式')
-  .option('--audit', '审计模式')
   .option('--reset', '清除默认模式')
   .action(function(this: any) {
     const options = this.opts();
@@ -1103,7 +1106,7 @@ setupCmd
     }
 
     // 显示当前默认模式
-    const currentDefault = config.get('defaultMode') as PermissionModeName | null;
+    const currentDefault = getDefaultMode();
     if (currentDefault && PERMISSION_PRESETS[currentDefault]) {
       console.log(chalk.green(`当前默认模式: ${PERMISSION_PRESETS[currentDefault].name}`));
     } else {
@@ -1613,7 +1616,7 @@ program
       console.log('');
 
       // 获取默认模式
-      const defaultMode = config.get('defaultMode') as PermissionModeName | null;
+      const defaultMode = getDefaultMode();
       const registries = getRegistries();
       const current = config.get('current') as string;
       const envConfig = registries[current];
@@ -1802,7 +1805,7 @@ program
           return;
         }
       } else if (action === 'setDefault') {
-        const currentDefault = config.get('defaultMode') as PermissionModeName | null;
+        const currentDefault = getDefaultMode();
 
         const { selectedMode } = await inquirer.prompt([
           {

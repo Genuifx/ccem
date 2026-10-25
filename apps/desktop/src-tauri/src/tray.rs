@@ -105,7 +105,7 @@ fn build_env_menu(
 
 /// Build the permission mode submenu dynamically
 fn build_perm_menu(app: &AppHandle, current: &str) -> Result<Submenu<tauri::Wry>, tauri::Error> {
-    let modes = vec!["yolo", "dev", "readonly", "safe", "ci", "audit"];
+    let modes = vec!["yolo", "auto", "dev", "readonly", "safe"];
     let mut items: Vec<MenuItem<tauri::Wry>> = Vec::new();
 
     for mode in &modes {

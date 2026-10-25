@@ -41,7 +41,7 @@ const TELEGRAM_HTTP_TIMEOUT_SECS: u64 = 12;
 const TELEGRAM_STOP_GRACE_TIMEOUT_SECS: u64 = 7;
 const TELEGRAM_STOP_POLL_INTERVAL_MS: u64 = 100;
 const TELEGRAM_BIND_PROJECT_LIMIT: usize = 8;
-const TELEGRAM_BIND_PERM_MODES: &[&str] = &["yolo", "dev", "readonly", "safe", "ci", "audit"];
+const TELEGRAM_BIND_PERM_MODES: &[&str] = &["yolo", "auto", "dev", "readonly", "safe"];
 const TELEGRAM_MINIMAL_GROUP_COMMANDS: &[TelegramBotCommand] = &[
     TelegramBotCommand {
         command: "help",

@@ -48,6 +48,13 @@ test('maps ccem permission names to Claude Agent SDK permission modes', async ()
   assert.deepEqual(normalizeClaudePermissionMode('manual'), {
     permissionMode: 'manual',
     allowDangerouslySkipPermissions: false,
+  });  assert.deepEqual(normalizeClaudePermissionMode('auto'), {
+    permissionMode: 'auto',
+    allowDangerouslySkipPermissions: false,
+  });
+  assert.deepEqual(normalizeClaudePermissionMode('ci'), {
+    permissionMode: 'default',
+    allowDangerouslySkipPermissions: false,
   });
 });
 

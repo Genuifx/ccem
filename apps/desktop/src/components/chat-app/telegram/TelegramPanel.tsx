@@ -15,11 +15,10 @@ import { shallow } from 'zustand/shallow';
 
 const MODE_DISPLAY_NAMES: Record<PermissionModeName, string> = {
   yolo: 'YOLO',
+  auto: 'Auto',
   dev: 'Developer',
   readonly: 'Read Only',
   safe: 'Safe',
-  ci: 'CI / CD',
-  audit: 'Audit',
 };
 
 const INPUT_CLS =

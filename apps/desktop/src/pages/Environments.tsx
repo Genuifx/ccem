@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Plus, Shield, ShieldCheck, ShieldOff, ShieldAlert, ShieldBan, Search, LayoutGrid, List } from '@/lib/lucide-react';
+import { Plus, Shield, ShieldCheck, ShieldOff, ShieldAlert, ShieldBan, Sparkles, LayoutGrid, List } from '@/lib/lucide-react';
 import { ErrorBanner } from '@/components/ui/EmptyState';
 import { EnvList } from '@/components/environments';
 import { EnvironmentsRouterRules } from '@/components/EnvironmentsRouterRules';
@@ -274,21 +274,19 @@ export function Environments({ onAddEnv, onEditEnv, onCopyEnv, onDeleteEnv }: En
 
 const MODE_DISPLAY_NAMES: Record<PermissionModeName, string> = {
   yolo: 'YOLO',
+  auto: 'Auto',
   dev: 'Developer',
   readonly: 'Read Only',
   safe: 'Safe',
-  ci: 'CI / CD',
-  audit: 'Audit',
 };
 
 function getModeIcon(mode: PermissionModeName): typeof Shield {
   const iconMap: Record<PermissionModeName, typeof Shield> = {
     yolo: ShieldOff,
+    auto: Sparkles,
     dev: ShieldCheck,
     readonly: ShieldBan,
     safe: ShieldAlert,
-    ci: ShieldCheck,
-    audit: Search,
   };
   return iconMap[mode] || Shield;
 }

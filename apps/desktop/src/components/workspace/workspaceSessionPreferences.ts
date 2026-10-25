@@ -11,12 +11,15 @@ export interface WorkspaceHistorySessionPreference {
 export type WorkspaceHistorySessionPreferences = Record<string, WorkspaceHistorySessionPreference>;
 
 const DEFAULT_EFFORT: EffortLevel = 'max';
-const PERMISSION_MODES = new Set(['yolo', 'dev', 'readonly', 'safe', 'ci', 'audit']);
+const PERMISSION_MODES = new Set(['yolo', 'auto', 'dev', 'readonly', 'safe']);
 const CLAUDE_EFFORT_LEVELS = new Set<EffortLevel>(['low', 'medium', 'high', 'xhigh', 'max']);
 const CODEX_EFFORT_LEVELS = new Set<EffortLevel>(['minimal', 'low', 'medium', 'high', 'xhigh']);
 
-function isPermissionMode(value: string | undefined): value is PermissionModeName {
-  return Boolean(value && PERMISSION_MODES.has(value));
+function resolvePermissionMode(value: string | undefined): PermissionModeName | null {
+  // Retired modes: "ci" became "safe", "audit" became "readonly".
+  if (value === 'ci') return 'safe';
+  if (value === 'audit') return 'readonly';
+  return value && PERMISSION_MODES.has(value) ? value as PermissionModeName : null;
 }
 
 function isEffortLevel(value: string | null | undefined): value is EffortLevel {
@@ -74,7 +77,7 @@ export function resolveHistorySessionControls(options: {
   defaultPermMode: PermissionModeName;
 }) {
   const saved = options.preferences[sessionPreferenceKey(options.session)] ?? {};
-  const savedPermMode = isPermissionMode(saved.permMode) ? saved.permMode : null;
+  const savedPermMode = resolvePermissionMode(saved.permMode);
 
   return {
     envName: saved.envName || options.session.envName || options.currentEnv || '',

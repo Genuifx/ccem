@@ -3,7 +3,7 @@ import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import { DeleteEnvConfirmDialog } from '@/components/DeleteEnvConfirmDialog';
 import { createDeleteGuard } from '@/lib/asyncGuard';
-import { ENV_PRESETS } from '@ccem/core/browser';
+import { ENV_PRESETS, resolvePermissionModeName } from '@ccem/core/browser';
 import type { PermissionModeName } from '@ccem/core/browser';
 import { AppLayout } from '@/components/layout';
 import { Workspace } from '@/pages/Workspace';
@@ -60,12 +60,8 @@ const EnvironmentDialogComponent = lazy(async () =>
   import('@/components/EnvironmentDialog').then((m) => ({ default: m.EnvironmentDialog }))
 );
 
-const PERMISSION_MODE_NAMES: PermissionModeName[] = ['yolo', 'dev', 'readonly', 'safe', 'ci', 'audit'];
-
 function normalizeAppPermissionMode(value: unknown): PermissionModeName | null {
-  return typeof value === 'string' && (PERMISSION_MODE_NAMES as string[]).includes(value)
-    ? value as PermissionModeName
-    : null;
+  return typeof value === 'string' ? resolvePermissionModeName(value) : null;
 }
 
 function AppContent() {

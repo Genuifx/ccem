@@ -5,6 +5,7 @@ import {
   PERMISSION_PRESETS,
   getPermissionModeNames,
   getModeIcon,
+  resolvePermissionModeName,
   formatPermissionDescription,
   normalizePermissionAllowRule,
   normalizePermissionAllowRules,
@@ -112,7 +113,7 @@ describe('presets', () => {
   });
 
   describe('PERMISSION_PRESETS', () => {
-    const expectedModes: PermissionModeName[] = ['yolo', 'dev', 'readonly', 'safe', 'ci', 'audit'];
+    const expectedModes: PermissionModeName[] = ['yolo', 'auto', 'dev', 'readonly', 'safe'];
 
     it('should have all expected permission modes', () => {
       for (const mode of expectedModes) {
@@ -156,10 +157,6 @@ describe('presets', () => {
       expect(PERMISSION_PRESETS.readonly.permissions.deny).toContain('Write(*)');
     });
 
-    it('should have audit mode that denies modifications', () => {
-      expect(PERMISSION_PRESETS.audit.permissionMode).toBe('plan');
-      expect(PERMISSION_PRESETS.audit.permissions.deny).toContain('Edit(*)');
-    });
   });
 
   describe('normalizePermissionAllowRule', () => {
@@ -191,9 +188,29 @@ describe('presets', () => {
       expect(names).toContain('dev');
       expect(names).toContain('readonly');
       expect(names).toContain('safe');
-      expect(names).toContain('ci');
-      expect(names).toContain('audit');
-      expect(names.length).toBe(6);
+      expect(names).toContain('auto');
+      expect(names).not.toContain('ci');
+      expect(names).not.toContain('audit');
+      expect(names.length).toBe(5);
+    });
+  });
+
+  describe('auto preset', () => {
+    it('should hand permission decisions to the SDK auto mode', () => {
+      expect(PERMISSION_PRESETS.auto.permissionMode).toBe('auto');
+      expect(PERMISSION_PRESETS.auto.permissions.deny).toContain('Read(.env)');
+    });
+  });
+
+  describe('resolvePermissionModeName', () => {
+    it('should keep current modes and map retired ci to safe', () => {
+      expect(resolvePermissionModeName('auto')).toBe('auto');
+      expect(resolvePermissionModeName('dev')).toBe('dev');
+      expect(resolvePermissionModeName('ci')).toBe('safe');
+      expect(resolvePermissionModeName('audit')).toBe('readonly');
+      expect(resolvePermissionModeName('unknown')).toBeNull();
+      expect(resolvePermissionModeName('toString')).toBeNull();
+      expect(resolvePermissionModeName(null)).toBeNull();
     });
   });
 
@@ -203,8 +220,7 @@ describe('presets', () => {
       expect(getModeIcon('dev')).toBe('💻');
       expect(getModeIcon('readonly')).toBe('👀');
       expect(getModeIcon('safe')).toBe('🛡️');
-      expect(getModeIcon('ci')).toBe('🔧');
-      expect(getModeIcon('audit')).toBe('🔍');
+      expect(getModeIcon('auto')).toBe('🤖');
     });
   });
 

@@ -4,11 +4,10 @@ export type WorkspacePermissionModeName = PermissionModeName;
 
 const CCEM_PERMISSION_MODE_NAMES = new Set<string>([
   'yolo',
+  'auto',
   'dev',
   'readonly',
   'safe',
-  'ci',
-  'audit',
 ]);
 
 const WORKSPACE_PERMISSION_MODE_ALIASES: Record<string, WorkspacePermissionModeName> = {
@@ -16,8 +15,9 @@ const WORKSPACE_PERMISSION_MODE_ALIASES: Record<string, WorkspacePermissionModeN
   acceptEdits: 'dev',
   default: 'dev',
   manual: 'dev',
-  auto: 'dev',
   dontAsk: 'safe',
+  ci: 'safe',
+  audit: 'readonly',
   'danger-full-access': 'yolo',
   'workspace-write': 'dev',
   'read-only': 'readonly',
@@ -25,11 +25,10 @@ const WORKSPACE_PERMISSION_MODE_ALIASES: Record<string, WorkspacePermissionModeN
 
 export const WORKSPACE_PERMISSION_MODE_DISPLAY_NAMES: Record<WorkspacePermissionModeName, string> = {
   yolo: 'YOLO',
+  auto: 'Auto',
   dev: 'Developer',
   readonly: 'Read Only',
   safe: 'Safe',
-  ci: 'CI / CD',
-  audit: 'Audit',
 };
 
 export function normalizeWorkspacePermissionModeName(

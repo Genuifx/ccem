@@ -50,6 +50,7 @@ test('browser MCP keeps a stable tool surface and enforces hot permission change
     assert.deepEqual(registeredToolNames(createCcemBrowserMcpServer(mode, async () => ({}))), allTools);
   }
   assert.deepEqual(browserToolNamesForPermissionMode('custom').sort(), readTools);
+  assert.deepEqual(browserToolNamesForPermissionMode('auto').sort(), allTools);
 
   let mode = 'readonly';
   const requests = [];

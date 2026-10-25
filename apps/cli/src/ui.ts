@@ -317,16 +317,15 @@ export const getMainMenuChoices = (defaultMode: PermissionModeName | null) => {
 // 权限模式颜色
 const modeColors: Record<PermissionModeName, (s: string) => string> = {
   yolo: theme.danger,
+  auto: theme.accent,
   dev: theme.success,
   readonly: theme.primary,
   safe: theme.warning,
-  ci: theme.accent,
-  audit: theme.primary,
 };
 
 // 权限模式选项
 export const getPermModeChoices = (currentMode?: PermissionModeName | null, showCurrent = false) => {
-  const modes: PermissionModeName[] = ['yolo', 'dev', 'readonly', 'safe', 'ci', 'audit'];
+  const modes: PermissionModeName[] = ['yolo', 'auto', 'dev', 'readonly', 'safe'];
 
   const choices = modes.map(mode => {
     const preset = PERMISSION_PRESETS[mode];

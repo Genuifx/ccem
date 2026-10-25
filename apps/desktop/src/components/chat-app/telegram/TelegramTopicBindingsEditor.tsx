@@ -35,11 +35,10 @@ const EMPTY_DRAFT: BindingDraft = {
 
 const MODE_DISPLAY_NAMES: Record<PermissionModeName, string> = {
   yolo: 'YOLO',
+  auto: 'Auto',
   dev: 'Developer',
   readonly: 'Read Only',
   safe: 'Safe',
-  ci: 'CI / CD',
-  audit: 'Audit',
 };
 
 function toDraft(binding: TelegramTopicBinding): BindingDraft {

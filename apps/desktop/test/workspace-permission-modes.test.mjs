@@ -66,6 +66,9 @@ test('normalizes runtime permission aliases back to ccem permission names', asyn
   assert.equal(normalizeWorkspacePermissionModeName('acceptEdits'), 'dev');
   assert.equal(normalizeWorkspacePermissionModeName('manual'), 'dev');
   assert.equal(normalizeWorkspacePermissionModeName('read-only'), 'readonly');
+  assert.equal(normalizeWorkspacePermissionModeName('auto'), 'auto');
+  assert.equal(normalizeWorkspacePermissionModeName('ci'), 'safe');
+  assert.equal(normalizeWorkspacePermissionModeName('audit'), 'readonly');
   assert.equal(normalizeWorkspacePermissionModeName('unknown-mode'), 'dev');
 });
 
