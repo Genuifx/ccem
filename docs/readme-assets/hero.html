@@ -2,11 +2,10 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>CCEM — switchboard hero</title>
+<title>CCEM — delegate the easy work</title>
 <style>
   :root {
     --bakelite: #16130f;
-    --bakelite-2: #201b15;
     --cream: #efe4cf;
     --cream-dim: #b9ab93;
     --brass: #c9a25d;
@@ -14,35 +13,32 @@
     --opus: #e07642;
     --sonnet: #4f8de0;
     --haiku: #a6cbf6;
+    --cheap: #7fd6a4;
     --idle: #6d6458;
-    --ink: #0d0b09;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { width: 2400px; height: 1350px; background: var(--bakelite); }
   body { position: relative; font-family: "Gill Sans", "Gill Sans MT", sans-serif; color: var(--cream); }
 
-  /* atmosphere: warm vignette + faint ruled panel lines + grain */
   .bg { position: absolute; inset: 0;
     background:
-      radial-gradient(1100px 700px at 74% 42%, rgba(224,118,66,.16), transparent 70%),
-      radial-gradient(900px 600px at 8% 100%, rgba(79,141,224,.14), transparent 70%),
+      radial-gradient(1000px 700px at 76% 44%, rgba(224,118,66,.14), transparent 70%),
+      radial-gradient(900px 600px at 6% 100%, rgba(127,214,164,.10), transparent 70%),
       repeating-linear-gradient(0deg, rgba(255,255,255,.018) 0 1px, transparent 1px 6px),
       linear-gradient(160deg, #1d1813 0%, #120f0c 60%, #0e0c0a 100%); }
   .grain { position: absolute; inset: 0; opacity: .32; mix-blend-mode: overlay; pointer-events: none; }
 
-  /* left column: copy */
-  .eyebrow { position: absolute; left: 120px; top: 118px; font-family: Copperplate, serif; font-size: 26px; letter-spacing: .32em; color: var(--brass); }
+  .eyebrow { position: absolute; left: 120px; top: 112px; font-family: Copperplate, serif; font-size: 26px; letter-spacing: .32em; color: var(--brass); }
   .eyebrow b { color: var(--cream); font-weight: 400; }
-  h1 { position: absolute; left: 112px; top: 178px; font-family: "DIN Condensed", sans-serif; font-weight: 700; font-size: 150px; line-height: .88; letter-spacing: -.005em; text-transform: uppercase; color: var(--cream); }
+  h1 { position: absolute; left: 112px; top: 170px; font-family: "DIN Condensed", sans-serif; font-weight: 700; font-size: 142px; line-height: .9; text-transform: uppercase; color: var(--cream); }
   h1 .hot { color: var(--opus); display: block; text-shadow: 0 0 60px rgba(224,118,66,.35); }
-  .sub { position: absolute; left: 120px; top: 640px; width: 880px; font-size: 35px; line-height: 1.4; color: var(--cream-dim); }
+  .sub { position: absolute; left: 120px; top: 600px; width: 880px; font-size: 34px; line-height: 1.42; color: var(--cream-dim); }
   .sub em { font-style: normal; color: var(--cream); }
-  .cmd { position: absolute; left: 120px; top: 880px; display: flex; align-items: center; gap: 22px; font-family: "PT Mono", Menlo, monospace; font-size: 34px; color: var(--cream); }
-  .cmd .prompt { color: var(--opus); }
-  .cmd .tag { font-family: Copperplate, serif; font-size: 20px; letter-spacing: .24em; color: var(--brass); border: 1.5px solid var(--brass-dk); padding: 9px 16px 7px; border-radius: 4px; }
+  .sub .g { color: var(--cheap); }
+  .badges { position: absolute; left: 120px; top: 862px; display: flex; gap: 16px; }
+  .badge { font-family: Copperplate, serif; font-size: 20px; letter-spacing: .22em; color: var(--brass); border: 1.5px solid var(--brass-dk); padding: 9px 16px 7px; border-radius: 4px; }
 
-  /* switchboard panel */
-  .panel { position: absolute; left: 1080px; top: 96px; width: 1230px; height: 900px; border-radius: 26px;
+  .panel { position: absolute; left: 1060px; top: 90px; width: 1250px; height: 910px; border-radius: 26px;
     background: linear-gradient(180deg, #2a231b 0%, #1b1712 100%);
     box-shadow: inset 0 2px 0 rgba(255,255,255,.06), inset 0 -3px 0 rgba(0,0,0,.5), 0 40px 90px rgba(0,0,0,.55), 0 0 0 2px #0a0907; }
   .panel::before { content: ""; position: absolute; inset: 22px; border-radius: 16px; border: 1.5px solid rgba(201,162,93,.22); }
@@ -50,21 +46,29 @@
   .screw::after { content: ""; position: absolute; left: 4px; right: 4px; top: 10px; height: 2px; background: #4a3819; transform: rotate(35deg); }
   .panel svg { position: absolute; inset: 0; overflow: visible; }
 
+  /* planner cards (HTML, over the svg) */
+  .planner { position: absolute; left: 58px; width: 330px; border-radius: 14px; padding: 18px 20px 14px;
+    background: linear-gradient(180deg, #f4ead6, #e2d4b8); color: #2a2117; box-shadow: 0 16px 30px rgba(0,0,0,.5), inset 0 0 0 1.5px #b9a57f; }
+  .planner h3 { font-family: Copperplate, serif; font-size: 23px; letter-spacing: .16em; display: flex; justify-content: space-between; align-items: baseline; }
+  .planner h3 small { font-family: "PT Mono", Menlo, monospace; font-size: 15px; letter-spacing: 0; color: #8a6a35; }
+  .planner ul { list-style: none; margin-top: 12px; font-family: "PT Mono", Menlo, monospace; font-size: 18px; line-height: 1.75; }
+  .planner li { display: flex; gap: 10px; align-items: center; }
+  .planner li .m { width: 16px; height: 16px; border-radius: 4px; border: 2px solid #8f7a55; flex: none; }
+  .planner li.out { color: #6a5a44; }
+  .planner li.out .m { border-color: #3c9a66; background: #7fd6a4; }
+  .planner li.keep { color: #2a2117; font-weight: 700; }
+  .planner li.keep .m { border-color: var(--opus); background: var(--opus); border-radius: 50%; }
+
   .plate { font-family: Copperplate, serif; font-size: 22px; letter-spacing: .14em; fill: #2a2117; }
   .plate-sm { font-family: Copperplate, serif; font-size: 16px; letter-spacing: .3em; fill: var(--brass); }
+  .task { font-family: "PT Mono", Menlo, monospace; font-size: 16px; fill: #d8ccb6; }
 
-  /* bottom rail: permission keycaps + features */
-  .rail { position: absolute; left: 120px; right: 90px; top: 1060px; height: 210px; display: grid; grid-template-columns: auto 1fr; gap: 70px; align-items: center; }
-  .keys-label, .feat-label { font-family: Copperplate, serif; font-size: 20px; letter-spacing: .28em; color: var(--brass); margin-bottom: 18px; }
-  .keys { display: flex; gap: 16px; }
-  .key { position: relative; min-width: 120px; padding: 22px 26px 26px; border-radius: 14px; text-align: center; font-family: "PT Mono", Menlo, monospace; font-size: 30px; color: #d8ccb6;
-    background: linear-gradient(180deg, #3a3128 0%, #2a231c 100%);
-    box-shadow: inset 0 2px 0 rgba(255,255,255,.08), 0 8px 0 #120f0b, 0 14px 24px rgba(0,0,0,.5); }
-  .key.on { color: #fff6ea; background: linear-gradient(180deg, #ee8a55 0%, #c95f2f 100%);
-    box-shadow: inset 0 2px 0 rgba(255,255,255,.35), 0 8px 0 #7a3415, 0 0 40px rgba(224,118,66,.55), 0 14px 24px rgba(0,0,0,.5); }
-  .key.on::after { content: ""; position: absolute; top: 10px; right: 12px; width: 9px; height: 9px; border-radius: 50%; background: #fff3c4; box-shadow: 0 0 10px #ffd27a; }
-  .feats { display: flex; flex-wrap: wrap; gap: 14px 14px; }
-  .feat { font-family: "PT Mono", Menlo, monospace; font-size: 25px; color: var(--cream); padding: 12px 20px; border-radius: 999px; border: 1.5px solid rgba(239,228,207,.22); background: rgba(239,228,207,.04); }
+  .rail { position: absolute; left: 120px; right: 90px; top: 1062px; height: 220px; display: grid; grid-template-columns: 1080px 1fr; gap: 60px; align-items: start; }
+  .label { font-family: Copperplate, serif; font-size: 20px; letter-spacing: .28em; color: var(--brass); margin-bottom: 18px; }
+  .term { border-radius: 14px; padding: 22px 26px; background: #0d0b09; box-shadow: inset 0 0 0 1.5px rgba(201,162,93,.25), 0 14px 30px rgba(0,0,0,.45); font-family: "PT Mono", Menlo, monospace; font-size: 23px; line-height: 1.6; color: #d8ccb6; white-space: nowrap; }
+  .term .p { color: var(--opus); } .term .k { color: var(--haiku); } .term .s { color: var(--cheap); } .term .d { color: #6e665b; }
+  .feats { display: flex; flex-wrap: wrap; gap: 14px; }
+  .feat { font-family: "PT Mono", Menlo, monospace; font-size: 23px; color: var(--cream); padding: 11px 18px; border-radius: 999px; border: 1.5px solid rgba(239,228,207,.22); background: rgba(239,228,207,.04); }
   .feat i { font-style: normal; color: var(--opus); margin-right: 10px; }
   .feat.free { border-color: var(--opus); color: var(--opus); }
 </style>
@@ -74,14 +78,14 @@
 <svg class="grain" width="2400" height="1350"><filter id="n"><feTurbulence type="fractalNoise" baseFrequency=".9" numOctaves="3" stitchTiles="stitch"/><feColorMatrix values="0 0 0 0 .5  0 0 0 0 .5  0 0 0 0 .5  0 0 0 .9 0"/></filter><rect width="100%" height="100%" filter="url(#n)"/></svg>
 
 <div class="eyebrow"><b>CCEM</b> &nbsp;·&nbsp; Claude Code Environment Manager</div>
-<h1>Every agent.<br>Every model.<span class="hot">One switchboard.</span></h1>
-<p class="sub">Plug <em>Claude Code, Codex and OpenCode</em> into any provider. Switch models in one keystroke, set permissions in one word, and send busywork to cheaper models.</p>
-<div class="cmd"><span><span class="prompt">$</span> npx ccem</span><span class="tag">CLI + Desktop</span><span class="tag">macOS · Windows</span></div>
+<h1>Let Claude &amp; Codex<br>delegate the<span class="hot">easy work.</span></h1>
+<p class="sub">The <em>Claude and Codex apps</em> keep planning. With the CCEM skill they hand routine tasks to the <span class="g">best-value model</span> — DeepSeek, GLM, KIMI, Qwen — as background sessions, then track them and pull the results back.</p>
+<div class="badges"><span class="badge">CLI + Desktop</span><span class="badge">macOS · Windows</span><span class="badge">Open source</span></div>
 
 <div class="panel">
   <span class="screw" style="left:34px;top:34px"></span><span class="screw" style="right:34px;top:34px"></span>
   <span class="screw" style="left:34px;bottom:34px"></span><span class="screw" style="right:34px;bottom:34px"></span>
-  <svg width="1230" height="900" viewBox="0 0 1230 900">
+  <svg width="1250" height="910" viewBox="0 0 1250 910">
     <defs>
       <radialGradient id="hole" cx="50%" cy="45%" r="55%"><stop offset="0" stop-color="#000"/><stop offset=".7" stop-color="#0b0907"/><stop offset="1" stop-color="#2b241c"/></radialGradient>
       <linearGradient id="brass" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f0d9a6"/><stop offset=".55" stop-color="#b98f4a"/><stop offset="1" stop-color="#6e5226"/></linearGradient>
@@ -91,48 +95,64 @@
       <filter id="drop" x="-20%" y="-20%" width="140%" height="160%"><feDropShadow dx="0" dy="10" stdDeviation="9" flood-color="#000" flood-opacity=".55"/></filter>
     </defs>
 
-    <!-- section labels -->
-    <text class="plate-sm" x="96" y="92">AGENTS</text>
-    <text class="plate-sm" x="1134" y="92" text-anchor="end">PROVIDERS · 11 PRESETS</text>
+    <text class="plate-sm" x="66" y="86">PLANNERS</text>
+    <text class="plate-sm" x="1184" y="86" text-anchor="end">WORKERS · BEST-VALUE MODELS</text>
 
-    <!-- cords (drawn first so jacks sit on top) -->
     <g id="cords" filter="url(#drop)"></g>
 
     <!-- center dial -->
-    <g transform="translate(560 430)">
-      <circle r="178" fill="#0e0c09" opacity=".6" transform="translate(0 14)"/>
-      <circle r="176" fill="url(#brass)"/>
-      <circle r="164" fill="url(#dial)"/>
-      <circle r="164" fill="none" stroke="#b9a57f" stroke-width="1.5"/>
+    <g transform="translate(600 440)">
+      <circle r="150" fill="#0e0c09" opacity=".6" transform="translate(0 14)"/>
+      <circle r="148" fill="url(#brass)"/>
+      <circle r="137" fill="url(#dial)"/>
       <g id="ticks"></g>
-      <image href="../../logo.png" x="-118" y="-118" width="236" height="236" style="mix-blend-mode:multiply"/>
+      <image href="../../logo.png" x="-100" y="-100" width="200" height="200" style="mix-blend-mode:multiply"/>
     </g>
-
-    <!-- tier legend -->
-    <g transform="translate(400 690)" font-family="PT Mono, Menlo, monospace" font-size="20" fill="#d8ccb6">
-      <rect x="-26" y="-34" width="372" height="58" rx="29" fill="rgba(0,0,0,.35)" stroke="rgba(201,162,93,.3)"/>
-      <circle cx="0" cy="-5" r="9" fill="var(--opus)"/><text x="18" y="2">opus</text>
-      <circle cx="116" cy="-5" r="9" fill="var(--sonnet)"/><text x="134" y="2">sonnet</text>
-      <circle cx="246" cy="-5" r="9" fill="var(--haiku)"/><text x="264" y="2">haiku</text>
+    <g transform="translate(600 640)" text-anchor="middle">
+      <rect x="-190" y="-26" width="380" height="44" rx="22" fill="rgba(0,0,0,.4)" stroke="rgba(201,162,93,.35)"/>
+      <text font-family="PT Mono, Menlo, monospace" font-size="18" fill="#d8ccb6" y="3">ccem skill → desktop create</text>
     </g>
-    <text class="plate-sm" x="560" y="770" text-anchor="middle">PER-SUBAGENT ROUTING</text>
+    <text class="plate-sm" x="600" y="712" text-anchor="middle">BACKGROUND SESSIONS · TRACKED</text>
 
+    <g transform="translate(70 830)" font-family="PT Mono, Menlo, monospace" font-size="17" fill="#d8ccb6">
+      <circle cx="8" cy="-6" r="8" fill="var(--opus)"/><text x="26" y="0">stays on your best model</text>
+      <rect x="300" y="-14" width="16" height="16" rx="4" fill="#7fd6a4" stroke="#3c9a66" stroke-width="2"/><text x="326" y="0">handed off via CCEM</text>
+      <text x="580" y="0" fill="#8a7d68">$ = relative cost</text>
+    </g>
     <g id="jacks"></g>
   </svg>
+
+  <div class="planner" style="top:150px">
+    <h3>CLAUDE <small>app · plans</small></h3>
+    <ul>
+      <li class="keep"><span class="m"></span>redesign data flow</li>
+      <li class="out"><span class="m"></span>write auth tests</li>
+      <li class="out"><span class="m"></span>update API docs</li>
+    </ul>
+  </div>
+  <div class="planner" style="top:500px">
+    <h3>CODEX <small>app · plans</small></h3>
+    <ul>
+      <li class="keep"><span class="m"></span>review the release</li>
+      <li class="out"><span class="m"></span>rename config keys</li>
+      <li class="out"><span class="m"></span>triage lint errors</li>
+    </ul>
+  </div>
 </div>
 
 <div class="rail">
   <div>
-    <div class="keys-label">PERMISSIONS · ONE WORD</div>
-    <div class="keys"><span class="key">yolo</span><span class="key on">auto</span><span class="key">dev</span><span class="key">readonly</span><span class="key">safe</span></div>
+    <div class="label">WHAT THE APPS RUN</div>
+    <div class="term"><span class="p">$</span> ccem desktop create <span class="k">--provider</span> claude <span class="k">--env</span> <span class="s">deepseek</span> \<br>&nbsp;&nbsp;<span class="k">--prompt</span> "write auth tests" <span class="k">--perm</span> dev <span class="k">--json</span> <span class="d"># → runtimeId · ccem://</span></div>
   </div>
   <div>
-    <div class="feat-label">ALSO ON THE BOARD</div>
+    <div class="label">ALSO ON THE BOARD</div>
     <div class="feats">
-      <span class="feat"><i>◆</i>usage &amp; cost analytics</span>
-      <span class="feat"><i>◆</i>cron automation</span>
-      <span class="feat"><i>◆</i>Telegram · WeChat · WeCom · Feishu</span>
-      <span class="feat"><i>◆</i>fork &amp; rewind sessions</span>
+      <span class="feat"><i>◆</i>11 provider presets</span>
+      <span class="feat"><i>◆</i>one-word permissions</span>
+      <span class="feat"><i>◆</i>per-subagent routing</span>
+      <span class="feat"><i>◆</i>usage &amp; cost</span>
+      <span class="feat"><i>◆</i>cron · chat bots</span>
       <span class="feat free">free &amp; open source</span>
     </div>
   </div>
@@ -141,47 +161,50 @@
 <script>
   const NS = 'http://www.w3.org/2000/svg';
   const el = (tag, attrs, parent) => { const n = document.createElementNS(NS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); parent && parent.appendChild(n); return n; };
-  const hub = { x: 560, y: 430 };
-  const agents = [ { name: 'CLAUDE CODE', y: 250, tier: 'opus', live: true }, { name: 'CODEX', y: 430, tier: 'sonnet', live: true }, { name: 'OPENCODE', y: 610, tier: null, live: false } ];
-  const providers = ['KIMI', 'GLM', 'DEEPSEEK', 'QWEN', 'MINIMAX', 'MIMO', 'OPENROUTER', 'OLLAMA'].map((n, i) => ({ name: n, y: 150 + i * 88 }));
-  const route = { KIMI: 'opus', GLM: 'sonnet', DEEPSEEK: 'haiku', OLLAMA: 'haiku' };
-  const color = t => ({ opus: 'var(--opus)', sonnet: 'var(--sonnet)', haiku: 'var(--haiku)' }[t] || 'var(--idle)');
-  const AX = 120, PX = 1110;
+  const hub = { x: 600, y: 440 };
+  const PX = 1150;
+  const workers = [
+    { name: 'DEEPSEEK', y: 200, task: 'auth tests', cost: 1, c: 'var(--cheap)' },
+    { name: 'GLM',      y: 360, task: 'API docs',   cost: 1, c: 'var(--cheap)' },
+    { name: 'KIMI',     y: 520, task: 'config keys', cost: 2, c: 'var(--haiku)' },
+    { name: 'QWEN',     y: 680, task: 'lint triage', cost: 1, c: 'var(--cheap)' },
+  ];
 
-  // dial ticks
   const ticks = document.getElementById('ticks');
-  for (let i = 0; i < 60; i++) { const a = i * Math.PI / 30, r1 = i % 5 ? 152 : 146, r2 = 158;
+  for (let i = 0; i < 60; i++) { const a = i * Math.PI / 30, r1 = i % 5 ? 126 : 120, r2 = 132;
     el('line', { x1: Math.cos(a) * r1, y1: Math.sin(a) * r1, x2: Math.cos(a) * r2, y2: Math.sin(a) * r2, stroke: '#9c8762', 'stroke-width': i % 5 ? 1.2 : 2.4 }, ticks); }
 
-  // cords: sagging cubic beziers with a dark sheath + colored core
   const cords = document.getElementById('cords');
-  const cord = (x1, y1, x2, y2, c, sag, live) => {
+  const cord = (x1, y1, x2, y2, c, sag) => {
     const d = `M${x1} ${y1} C ${x1 + (x2 - x1) * .35} ${y1 + sag}, ${x1 + (x2 - x1) * .65} ${y2 + sag}, ${x2} ${y2}`;
     el('path', { d, fill: 'none', stroke: '#0a0806', 'stroke-width': 19, 'stroke-linecap': 'round' }, cords);
-    const core = el('path', { d, fill: 'none', stroke: c, 'stroke-width': 12, 'stroke-linecap': 'round', opacity: live ? 1 : .55 }, cords);
+    el('path', { d, fill: 'none', stroke: c, 'stroke-width': 12, 'stroke-linecap': 'round', filter: 'url(#glow)' }, cords);
     el('path', { d, fill: 'none', stroke: 'rgba(255,255,255,.28)', 'stroke-width': 3, 'stroke-linecap': 'round', transform: 'translate(0 -3)' }, cords);
-    if (live) core.setAttribute('filter', 'url(#glow)');
   };
-  agents.forEach(a => cord(AX + 20, a.y, hub.x - 150, hub.y + (a.y - hub.y) * .45, color(a.tier), a.live ? 70 : 110, a.live));
-  providers.forEach(p => { const t = route[p.name]; if (t) cord(hub.x + 150, hub.y + (p.y - hub.y) * .45, PX - 20, p.y, color(t), 60, true); });
-  // a loose, unplugged cord hanging from the board for texture
-  cord(PX - 20, 150 + 5 * 88, 930, 840, 'var(--idle)', 40, false);
+  // planners (right edge of cards) → dial, in planner orange
+  cord(390, 235, hub.x - 140, hub.y - 50, 'var(--opus)', 60);
+  cord(390, 585, hub.x - 140, hub.y + 50, 'var(--opus)', 60);
+  // dial → workers, colored by cost
+  workers.forEach(w => cord(hub.x + 140, hub.y + (w.y - hub.y) * .4, PX - 20, w.y, w.c, 50));
 
-  // jacks + nameplates
   const jacks = document.getElementById('jacks');
-  const jack = (x, y, label, side, lit, c) => {
-    const g = el('g', { transform: `translate(${x} ${y})` }, jacks);
-    el('circle', { r: 27, fill: 'url(#brass)' }, g);
-    el('circle', { r: 19, fill: '#3b3024' }, g);
-    el('circle', { r: 12, fill: 'url(#hole)' }, g);
-    if (lit) { el('circle', { cx: side === 'r' ? 46 : -46, cy: 0, r: 7, fill: c, filter: 'url(#glow)' }, g); }
-    const w = label.length * 17 + 40, px = side === 'r' ? 62 : -62 - w;
-    el('rect', { x: px, y: -21, width: w, height: 42, rx: 5, fill: 'url(#plate)', stroke: '#8f7a55', 'stroke-width': 1.2 }, g);
-    el('circle', { cx: px + 9, cy: 0, r: 2.6, fill: '#8f7a55' }, g); el('circle', { cx: px + w - 9, cy: 0, r: 2.6, fill: '#8f7a55' }, g);
-    const t = el('text', { class: 'plate', x: px + w / 2, y: 8, 'text-anchor': 'middle' }, g); t.textContent = label;
-  };
-  agents.forEach(a => jack(AX, a.y, a.name, 'r', a.live, color(a.tier)));
-  providers.forEach(p => jack(PX, p.y, p.name, 'l', !!route[p.name], color(route[p.name])));
+  workers.forEach(w => {
+    const g = el('g', { transform: `translate(${PX} ${w.y})` }, jacks);
+    el('circle', { r: 27, fill: 'url(#brass)' }, g); el('circle', { r: 19, fill: '#3b3024' }, g); el('circle', { r: 12, fill: 'url(#hole)' }, g);
+    el('circle', { cx: -46, cy: 0, r: 7, fill: w.c, filter: 'url(#glow)' }, g);
+    const wpl = w.name.length * 17 + 40, px = -62 - wpl;
+    el('rect', { x: px, y: -21, width: wpl, height: 42, rx: 5, fill: 'url(#plate)', stroke: '#8f7a55', 'stroke-width': 1.2 }, g);
+    const t = el('text', { class: 'plate', x: px + wpl / 2, y: 8, 'text-anchor': 'middle' }, g); t.textContent = w.name;
+    // task + cost meter under the plate
+    const label = '↳ ' + w.task, lw = label.length * 10 + 26;
+    el('rect', { x: px + wpl - lw, y: 30, width: lw, height: 30, rx: 15, fill: 'rgba(10,8,6,.88)', stroke: 'rgba(201,162,93,.3)' }, g);
+    const tt = el('text', { class: 'task', x: px + wpl - 13, y: 51, 'text-anchor': 'end' }, g); tt.textContent = label;
+    for (let i = 0; i < 3; i++) {
+      const on = i < w.cost;
+      const tx = el('text', { x: px + wpl - 2 - (2 - i) * 18, y: -32, 'text-anchor': 'end', 'font-family': 'PT Mono, Menlo, monospace', 'font-size': 18, fill: on ? w.c : '#4a4238' }, g);
+      tx.textContent = '$';
+    }
+  });
 </script>
 </body>
 </html>

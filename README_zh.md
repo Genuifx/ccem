@@ -19,7 +19,7 @@
   <a href="https://github.com/Genuifx/ccem/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" /></a>
 </p>
 
-![CCEM — every agent, every model, one switchboard](./screenshots/hero.webp)
+![CCEM — let Claude & Codex delegate the easy work to best-value models](./screenshots/hero.webp)
 
 ---
 
@@ -45,12 +45,13 @@
 Claude Code 很好用。可一旦每天认真用，事情就开始乱了。
 
 - **模型太多。** 前端用 KIMI，脚本用 DeepSeek，重构用 GLM，飞机上用本地 Ollama。每切一次都要手动 `export` 环境变量，开到第八个终端标签，谁也记不清哪个标签连的是哪家。
+- **最强的模型在干杂活。** Claude 或 Codex 用顶级模型的 token 去改配置项名字、写样板测试。
 - **审批疲劳。** 一天点 200 次 *允许* 谁都受不了。可 `--dangerously-skip-permissions` 放在 `.env` 旁边，怎么看都不放心。
 - **不知道花了多少。** Claude Code、Codex、OpenCode 各记各的日志，没有地方把它们加起来。
 - **人不在电脑前。** 你出门买咖啡，测试挂了，电脑在家里。
 - **本该自己跑的活。** 每晚跑测试、周一扫一遍 PR、周五出 changelog，跑完把结果发到手机。
 
-**ccem 把这些都包了。** 它是免费开源的 CLI 加原生 Tauri 桌面应用：一个按键切模型，一个词设权限，把 subagent 路由到便宜的模型，统计每一个 token，跑定时任务，还能在 Telegram、微信、企业微信或飞书里接着聊一个会话。
+**ccem 把这些都包了。** 它是免费开源的 CLI 加原生 Tauri 桌面应用：一个按键切模型，一个词设权限，让 Claude 和 Codex 应用把日常任务交给更便宜的模型，subagent 也能这样路由，统计每一个 token，跑定时任务，还能在 Telegram、微信、企业微信或飞书里接着聊一个会话。
 
 ---
 
@@ -58,6 +59,7 @@ Claude Code 很好用。可一旦每天认真用，事情就开始乱了。
 
 | | CLI | Desktop |
 |---|:---:|:---:|
+| **让 Claude 和 Codex 分派任务**：装好自带的 `ccem` agent skill 后，它们能在性价比最高的模型上开后台会话，再跟进进度和结果 | ✅ `ccem desktop create` | ✅ 设置 → Agent Skill |
 | **11 个服务商预设**（GLM、KIMI、DeepSeek、通义/百炼、MiniMax、MiMo、OpenRouter、Ollama…），自动映射 Opus / Sonnet / Haiku 档位 | ✅ | ✅ |
 | **5 种权限模式**：`yolo` · `auto` · `dev` · `readonly` · `safe` | ✅ | ✅ |
 | **独立 agent 配置目录**：CCEM 的 Claude Code 数据与官方应用分开；Codex 可选择隔离 | ✅ `ccem auth` | ✅ |
@@ -289,11 +291,14 @@ ccem cron notification-targets        # 查看结果可以发到哪里
 
 ## 从 CLI 驱动 Desktop
 
+**Claude 和 Codex 应用分派任务**用的也是这套命令。在 **设置 → Agent Skill** 里装好 CCEM agent skill，它们就能自己执行：规划留在你正在对话的应用里，日常部分在更便宜的环境上开会话去做，再读事件、发跟进。
+
 Desktop 运行时：
 
 ```bash
 ccem desktop health --json
-ccem desktop create --env kimi --perm dev --json      # 新建工作区会话
+ccem desktop create --provider claude --cwd "$PWD" --env deepseek \
+  --prompt "write auth tests" --perm dev --json        # 新建后台会话
 ccem desktop sessions --cwd . --status running --json
 ccem desktop status <runtimeId> --json
 ccem desktop events <runtimeId> --since 0 --limit 50 --json

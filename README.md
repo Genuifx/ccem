@@ -19,7 +19,7 @@
   <a href="https://github.com/Genuifx/ccem/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" /></a>
 </p>
 
-![CCEM — every agent, every model, one switchboard](./screenshots/hero.webp)
+![CCEM — let Claude & Codex delegate the easy work to best-value models](./screenshots/hero.webp)
 
 ---
 
@@ -45,12 +45,13 @@
 Claude Code is great. Using it seriously every day is where things get messy.
 
 - **Model sprawl.** KIMI for frontend, DeepSeek for scripts, GLM for refactors, a local Ollama model on the plane. Each switch means hand-`export`ing env vars, and eight terminal tabs later nobody knows which tab talks to which provider.
+- **Your best model doing busywork.** Claude or Codex burns top-tier tokens renaming config keys and writing boilerplate tests.
 - **Permission fatigue.** Clicking *Approve* 200 times a day wears you out. `--dangerously-skip-permissions` feels like a bad idea next to your `.env`.
 - **No idea what you spent.** Claude Code, Codex and OpenCode each keep their own logs. Nothing adds them up.
 - **You're away from your desk.** You're out getting coffee, a test is red, and your laptop is at home.
 - **The work that should run itself.** Nightly test runs, a Monday PR sweep, a changelog every Friday, with the results sent to your phone.
 
-**ccem handles all of it.** It's a free, open-source CLI plus a native Tauri desktop app that switches models in one keystroke, sets permissions with one word, routes subagents to cheaper models, tracks every token, runs cron jobs, and lets you continue a session from Telegram, WeChat, WeCom or Feishu.
+**ccem handles all of it.** It's a free, open-source CLI plus a native Tauri desktop app that switches models in one keystroke, sets permissions with one word, lets the Claude and Codex apps hand routine tasks to cheaper models, routes subagents the same way, tracks every token, runs cron jobs, and lets you continue a session from Telegram, WeChat, WeCom or Feishu.
 
 ---
 
@@ -58,6 +59,7 @@ Claude Code is great. Using it seriously every day is where things get messy.
 
 | | CLI | Desktop |
 |---|:---:|:---:|
+| **Let Claude & Codex delegate**: with the bundled `ccem` agent skill they start background sessions on best-value models, then track them and follow up | ✅ `ccem desktop create` | ✅ Settings → Agent Skill |
 | **11 provider presets** (GLM, KIMI, DeepSeek, Qwen/Bailian, MiniMax, MiMo, OpenRouter, Ollama, …) with Opus / Sonnet / Haiku tier mapping | ✅ | ✅ |
 | **5 permission modes**: `yolo` · `auto` · `dev` · `readonly` · `safe` | ✅ | ✅ |
 | **Separate agent profiles**: CCEM's Claude Code data stays apart from the official app; Codex can opt in | ✅ `ccem auth` | ✅ |
@@ -289,11 +291,14 @@ Other options: `--working-dir`, `--env-name`, `--max-budget-usd`, `--allowed-too
 
 ## Drive Desktop from the CLI
 
+This is also how the **Claude and Codex apps delegate work**. Install the CCEM agent skill (**Settings → Agent Skill**) and they run these commands themselves: keep planning in the app you're talking to, start a session on a cheaper environment for the routine part, then read its events and send follow-ups.
+
 With the Desktop app running:
 
 ```bash
 ccem desktop health --json
-ccem desktop create --env kimi --perm dev --json      # Start a workspace session
+ccem desktop create --provider claude --cwd "$PWD" --env deepseek \
+  --prompt "write auth tests" --perm dev --json        # Start a background session
 ccem desktop sessions --cwd . --status running --json
 ccem desktop status <runtimeId> --json
 ccem desktop events <runtimeId> --since 0 --limit 50 --json
