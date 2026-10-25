@@ -1,6 +1,6 @@
 # README image briefs
 
-Shot list for the next round of README screenshots. Each brief was checked against the real desktop UI and a recorded `ccem` terminal session (2026-10-25). Figures 1, 2, 3, 6, 7 and 8 currently use the older screenshots in `screenshots/`; figures 4, 5 and 9 have no image in the README yet.
+Shot list for the next round of README screenshots. Each brief was checked against the real desktop UI and a recorded `ccem` terminal session (2026-10-25). All nine figures are in `screenshots/` (2026-10-25 round: real dev-instance screenshots with private details blurred; parts that cannot be captured directly, such as the routing popover, bot list, poster and tray, are drawn to match the UI). Retake them from these briefs when the UI changes.
 
 ## English
 

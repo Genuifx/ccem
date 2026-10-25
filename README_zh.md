@@ -19,7 +19,7 @@
   <a href="https://github.com/Genuifx/ccem/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" /></a>
 </p>
 
-![CCEM Desktop](./screenshots/shots.webp)
+![CCEM Desktop](./screenshots/hero.webp)
 
 ---
 
@@ -120,7 +120,7 @@ npm install -g ccem
 # 或直接：npx ccem
 ```
 
-![ccem CLI](./screenshots/cli-index.webp)
+![ccem CLI](./screenshots/cli-menu.webp)
 
 ## 环境管理
 
@@ -342,7 +342,7 @@ ccem desktop open 'ccem://workspace/session?…'         # 在 Desktop 中聚焦
 
 ## Workspace：Claude Code、Codex 与 OpenCode 同处一地
 
-![Workspace](./screenshots/sessions.webp)
+![Workspace](./screenshots/workspace.webp)
 
 Workspace 不只是个启动器。你在这里发起、引导和回顾 agent 的每一次运行。
 
@@ -359,6 +359,8 @@ Workspace 不只是个启动器。你在这里发起、引导和回顾 agent 的
 
 ## 按 Subagent 路由模型
 
+![Dynamic routing](./screenshots/routing.webp)
+
 `grep` 凭什么要付顶级模型的钱？给 Claude 会话打开 **动态路由**，ccem 会让它经过一个本地路由代理（绑定在 `127.0.0.1`），把活分给不同的环境：
 
 - 把 **subagent 类型**（例如 `Explore`）和 **后台任务** 绑定到不同环境。主线程跟随输入框里选的环境。
@@ -371,6 +373,8 @@ Workspace 不只是个启动器。你在这里发起、引导和回顾 agent 的
 
 ## 会话与会话审查
 
+![Session Review](./screenshots/session-review.webp)
+
 - 网格或列表视图展示所有会话，包括项目、环境、权限模式、agent，以及发起来源（Desktop、CLI、聊天机器人或定时任务）。
 - **会话审查**（顶栏的审查图标）：待办进度快照、来自 Git 和 SDK 的改动文件（按文件分组展示 diff）、生成的产物（HTML、图片、报告）、失败的工具调用，以及每个 subagent 的轨迹。
 - tmux 会话的 **交互事件**：结构化的工具提示、计划审阅和终端审批。
@@ -379,7 +383,7 @@ Workspace 不只是个启动器。你在这里发起、引导和回顾 agent 的
 
 ## 远程控制：聊天机器人
 
-![Remote Control](./screenshots/telegram.webp)
+![Remote Control](./screenshots/chat-bots.webp)
 
 在手机上继续工作区里的任务，用的是 **你配置的任意 API key**，而不仅限于 Anthropic 订阅。
 
@@ -421,6 +425,8 @@ Workspace 不只是个启动器。你在这里发起、引导和回顾 agent 的
 费用来自 ccem 能读到的用量记录和已知的模型价格。缺价格的部分，ccem 只显示已知费用，并单列未定价的 token 数，不会瞎猜。这些数字是估算，不是服务商账单。
 
 ## 托盘面板
+
+![Tray Cockpit](./screenshots/tray-cockpit.webp)
 
 菜单栏里的迷你仪表盘，显示当前环境和权限模式、今日 token 和费用、按小时或按天的趋势、模型类型占比、活跃项目、即将运行的定时任务、健康检查（tmux、bridge、cron、版本）和快捷启动按钮。
 

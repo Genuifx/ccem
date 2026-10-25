@@ -19,7 +19,7 @@
   <a href="https://github.com/Genuifx/ccem/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" /></a>
 </p>
 
-![CCEM Desktop](./screenshots/shots.webp)
+![CCEM Desktop](./screenshots/hero.webp)
 
 ---
 
@@ -120,7 +120,7 @@ npm install -g ccem
 # or just: npx ccem
 ```
 
-![ccem CLI](./screenshots/cli-index.webp)
+![ccem CLI](./screenshots/cli-menu.webp)
 
 ## Environment Management
 
@@ -342,7 +342,7 @@ A native app built on **Tauri 2** (a Rust backend and a React frontend, not an E
 
 ## Workspace: Claude Code, Codex & OpenCode in One Place
 
-![Workspace](./screenshots/sessions.webp)
+![Workspace](./screenshots/workspace.webp)
 
 The Workspace isn't just a launcher. It's where you start, steer and review agent runs.
 
@@ -359,6 +359,8 @@ The Workspace isn't just a launcher. It's where you start, steer and review agen
 
 ## Per-Subagent Model Routing
 
+![Dynamic routing](./screenshots/routing.webp)
+
 Why pay top-model prices for `grep`? Turn on **Dynamic routing** for a Claude session and ccem runs it through a local routing proxy (bound to `127.0.0.1`) that splits the work across environments:
 
 - Bind **subagent types** (for example `Explore`) and **background tasks** to different environments. The main thread follows the composer's environment.
@@ -371,6 +373,8 @@ Routing is opt-in for each session, and sessions that don't use it run direct. T
 
 ## Sessions & Session Review
 
+![Session Review](./screenshots/session-review.webp)
+
 - Grid or list view of every session, showing project, environment, permission mode, agent and where it was started (Desktop, CLI, chat bot or cron).
 - **Session Review** (the Review icon in the top bar): a todo progress snapshot, changed files from Git and the SDK grouped into per-file diffs, generated artifacts (HTML, images, reports), failed tool calls, and a trace of each subagent.
 - **Interactive events** for tmux sessions: structured tool prompts, plan reviews and terminal approvals.
@@ -379,7 +383,7 @@ Routing is opt-in for each session, and sessions that don't use it run direct. T
 
 ## Remote Control: Chat Bots
 
-![Remote Control](./screenshots/telegram.webp)
+![Remote Control](./screenshots/chat-bots.webp)
 
 Continue workspace tasks from your phone, using **any API key you've configured** rather than only an Anthropic subscription.
 
@@ -421,6 +425,8 @@ Scheduled runs need the Desktop app running.
 Costs come from the usage records ccem can read and known model prices. Where a price is missing, ccem shows the known cost and a count of unpriced tokens instead of guessing. Treat these figures as an estimate, not a provider bill.
 
 ## Tray Cockpit
+
+![Tray Cockpit](./screenshots/tray-cockpit.webp)
 
 A menu-bar mini dashboard showing the current env and permission mode, today's tokens and cost, an hourly or daily trend, the split by model type, active projects, upcoming cron tasks, health checks (tmux, bridge, cron, version) and quick-launch buttons.
 
