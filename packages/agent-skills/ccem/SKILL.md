@@ -17,10 +17,11 @@ ccem desktop health --json
 
 If `ccem desktop health` reports a stale descriptor, use the CLI message as
 the source of truth and do not inspect `~/.ccem/control.json` yourself. A
-dead-pid descriptor at the default path is removed automatically; restart CCEM
-Desktop and rerun the command. If the message says the endpoint refused the
-connection or timed out while the publishing process is still running, restart
-CCEM Desktop so it republishes a fresh endpoint.
+dead-pid descriptor at the default path is removed automatically. If the message
+says the endpoint refused the connection or timed out while the publishing
+process is still running, restarting CCEM Desktop may be needed to republish a
+fresh endpoint. For read-only requests, report the unavailable bridge; do not
+launch, restart, or foreground Desktop as an automatic fallback.
 
 ### Development builds and the control descriptor
 
@@ -59,25 +60,66 @@ Target the exact generated bundle identifier or Tauri MCP port from the
 manifest. If those are unavailable, stop and report the targeting failure
 without disturbing the installed release.
 
-If it is healthy, create sessions through the desktop CLI wrapper:
+### Create sessions without opening Desktop by default
+
+If the bridge is healthy and session creation was requested, use the desktop CLI wrapper:
 
 ```bash
-ccem desktop create --provider codex --cwd /absolute/project/path --prompt "Task to run" --perm dev --effort low --open true --json
+ccem desktop create --provider codex --cwd /absolute/project/path --prompt "Task to run" --perm dev --effort low --open false --json
 ```
 
 Use absolute working directories. Preserve the returned `runtimeId`, `sessionId`, and `ccem://` link when reporting progress or sending follow-up input.
 
-Common follow-up commands:
+### Read sessions in the background by default
+
+Requests to read, inspect, summarize, or check a session (including “读一下”,
+“查看内容”, “总结”, and “检查状态”) must use background queries without changing
+desktop focus or navigation. A `ccem://` link, including `focus=history` or
+`focus=live`, does not by itself authorize opening the UI.
+
+When the link includes `runtimeId` (or `id` with `idKind=runtime`), query that
+runtime directly with `status` and `events`. Otherwise, use `providerSessionId`
+(or `id` with `idKind=provider`) to resolve the runtime from the session list:
 
 ```bash
 ccem desktop sessions --json
-ccem desktop status <runtimeId> --json
-ccem desktop events <runtimeId> --json
-ccem desktop send <runtimeId> --text "Follow-up instruction" --json
-ccem desktop open <ccem://session-link> --json
 ```
 
-When the user gives a `ccem://` link, use the desktop CLI wrapper to open or inspect it. Do not try to parse provider history directories yourself unless the wrapper reports that the desktop bridge is unavailable.
+Match the returned `provider` to the link's `source`, match `providerSessionId`,
+and match `cwd` when supplied. Narrow the query with `--provider` and `--cwd`
+when available, and filter out unrelated sessions before displaying results.
+Use the matched `runtimeId` to read the requested session:
+
+```bash
+ccem desktop status <runtimeId> --json
+ccem desktop events <runtimeId> --json
+```
+
+If a query fails, no unique matching runtime is found, or the history cannot be
+read, report the limitation without automatically launching, restarting, or
+foregrounding Desktop. Do not parse provider history directories yourself unless
+the wrapper reports that the desktop bridge is unavailable.
+
+### Open Desktop only on explicit request
+
+Use `ccem desktop open` only when the user explicitly asks to open, show, or
+navigate to the session in Desktop (for example, “在桌面端打开这个会话”). It
+foregrounds Desktop and changes its selected session. Reading or validating a
+link must not call `open`, an OS URL opener, or UI automation to foreground
+Desktop. Likewise, use `--open true` when creating a session only if opening it
+was explicitly requested; otherwise use `--open false`.
+
+```bash
+ccem desktop open "<ccem://session-link>" --json
+```
+
+### Send follow-up input
+
+Send follow-up input only when requested:
+
+```bash
+ccem desktop send <runtimeId> --text "Follow-up instruction" --json
+```
 
 ## Cron And Scheduled Work
 
