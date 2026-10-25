@@ -1,6 +1,6 @@
 # README image briefs
 
-Shot list for the next round of README screenshots. Each brief was checked against the real desktop UI and a recorded `ccem` terminal session (2026-10-25). All nine figures are in `screenshots/` (2026-10-25 round: real dev-instance screenshots with private details blurred; parts that cannot be captured directly, such as the routing popover, bot list, poster and tray, are drawn to match the UI). Retake them from these briefs when the UI changes.
+Shot list for the next round of README screenshots. Each brief was checked against the real desktop UI and a recorded `ccem` terminal session (2026-10-25). All nine figures are in `screenshots/` (2026-10-25 round: real dev-instance screenshots with private details blurred; parts that cannot be captured directly, such as the routing popover, bot list, poster and tray, are drawn to match the UI). Retake them from these briefs when the UI changes. Figure 1 is now a promotional banner rather than a UI screenshot: a switchboard illustration (agents → CCEM router → providers, cords colored by Opus/Sonnet/Haiku tier, permission keycaps) rendered from `docs/readme-assets/hero.html` (serve the repo root over HTTP, open it at 2400×1350, screenshot, then `cwebp -q 86`); the UI-based hero brief below is kept for reference.
 
 ## English
 

@@ -19,7 +19,7 @@
   <a href="https://github.com/Genuifx/ccem/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome" /></a>
 </p>
 
-![CCEM Desktop](./screenshots/hero.webp)
+![CCEM — every agent, every model, one switchboard](./screenshots/hero.webp)
 
 ---
 
