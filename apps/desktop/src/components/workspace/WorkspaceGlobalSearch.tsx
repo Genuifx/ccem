@@ -350,6 +350,7 @@ export const WorkspaceGlobalSearch = memo(function WorkspaceGlobalSearch({
           </p>
           <p className="mt-0.5 truncate text-[11px] leading-tight text-muted-foreground">
             {session.projectName || getProjectName(session.project)} · {formatRelativeTime(session.timestamp, t)}
+            {session.archived && <> · {t('workspace.archivedSessions')}</>}
           </p>
         </div>
       </button>

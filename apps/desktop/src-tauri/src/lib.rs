@@ -103,6 +103,7 @@ use history::{
     get_conversation_detail, get_conversation_history, get_conversation_messages,
     get_conversation_segments, get_session_subagents, get_workspace_overview_snapshot,
     search_conversation_history,
+    get_archived_sessions,
 };
 use interactive_runtime::{
     InteractiveReplayBatch, InteractiveRuntimeManager, InteractiveSessionOptions,
@@ -6207,10 +6208,13 @@ pub fn run_desktop_app() -> i32 {
             get_conversation_segments,
             get_session_subagents,
             search_conversation_history,
+            get_archived_sessions,
             title_overrides::set_session_title,
             session_titles::generate_workspace_session_title,
             session_annotations::set_session_annotation,
             session_annotations::clear_session_annotation,
+            session_annotations::set_sessions_archived,
+            session_annotations::get_session_archive_overlay,
             session_lineage::record_session_parent,
             session_lineage::list_session_parents,
             session_next_steps::suggest_workspace_next_steps,

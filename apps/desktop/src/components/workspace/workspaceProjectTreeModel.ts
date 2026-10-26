@@ -143,19 +143,34 @@ export function stabilizeProjectNodeSessions(
       (newest, session) => Math.max(newest, session.timestamp),
       Number.NEGATIVE_INFINITY
     );
+    const oldestRetainedTimestamp = retainedSessions.reduce(
+      (oldest, session) => Math.min(oldest, session.timestamp),
+      Number.POSITIVE_INFINITY
+    );
     const freshSessions: HistorySessionItem[] = [];
+    const restoredSessions: HistorySessionItem[] = [];
     const backfilledSessions: HistorySessionItem[] = [];
     for (const session of newSessions) {
       if (session.timestamp >= newestRetainedTimestamp) {
         freshSessions.push(session);
+      } else if (session.timestamp > oldestRetainedTimestamp) {
+        // Inside the retained time range: a returning row (e.g. an undone
+        // archive), not pagination backfill. Put it back where it was.
+        restoredSessions.push(session);
       } else {
         backfilledSessions.push(session);
       }
     }
 
+    const middle = [...retainedSessions];
+    for (const session of restoredSessions) {
+      const index = middle.findIndex((item) => item.timestamp < session.timestamp);
+      middle.splice(index === -1 ? middle.length : index, 0, session);
+    }
+
     return {
       ...node,
-      sessions: [...freshSessions, ...retainedSessions, ...backfilledSessions],
+      sessions: [...freshSessions, ...middle, ...backfilledSessions],
     };
   });
 }

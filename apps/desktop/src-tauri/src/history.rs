@@ -53,6 +53,11 @@ pub struct HistorySession {
     pub task_sticker: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_label: Option<String>,
+    /// Effective archive state: CCEM overlay (session_annotations) over the
+    /// provider's native archive (Codex `archived_sessions`). Archived sessions
+    /// stay out of the workspace tree and are listed by `get_archived_sessions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
     /// Launch origin: provenance modes (`cron`, `external_control`,
     /// `native_sdk`, ...) or `automation` / `subagent` for Codex Desktop
     /// automation and sub-agent threads.
@@ -446,6 +451,22 @@ where
     Ok(build_workspace_overview_snapshot(sessions))
 }
 
+/// Archived (non-DSH) sessions, newest first, for the sidebar archive list.
+#[tauri::command]
+pub async fn get_archived_sessions() -> Result<Vec<HistorySession>, String> {
+    run_blocking(|| {
+        let mut sessions = dedupe_history_sessions(load_legacy_history_sessions_filtered(
+            None,
+            Some(HISTORY_LIMIT_MAX),
+        )?);
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.timestamp));
+        finalize_history_sessions(&mut sessions);
+        sessions.retain(|session| session.archived == Some(true));
+        Ok(sessions)
+    })
+    .await
+}
+
 #[tauri::command]
 pub async fn search_conversation_history(
     app: tauri::AppHandle,
@@ -556,6 +577,8 @@ fn load_legacy_history_sessions(limit: Option<usize>) -> Result<Vec<HistorySessi
     sessions = dedupe_history_sessions(sessions);
     sessions.sort_by_key(|session| std::cmp::Reverse(session.timestamp));
     finalize_history_sessions(&mut sessions);
+    // Archived sessions never take a slot in the workspace tree.
+    sessions.retain(|session| session.archived != Some(true));
 
     if let Some(limit) = limit {
         sessions.truncate(limit);
@@ -577,11 +600,18 @@ fn finalize_history_sessions(sessions: &mut [HistorySession]) {
     // Overlay user-edited task stage, expressive sticker, and short label.
     let annotations = crate::session_annotations::SessionAnnotations::load();
     for session in sessions.iter_mut() {
-        if let Some(annotation) = annotations.get(&session.source, &session.id) {
+        let annotation = annotations.get(&session.source, &session.id);
+        if let Some(annotation) = annotation {
             session.task_stage = annotation.stage.clone();
             session.task_sticker = annotation.sticker.clone();
             session.task_label = annotation.label.clone();
         }
+        let archived = crate::session_annotations::effective_archived(
+            annotation,
+            session.archived == Some(true),
+            session.timestamp,
+        );
+        session.archived = archived.then_some(true);
     }
 }
 
@@ -2002,6 +2032,7 @@ fn merge_claude_history_line(session_map: &mut HashMap<String, HistorySession>, 
             config_source: None,
             task_stage: None,
             task_sticker: None,
+            archived: None,
             task_label: None,
             launch_mode: None,
         },
@@ -2224,6 +2255,7 @@ fn history_session_from_provenance_record(
             .filter(|value| !value.trim().is_empty()),
         task_stage: None,
         task_sticker: None,
+        archived: None,
         task_label: None,
         launch_mode: None,
     })
@@ -2647,6 +2679,7 @@ fn parse_claude_project_session_index(path: &Path) -> Option<HistorySession> {
         config_source: None,
         task_stage: None,
         task_sticker: None,
+        archived: None,
         task_label: None,
         launch_mode: None,
     })
@@ -3192,6 +3225,7 @@ fn upsert_codex_history_session(
                 config_source: None,
                 task_stage: None,
                 task_sticker: None,
+                archived: None,
                 task_label: None,
                 launch_mode: None,
             },
@@ -3308,6 +3342,8 @@ fn load_codex_history_from_config_limited(
             {
                 return None;
             }
+            let native_archived = Path::new(&rollout_path)
+                .starts_with(config.codex_home.join("archived_sessions"));
 
             let project_name = record
                 .project
@@ -3329,6 +3365,7 @@ fn load_codex_history_from_config_limited(
                 config_source: None,
                 task_stage: None,
                 task_sticker: None,
+                archived: native_archived.then_some(true),
                 task_label: None,
                 launch_mode: record.launch_mode,
             })
@@ -4575,6 +4612,7 @@ fn parse_opencode_history_session(value: &serde_json::Value) -> Option<HistorySe
         }),
         task_stage: None,
         task_sticker: None,
+        archived: None,
         task_label: None,
         launch_mode: None,
     })
@@ -4846,6 +4884,7 @@ fn local_opencode_session_to_history_session(
         config_source: session.config_source,
         task_stage: None,
         task_sticker: None,
+        archived: None,
         task_label: None,
         launch_mode: None,
     }
@@ -4995,6 +5034,7 @@ pub fn map_dsh_list_item(item: &dsh_history::DshSessionListItem) -> HistorySessi
         config_source: None,
         task_stage: None,
         task_sticker: None,
+        archived: None,
         task_label: None,
         launch_mode: None,
     }
@@ -6081,6 +6121,7 @@ mod tests {
                 config_source: None,
                 task_stage: None,
                 task_sticker: None,
+                archived: None,
                 task_label: None,
                 launch_mode: None,
             },
@@ -6097,6 +6138,7 @@ mod tests {
                 config_source: None,
                 task_stage: None,
                 task_sticker: None,
+                archived: None,
                 task_label: None,
                 launch_mode: None,
             },
@@ -6113,6 +6155,7 @@ mod tests {
                 config_source: None,
                 task_stage: None,
                 task_sticker: None,
+                archived: None,
                 task_label: None,
                 launch_mode: None,
             },
@@ -6156,6 +6199,7 @@ mod tests {
             config_source: None,
             task_stage: None,
             task_sticker: None,
+            archived: None,
             task_label: None,
             launch_mode: None,
         };
@@ -6531,6 +6575,7 @@ mod tests {
                     config_source: None,
                     task_stage: None,
                     task_sticker: None,
+                    archived: None,
                     task_label: None,
                     launch_mode: None,
                 },
@@ -6625,6 +6670,7 @@ mod tests {
                 config_source: Some("native".to_string()),
                 task_stage: None,
                 task_sticker: None,
+                archived: None,
                 task_label: None,
                 launch_mode: None,
             },
@@ -6645,6 +6691,7 @@ mod tests {
                 config_source: Some("ccem".to_string()),
                 task_stage: None,
                 task_sticker: None,
+                archived: None,
                 task_label: None,
                 launch_mode: None,
             },
@@ -7491,6 +7538,7 @@ mod tests {
                 config_source: Some("ccem".to_string()),
                 task_stage: None,
                 task_sticker: None,
+                archived: None,
                 task_label: None,
                 launch_mode: None,
             },
@@ -7507,6 +7555,7 @@ mod tests {
                 config_source: None,
                 task_stage: None,
                 task_sticker: None,
+                archived: None,
                 task_label: None,
                 launch_mode: None,
             },
@@ -7523,6 +7572,7 @@ mod tests {
                 config_source: Some("ccem".to_string()),
                 task_stage: None,
                 task_sticker: None,
+                archived: None,
                 task_label: None,
                 launch_mode: None,
             },
@@ -7572,6 +7622,7 @@ mod tests {
                 config_source: Some("ccem".to_string()),
                 task_stage: None,
                 task_sticker: None,
+                archived: None,
                 task_label: None,
                 launch_mode: None,
             },
@@ -7588,6 +7639,7 @@ mod tests {
                 config_source: None,
                 task_stage: None,
                 task_sticker: None,
+                archived: None,
                 task_label: None,
                 launch_mode: None,
             },
@@ -7631,6 +7683,7 @@ mod tests {
             config_source: Some("ccem".to_string()),
             task_stage: None,
             task_sticker: None,
+            archived: None,
             task_label: None,
             launch_mode: None,
         }];
@@ -9086,6 +9139,7 @@ mod dsh_integration_tests {
             config_source: None,
             task_stage: None,
             task_sticker: None,
+            archived: None,
             task_label: None,
             launch_mode: None,
         };
@@ -9107,6 +9161,7 @@ mod dsh_integration_tests {
             config_source: None,
             task_stage: None,
             task_sticker: None,
+            archived: None,
             task_label: None,
             launch_mode: None,
         };
@@ -9148,6 +9203,7 @@ mod dsh_integration_tests {
                     config_source: None,
                     task_stage: None,
                     task_sticker: None,
+                    archived: None,
                     task_label: None,
                     launch_mode: None,
                 },
@@ -9164,6 +9220,7 @@ mod dsh_integration_tests {
                     config_source: None,
                     task_stage: None,
                     task_sticker: None,
+                    archived: None,
                     task_label: None,
                     launch_mode: None,
                 },
@@ -9201,6 +9258,7 @@ mod dsh_integration_tests {
                     config_source: None,
                     task_stage: None,
                     task_sticker: None,
+                    archived: None,
                     task_label: None,
                     launch_mode: None,
                 },
@@ -9217,6 +9275,7 @@ mod dsh_integration_tests {
                     config_source: None,
                     task_stage: None,
                     task_sticker: None,
+                    archived: None,
                     task_label: None,
                     launch_mode: None,
                 },
@@ -9339,6 +9398,7 @@ mod dsh_integration_tests {
             config_source: None,
             task_stage: None,
             task_sticker: None,
+            archived: None,
             task_label: None,
             launch_mode: None,
         }];
@@ -9355,6 +9415,7 @@ mod dsh_integration_tests {
             config_source: None,
             task_stage: None,
             task_sticker: None,
+            archived: None,
             task_label: None,
             launch_mode: None,
         }];
@@ -9391,6 +9452,7 @@ mod dsh_integration_tests {
             config_source: None,
             task_stage: None,
             task_sticker: None,
+            archived: None,
             task_label: None,
             launch_mode: None,
         }];

@@ -18,6 +18,8 @@ import {
   Alert02Icon,
   AlertCircleIcon,
   AppWindowIcon,
+  Archive01Icon,
+  ArchiveRestoreIcon,
   ArrowDown01Icon,
   ArrowLeft01Icon,
   ArrowRight01Icon,
@@ -213,6 +215,8 @@ export const Wechat = createIcon(WechatIcon, 'Wechat');
 export const AlertCircle = createIcon(AlertCircleIcon, 'AlertCircle');
 export const AlertTriangle = createIcon(Alert02Icon, 'AlertTriangle');
 export const AppWindow = createIcon(AppWindowIcon, 'AppWindow');
+export const Archive = createIcon(Archive01Icon, 'Archive');
+export const ArchiveRestore = createIcon(ArchiveRestoreIcon, 'ArchiveRestore');
 export const ArrowLeft = createIcon(ArrowLeft01Icon, 'ArrowLeft');
 export const ArrowRight = createIcon(ArrowRight01Icon, 'ArrowRight');
 export const ArrowUp = createIcon(ArrowUp01Icon, 'ArrowUp');

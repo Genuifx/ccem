@@ -1,6 +1,7 @@
 import { memo } from 'react';
 import type { ReactNode } from 'react';
 import {
+  Archive,
   Bot,
   ChevronsUp,
   FlaskConical,
@@ -25,6 +26,7 @@ import {
 } from '@/components/ui/context-menu';
 import type { HistorySessionItem } from '@/features/conversations/types';
 import type { ProjectNode, RecentSessionBucket, SidebarGroupId } from './workspaceProjectTreeModel';
+import type { BulkArchiveCandidates } from './sessionArchive';
 
 export const PROJECT_TREE_PAGE_SIZE = 6;
 export const RECENT_BUCKET_PAGE_SIZE = 15;
@@ -41,7 +43,42 @@ type ProjectActionCallbacks = {
   onMarkTemporary: (project: string) => void;
   onResetProjectClassification: (overrideKey: string) => void;
   onOrganizeSidebar: () => void;
+  getArchiveCandidates?: (sessions: HistorySessionItem[]) => BulkArchiveCandidates;
+  onArchiveSessions: (sessions: HistorySessionItem[]) => void;
 };
+
+function ProjectArchiveMenuItems({
+  actions,
+  sessions,
+  t,
+}: {
+  actions: ProjectActionCallbacks;
+  sessions: HistorySessionItem[];
+  t: (key: string) => string;
+}) {
+  // Rendered only while the context menu is open, so candidates are fresh.
+  const candidates = actions.getArchiveCandidates?.(sessions);
+  if (!candidates) return null;
+  return (
+    <>
+      <ContextMenuSeparator />
+      <ContextMenuItem
+        disabled={candidates.stale.length === 0}
+        onClick={() => actions.onArchiveSessions(candidates.stale)}
+      >
+        <Archive className="mr-2 h-3.5 w-3.5" />
+        {t('workspace.archiveStaleSessions').replace('{count}', String(candidates.stale.length))}
+      </ContextMenuItem>
+      <ContextMenuItem
+        disabled={candidates.done.length === 0}
+        onClick={() => actions.onArchiveSessions(candidates.done)}
+      >
+        <Archive className="mr-2 h-3.5 w-3.5" />
+        {t('workspace.archiveDoneSessions').replace('{count}', String(candidates.done.length))}
+      </ContextMenuItem>
+    </>
+  );
+}
 
 type ProjectNodeSectionKind = 'main' | 'group';
 
@@ -313,6 +350,7 @@ export const ProjectTreeContent = memo(function ProjectTreeContent({
               <RefreshCw className="mr-2 h-3.5 w-3.5" />
               {t('workspace.organizeSidebar')}
             </ContextMenuItem>
+            <ProjectArchiveMenuItems actions={projectActions} sessions={node.sessions} t={t} />
           </ContextMenuContent>
         </ContextMenu>
 
