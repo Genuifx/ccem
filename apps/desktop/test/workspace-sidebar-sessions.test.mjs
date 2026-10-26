@@ -557,3 +557,38 @@ test('background refresh reloads the selected transcript only when it differs fr
   );
   assert.equal(shouldReloadSelectedHistorySession(null, session), true);
 });
+
+test('live summary refreshes keep sidebar rows and tree state identities when nothing visible changed', async () => {
+  const {
+    buildLiveSessionTreeState,
+    buildWorkspaceSidebarSessions,
+    retainStableHistorySessions,
+    retainStableLiveSessionTreeState,
+  } = await importWorkspaceSidebarSessions();
+  const history = [historySession({ id: 'provider-1' })];
+  const entry = (overrides) => ({
+    session: nativeSession({ provider_session_id: 'provider-1', ...overrides }),
+  });
+
+  const firstRows = buildWorkspaceSidebarSessions(history, [entry()]);
+  const refreshedRows = retainStableHistorySessions(
+    firstRows,
+    buildWorkspaceSidebarSessions(history, [entry({ updated_at: '2026-05-02T12:55:00.000Z' })]),
+  );
+  assert.equal(refreshedRows, firstRows);
+
+  const firstTree = buildLiveSessionTreeState([entry()]);
+  const refreshedTree = retainStableLiveSessionTreeState(
+    firstTree,
+    buildLiveSessionTreeState([entry({ updated_at: '2026-05-02T12:55:00.000Z' })]),
+  );
+  assert.equal(refreshedTree, firstTree);
+
+  const stoppedTree = retainStableLiveSessionTreeState(
+    firstTree,
+    buildLiveSessionTreeState([entry({ status: 'stopped', is_active: false })]),
+  );
+  assert.notEqual(stoppedTree, firstTree);
+  assert.equal(stoppedTree.canonicalKeyBySessionKey, firstTree.canonicalKeyBySessionKey);
+  assert.equal(stoppedTree.activeSessionKeys.size, 0);
+});

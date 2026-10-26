@@ -21,6 +21,21 @@ pub struct DoctorReport {
     environment: DoctorEnvironment,
     commands: Vec<DoctorCommandStatus>,
     paths: Vec<DoctorPathStatus>,
+    system: DoctorSystem,
+}
+
+/// Machine-wide pressure at export time. A slow UI on one Mac but not another
+/// is usually CPU/memory contention or a power policy, not the page itself.
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DoctorSystem {
+    model: Option<String>,
+    memory_bytes: Option<u64>,
+    load_average: Option<String>,
+    memory_free_percent: Option<u64>,
+    low_power_mode: Option<bool>,
+    agent_processes: Option<u64>,
+    agent_rss_bytes: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -114,7 +129,61 @@ fn build_doctor_report() -> DoctorReport {
         },
         commands: collect_command_statuses(&user_path),
         paths: collect_path_statuses(),
+        system: collect_system_load(),
     }
+}
+
+fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn collect_system_load() -> DoctorSystem {
+    let sysctl = |name: &str| command_stdout("/usr/sbin/sysctl", &["-n", name]);
+    let low_power_mode = command_stdout("/usr/bin/pmset", &["-g"]).and_then(|text| {
+        text.lines()
+            .find(|line| line.trim_start().starts_with("lowpowermode"))
+            .and_then(|line| line.split_whitespace().last())
+            .map(|value| value == "1")
+    });
+    let (agent_processes, agent_rss_bytes) = command_stdout("/bin/ps", &["-axo", "rss=,comm="])
+        .map(|text| summarize_agent_processes(&text))
+        .unzip();
+    DoctorSystem {
+        model: sysctl("hw.model"),
+        memory_bytes: sysctl("hw.memsize").and_then(|value| value.parse().ok()),
+        load_average: sysctl("vm.loadavg"),
+        memory_free_percent: sysctl("kern.memorystatus_level").and_then(|value| value.parse().ok()),
+        low_power_mode,
+        agent_processes,
+        agent_rss_bytes,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn collect_system_load() -> DoctorSystem {
+    DoctorSystem::default()
+}
+
+/// Counts agent CLIs and runtime helpers from `ps -axo rss=,comm=` output.
+/// Matches the executable name only; argument paths such as a
+/// `claude-code-env-manager` checkout must not count as agents.
+fn summarize_agent_processes(ps_output: &str) -> (u64, u64) {
+    const AGENT_EXECUTABLES: [&str; 4] = ["claude", "codex", "opencode", "ccem-node"];
+    ps_output
+        .lines()
+        .filter_map(|line| line.trim_start().split_once(' '))
+        .filter(|(_, executable)| {
+            let name = executable.trim().rsplit('/').next().unwrap_or_default();
+            AGENT_EXECUTABLES.contains(&name)
+        })
+        .fold((0, 0), |(count, rss), (rss_kb, _)| {
+            (count + 1, rss + rss_kb.trim().parse::<u64>().unwrap_or(0) * 1024)
+        })
 }
 
 fn collect_command_statuses(user_path: &str) -> Vec<DoctorCommandStatus> {
@@ -461,5 +530,15 @@ mod tests {
         ));
         assert!(is_windows_batch_path("ccem.BAT"));
         assert!(!is_windows_batch_path("/usr/local/bin/node"));
+    }
+
+    #[test]
+    fn agent_process_summary_counts_cli_and_helpers_only() {
+        let ps = "  420192 /opt/node_modules/@anthropic-ai/claude-code/bin/claude\n\
+                  75840 /Applications/CCEM Desktop.app/Contents/MacOS/ccem-node\n\
+                  2048 /Users/me/claude-code-env-manager/node_modules/@esbuild/darwin-arm64/bin/esbuild\n\
+                  1024 /usr/local/bin/codex\n\
+                  999 /bin/zsh\n";
+        assert_eq!(summarize_agent_processes(ps), (3, (420192 + 75840 + 1024) * 1024));
     }
 }

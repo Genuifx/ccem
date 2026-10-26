@@ -221,6 +221,33 @@ export function buildLiveSessionTreeState(
   };
 }
 
+/**
+ * Live summaries refresh while a turn runs, but the tree only cares about
+ * aliases and activity. Keep the previous state when those are unchanged so
+ * the memoized sidebar does not re-render every row on each refresh.
+ */
+export function retainStableLiveSessionTreeState(
+  previous: LiveSessionTreeState | null,
+  next: LiveSessionTreeState,
+): LiveSessionTreeState {
+  if (!previous) {
+    return next;
+  }
+  const previousKeys = Object.keys(previous.canonicalKeyBySessionKey);
+  const nextKeys = Object.keys(next.canonicalKeyBySessionKey);
+  const sameAliases = previousKeys.length === nextKeys.length
+    && nextKeys.every((key) => previous.canonicalKeyBySessionKey[key] === next.canonicalKeyBySessionKey[key]);
+  const sameActive = previous.activeSessionKeys.size === next.activeSessionKeys.size
+    && [...next.activeSessionKeys].every((key) => previous.activeSessionKeys.has(key));
+  if (sameAliases && sameActive) {
+    return previous;
+  }
+  return {
+    canonicalKeyBySessionKey: sameAliases ? previous.canonicalKeyBySessionKey : next.canonicalKeyBySessionKey,
+    activeSessionKeys: sameActive ? previous.activeSessionKeys : next.activeSessionKeys,
+  };
+}
+
 export function toLiveHistorySessionItem(
   entry: WorkspaceSidebarLiveSessionEntry,
 ): HistorySessionItem | null {

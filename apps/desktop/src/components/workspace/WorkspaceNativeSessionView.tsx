@@ -3117,7 +3117,10 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
         return;
       }
 
-      if (tickInFlightRef.current) {
+      // Backpressure: the cursor only advances once the previous batch has
+      // committed, so polling now would re-read the same events and the extra
+      // update would keep interrupting that commit on a busy machine.
+      if (tickInFlightRef.current || transcriptCommitRecovery.hasPending('poll')) {
         scheduleNextTick();
         return;
       }

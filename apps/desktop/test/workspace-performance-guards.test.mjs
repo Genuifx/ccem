@@ -428,3 +428,21 @@ test('doctor perf smoke is explicit, budgeted, and exportable', async () => {
     'Desktop package should expose the perf smoke report gate',
   );
 });
+
+test('live session streaming keeps unrelated workspace UI out of each transcript commit', async () => {
+  const workspace = await readSource('src', 'pages', 'Workspace.tsx');
+  const nativeView = await readSource('src', 'components', 'workspace', 'WorkspaceNativeSessionView.tsx');
+  const controls = await readSource('src', 'components', 'workspace', 'ComposerControls.tsx');
+  const contextIndicator = await readSource('src', 'components', 'workspace', 'ContextWindowIndicator.tsx');
+
+  assert.match(
+    nativeView,
+    /tickInFlightRef\.current \|\| transcriptCommitRecovery\.hasPending\('poll'\)/,
+    'the live poll loop must wait for the previous batch to commit before re-reading the same cursor',
+  );
+  assert.match(workspace, /retainStableHistorySessions\(\s*sidebarSessionsRef\.current/);
+  assert.match(workspace, /retainStableLiveSessionTreeState\(\s*liveSessionTreeStateRef\.current/);
+  assert.match(workspace, /onSelect=\{handleProjectTreeSelect\}/, 'the sidebar needs a stable select handler');
+  assert.match(controls, /export const ComposerControls = memo\(/);
+  assert.match(contextIndicator, /export const ContextWindowIndicator = memo\(/);
+});

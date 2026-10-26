@@ -1,4 +1,4 @@
-import { useState, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
+import { memo, useState, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
 import {
   Brain,
   Check,
@@ -305,7 +305,11 @@ export interface ComposerControlsProps {
   onEffortChange: (effort: EffortLevel) => void;
 }
 
-export function ComposerControls({
+// The live session view re-renders on every transcript poll; these menus only
+// change with their own props, so let them skip those renders.
+export const ComposerControls = memo(ComposerControlsView);
+
+function ComposerControlsView({
   provider,
   envName,
   permMode,

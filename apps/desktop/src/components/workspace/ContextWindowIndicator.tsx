@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { memo, useRef, useState } from 'react';
 import {
   HoverCard,
   HoverCardContent,
@@ -44,7 +44,9 @@ function getRingColor(percentage: number): string {
  * segment click engages the same pinned mode (REQ-0043) so an unpinned
  * hover panel cannot be auto-closed by its own view-swap resize.
  */
-export function ContextWindowIndicator({
+export const ContextWindowIndicator = memo(ContextWindowIndicatorView);
+
+function ContextWindowIndicatorView({
   usage,
   provider,
   onRefreshUsage,

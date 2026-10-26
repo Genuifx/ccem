@@ -137,6 +137,8 @@ import {
   findLiveEntryForSidebarSession,
   hasWorkspaceLiveActivityConflict,
   retainStableHistorySessions,
+  retainStableLiveSessionTreeState,
+  type LiveSessionTreeState,
   resolveWorkspaceReviewProviderSessionId,
   selectWorkspaceLiveSessionsForRestore,
   shouldReloadSelectedHistorySession,
@@ -1745,10 +1747,18 @@ export function Workspace({
     [liveSessionsByRuntimeId],
   );
 
-  const sidebarSessions = useMemo(
-    () => buildWorkspaceSidebarSessions(sessions, liveSessionEntries),
-    [liveSessionEntries, sessions],
-  );
+  // Live summaries refresh every couple of seconds during a turn. Reuse the
+  // previous rows when nothing visible changed so the sidebar and its
+  // decoration poll do not redo work for all sessions on every refresh.
+  const sidebarSessionsRef = useRef<HistorySessionItem[]>([]);
+  const sidebarSessions = useMemo(() => {
+    const next = retainStableHistorySessions(
+      sidebarSessionsRef.current,
+      buildWorkspaceSidebarSessions(sessions, liveSessionEntries),
+    );
+    sidebarSessionsRef.current = next;
+    return next;
+  }, [liveSessionEntries, sessions]);
 
   // Live native sessions keep their launch dir in project_dir. When the
   // transcript moved into a worktree, review/diff surfaces must use the
@@ -1762,10 +1772,15 @@ export function Workspace({
     return map;
   }, [sessions]);
 
-  const liveSessionTreeState = useMemo(
-    () => buildLiveSessionTreeState(liveSessionEntries),
-    [liveSessionEntries],
-  );
+  const liveSessionTreeStateRef = useRef<LiveSessionTreeState | null>(null);
+  const liveSessionTreeState = useMemo(() => {
+    const next = retainStableLiveSessionTreeState(
+      liveSessionTreeStateRef.current,
+      buildLiveSessionTreeState(liveSessionEntries),
+    );
+    liveSessionTreeStateRef.current = next;
+    return next;
+  }, [liveSessionEntries]);
 
   useEffect(() => {
     const currentKey = selectedKeyRef.current;
@@ -3915,6 +3930,17 @@ export function Workspace({
     );
   };
 
+  // handleSelect closes over live session state that changes on every summary
+  // refresh; the tree only needs to call the latest one when a row is clicked.
+  const handleSelectRef = useRef(handleSelect);
+  useLayoutEffect(() => {
+    handleSelectRef.current = handleSelect;
+  }, [handleSelect]);
+  const handleProjectTreeSelect = useCallback(
+    (...args: Parameters<typeof handleSelect>) => handleSelectRef.current(...args),
+    [],
+  );
+
   const handleProjectTreeRefresh = useCallback(() => {
     void Promise.all([
       refreshWorkspaceData({
@@ -4068,7 +4094,7 @@ export function Workspace({
               isLoading={isLoadingSessions}
               isRefreshing={isRefreshing}
               selectedKey={selectedKey}
-              onSelect={handleSelect}
+              onSelect={handleProjectTreeSelect}
               onRefresh={handleProjectTreeRefresh}
               onSaveTitle={handleProjectTreeSaveTitle}
               onSaveAnnotation={handleProjectTreeSaveAnnotation}

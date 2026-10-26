@@ -154,6 +154,15 @@ export interface DiagnosticsEnvelope {
   performanceMode?: string;
   hardwareConcurrency?: number;
   deviceMemory?: number;
+  /** Throttled frames look identical to slow ones; these tell them apart. */
+  display?: {
+    visibilityState: string;
+    hasFocus: boolean;
+    devicePixelRatio: number;
+    viewport: string;
+    screen: string;
+    prefersReducedMotion: boolean;
+  };
   summary: PerfSummary;
   events: PerfEvent[];
 }
@@ -180,6 +189,14 @@ export function buildDiagnosticsEnvelope(): DiagnosticsEnvelope {
     performanceMode: doc?.documentElement.dataset.performanceMode,
     hardwareConcurrency: nav?.hardwareConcurrency,
     deviceMemory: (nav as { deviceMemory?: number } | undefined)?.deviceMemory,
+    display: typeof window !== 'undefined' && doc ? {
+      visibilityState: doc.visibilityState,
+      hasFocus: doc.hasFocus(),
+      devicePixelRatio: window.devicePixelRatio,
+      viewport: `${window.innerWidth}x${window.innerHeight}`,
+      screen: `${window.screen.width}x${window.screen.height}`,
+      prefersReducedMotion: window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false,
+    } : undefined,
     summary: getPerfSummary(),
     events: getPerfEvents(),
   };
