@@ -549,6 +549,48 @@ test('tracks TaskCreate and TaskUpdate with stable ordering and increasing revis
   });
 });
 
+test('a new turn starts a fresh TaskCreate list, keeping only unfinished tasks', async () => {
+  const { TodoSnapshotTracker } = await importTodoSnapshotsModule();
+  const tracker = new TodoSnapshotTracker();
+  const create = (id, subject) => tracker.fromClaudeToolCompleted(
+    'TaskCreate',
+    { subject },
+    { task: { id, subject } },
+  );
+  const complete = (id) => tracker.fromClaudeToolCompleted(
+    'TaskUpdate',
+    { taskId: id, status: 'completed' },
+    { success: true, taskId: id },
+  );
+
+  tracker.beginClaudeTurn();
+  create('1', 'Turn one done');
+  create('2', 'Turn one open');
+  complete('1');
+  // Same turn: later creates never drop earlier completed work.
+  const sameTurn = create('3', 'Turn one late add');
+  assert.deepEqual(sameTurn.items.map((item) => item.id), ['1', '2', '3']);
+  complete('3');
+
+  tracker.beginClaudeTurn();
+  // A TaskUpdate before any TaskCreate keeps the old list intact.
+  const resumed = tracker.fromClaudeToolCompleted(
+    'TaskUpdate',
+    { taskId: '2', status: 'in_progress' },
+    { success: true, taskId: '2' },
+  );
+  assert.deepEqual(resumed.items.map((item) => item.id), ['1', '2', '3']);
+
+  const fresh = create('4', 'Turn two first');
+  const fresher = create('5', 'Turn two second');
+  assert.deepEqual(fresh.items.map((item) => item.id), ['2', '4']);
+  assert.deepEqual(fresher.items.map((item) => [item.id, item.status]), [
+    ['2', 'in_progress'],
+    ['4', 'pending'],
+    ['5', 'pending'],
+  ]);
+});
+
 test('removes deleted tasks and replaces TaskList state, including an empty list', async () => {
   const { TodoSnapshotTracker } = await importTodoSnapshotsModule();
   const tracker = new TodoSnapshotTracker();

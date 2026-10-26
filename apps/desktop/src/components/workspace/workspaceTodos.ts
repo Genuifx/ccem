@@ -510,6 +510,19 @@ function applyTaskUpdate(
   return true;
 }
 
+/**
+ * Claude's task store survives across turns. The first TaskCreate of a new
+ * user turn starts a fresh list: the previous turn's completed tasks drop out,
+ * unfinished ones stay because they are still open.
+ */
+function dropCompletedTodos(map: Map<string, WorkspaceTodoItem>) {
+  for (const [id, item] of map) {
+    if (item.status === 'completed') {
+      map.delete(id);
+    }
+  }
+}
+
 function completedLegacyToolUseIds(events: SessionEventRecord[]): Set<string> {
   const completed = new Set<string>();
   for (const event of events) {
@@ -543,8 +556,13 @@ function buildLegacyTodos(
   const rawClaudeTools = extractClaudeRawToolUses(events);
   const completedToolUseIds = completedLegacyToolUseIds(events);
   const startedInputs = legacyStartedInputs(events);
+  let turnListStarted = true;
 
   for (const event of [...events].sort((left, right) => left.seq - right.seq)) {
+    if (event.payload.type === 'user_prompt') {
+      turnListStarted = false;
+      continue;
+    }
     if (event.payload.type !== 'tool_use_started' && event.payload.type !== 'tool_use_completed') {
       continue;
     }
@@ -615,6 +633,10 @@ function buildLegacyTodos(
       }
       const item = taskCreateTodo(input, result, resultValue, source);
       if (item) {
+        if (!turnListStarted && isConfirmed) {
+          dropCompletedTodos(todos);
+          turnListStarted = true;
+        }
         todos.set(item.id, item);
         observed = true;
       }
@@ -655,6 +677,13 @@ function messageContentBlocks(message: ConversationMessageData): ConversationCon
   return [];
 }
 
+function isUserPromptMessage(message: ConversationMessageData): boolean {
+  if (message.msgType !== 'user' && message.msgType !== 'human') {
+    return false;
+  }
+  return !messageContentBlocks(message).some((block) => block.type === 'tool_result');
+}
+
 function hasSuccessfulHistoryResult(block: ConversationContentBlock): boolean {
   if (!Object.prototype.hasOwnProperty.call(block, '_result') || block._resultError === true) {
     return false;
@@ -690,9 +719,14 @@ function buildHistoryTodos(messages: ConversationMessageData[]): {
 } {
   let todos = new Map<string, WorkspaceTodoItem>();
   let observed = false;
+  let turnListStarted = true;
 
   for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
     const message = messages[messageIndex];
+    if (message && isUserPromptMessage(message)) {
+      turnListStarted = false;
+      continue;
+    }
     if (
       !message
       || (message.msgType !== 'assistant' && message.msgType !== 'ai')
@@ -758,6 +792,10 @@ function buildHistoryTodos(messages: ConversationMessageData[]): {
       if (block.name === 'TaskCreate') {
         const item = taskCreateTodo(input, result, block._result, source);
         if (item) {
+          if (!turnListStarted) {
+            dropCompletedTodos(todos);
+            turnListStarted = true;
+          }
           todos.set(item.id, item);
           observed = true;
         }
