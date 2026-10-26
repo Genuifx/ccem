@@ -4127,6 +4127,7 @@ function enqueueClaudePrompt(
   const content = buildClaudeUserContent(text, images);
 
   resetClaudeTurnTracking();
+  todoSnapshotTracker.beginClaudeTurn();
   claudeInputQueue.push({
     type: 'user',
     uuid: messageUuid as SDKUserMessage['uuid'],

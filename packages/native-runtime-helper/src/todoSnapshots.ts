@@ -176,10 +176,12 @@ export class TodoSnapshotTracker {
   private revision = 0;
   private claudeItems = new Map<string, TodoSnapshotItemV1>();
   private claudeBaselineKnown = true;
+  private claudeTurnListStarted = true;
 
   reset(seed?: TodoSnapshotV1 | null, claudeBaselineKnown = true) {
     this.revision = 0;
     this.claudeItems = new Map();
+    this.claudeTurnListStarted = true;
     this.claudeBaselineKnown = seed ? false : claudeBaselineKnown;
 
     if (!isTodoSnapshotV1(seed)) {
@@ -195,6 +197,15 @@ export class TodoSnapshotTracker {
     this.claudeItems = new Map(
       seed.items.map((item) => [item.id, cloneItem(item)]),
     );
+  }
+
+  /**
+   * A new user prompt starts a new turn. Claude's task store survives across
+   * turns, so the first TaskCreate of the turn drops the previous turn's
+   * completed tasks; unfinished ones stay because they are still open.
+   */
+  beginClaudeTurn() {
+    this.claudeTurnListStarted = false;
   }
 
   fromClaudeToolStarted(_rawName: string, _input: unknown): TodoSnapshotV1 | undefined {
@@ -242,6 +253,14 @@ export class TodoSnapshotTracker {
         return undefined;
       }
 
+      if (!this.claudeTurnListStarted) {
+        for (const [itemId, item] of this.claudeItems) {
+          if (item.status === 'completed') {
+            this.claudeItems.delete(itemId);
+          }
+        }
+      }
+      this.claudeTurnListStarted = true;
       const activeText = readActiveText(inputRecord) ?? readActiveText(task);
       this.claudeItems.set(id, {
         id,

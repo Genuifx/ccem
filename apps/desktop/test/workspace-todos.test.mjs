@@ -289,6 +289,62 @@ test('replays successful history TaskList, TaskCreate, and TaskUpdate calls', as
   );
 });
 
+test('starts a fresh history TaskCreate list on each new user turn', async () => {
+  const { buildWorkspaceTodos } = await importWorkspaceTodos();
+  const create = (uuid, id, subject) => historyToolMessage(uuid, {
+    type: 'tool_use',
+    id: uuid,
+    name: 'TaskCreate',
+    input: { subject },
+    _result: { task: { id, subject } },
+  });
+  const update = (uuid, id, status) => historyToolMessage(uuid, {
+    type: 'tool_use',
+    id: uuid,
+    name: 'TaskUpdate',
+    input: { taskId: id, status },
+    _result: { success: true, taskId: id },
+  });
+  const userPrompt = (uuid, text) => ({
+    msgType: 'user',
+    uuid,
+    content: [{ type: 'text', text }],
+    segmentIndex: 0,
+    isCompactBoundary: false,
+  });
+  const toolResultTurn = {
+    msgType: 'user',
+    uuid: 'tool-result',
+    content: [{ type: 'tool_result', tool_use_id: 'c2', content: 'ok' }],
+    segmentIndex: 0,
+    isCompactBoundary: false,
+  };
+
+  const result = buildWorkspaceTodos([], [
+    userPrompt('u1', 'first task'),
+    create('c1', 't1', 'Turn one done'),
+    create('c2', 't2', 'Turn one open'),
+    toolResultTurn,
+    update('up1', 't1', 'completed'),
+    create('c3', 't3', 'Turn one late add'),
+    update('up3', 't3', 'completed'),
+    userPrompt('u2', 'second task'),
+    create('c4', 't4', 'Turn two first'),
+    create('c5', 't5', 'Turn two second'),
+  ]);
+
+  assert.equal(result.source, 'history');
+  assert.deepEqual(
+    result.items.map((item) => [item.id, item.status]),
+    [
+      ['id:t2', 'pending'],
+      ['id:t4', 'pending'],
+      ['id:t5', 'pending'],
+    ],
+  );
+  assert.equal(result.total, 3);
+});
+
 test('treats an empty successful TaskList as an explicit clear', async () => {
   const { buildWorkspaceTodos } = await importWorkspaceTodos();
   const result = buildWorkspaceTodos([], [

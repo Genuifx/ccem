@@ -50310,9 +50310,11 @@ var TodoSnapshotTracker = class {
   revision = 0;
   claudeItems = /* @__PURE__ */ new Map();
   claudeBaselineKnown = true;
+  claudeTurnListStarted = true;
   reset(seed, claudeBaselineKnown = true) {
     this.revision = 0;
     this.claudeItems = /* @__PURE__ */ new Map();
+    this.claudeTurnListStarted = true;
     this.claudeBaselineKnown = seed ? false : claudeBaselineKnown;
     if (!isTodoSnapshotV1(seed)) {
       return;
@@ -50325,6 +50327,14 @@ var TodoSnapshotTracker = class {
     this.claudeItems = new Map(
       seed.items.map((item) => [item.id, cloneItem(item)])
     );
+  }
+  /**
+   * A new user prompt starts a new turn. Claude's task store survives across
+   * turns, so the first TaskCreate of the turn drops the previous turn's
+   * completed tasks; unfinished ones stay because they are still open.
+   */
+  beginClaudeTurn() {
+    this.claudeTurnListStarted = false;
   }
   fromClaudeToolStarted(_rawName, _input) {
     return void 0;
@@ -50355,6 +50365,14 @@ var TodoSnapshotTracker = class {
       if (!id || !text) {
         return void 0;
       }
+      if (!this.claudeTurnListStarted) {
+        for (const [itemId, item] of this.claudeItems) {
+          if (item.status === "completed") {
+            this.claudeItems.delete(itemId);
+          }
+        }
+      }
+      this.claudeTurnListStarted = true;
       const activeText = readActiveText(inputRecord) ?? readActiveText(task);
       this.claudeItems.set(id, {
         id,
@@ -54386,6 +54404,7 @@ function enqueueClaudePrompt(text, images, commandId, legacyReplayMessageId, ope
   claudeForegroundCommand = /^\/compact(?:\s|$)/iu.test(text.trim()) ? "compact" : null;
   const content = buildClaudeUserContent(text, images);
   resetClaudeTurnTracking();
+  todoSnapshotTracker.beginClaudeTurn();
   claudeInputQueue.push({
     type: "user",
     uuid: messageUuid,
