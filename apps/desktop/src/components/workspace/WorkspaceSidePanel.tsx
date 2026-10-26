@@ -18,6 +18,8 @@ interface SidePanelSelection {
   /** Per-tab requested file, so switching tabs never re-opens another tab's file. */
   filePaths?: Partial<Record<WorkspaceSideTab, string>>;
   fileModes?: Partial<Record<WorkspaceSideTab, WorkspaceSideFileMode>>;
+  /** Tab shown before the panel was closed, so reopening returns there. */
+  lastTab?: WorkspaceSideTab;
   revision: number;
 }
 export interface WorkspaceSidePanelController extends SidePanelSelection {
@@ -37,6 +39,8 @@ export function useWorkspaceSidePanelController(ownerKey: string, browserVisible
   const [target, setTarget] = useState<HTMLDivElement | null>(null);
   const selection = selections[ownerKey];
   const tab = selection ? selection.tab : browserVisible ? 'browser' : null;
+  const tabRef = useRef(tab);
+  tabRef.current = tab;
   const open = useCallback((nextTab: WorkspaceSideTab, filePath?: string, owner = ownerKey, fileMode?: WorkspaceSideFileMode) => {
     const previous = selectionsRef.current[owner];
     const filePaths = { ...(previous?.filePaths ?? {}) };
@@ -73,11 +77,12 @@ export function useWorkspaceSidePanelController(ownerKey: string, browserVisible
   }, [open]);
   const close = useCallback(() => {
     const previous = selectionsRef.current[ownerKey];
-    selectionsRef.current = { ...selectionsRef.current, [ownerKey]: { ...previous, tab: null, revision: (previous?.revision ?? 0) + 1 } };
+    const lastTab = tabRef.current ?? previous?.lastTab;
+    selectionsRef.current = { ...selectionsRef.current, [ownerKey]: { ...previous, tab: null, lastTab, revision: (previous?.revision ?? 0) + 1 } };
     setSelections(selectionsRef.current);
   }, [ownerKey]);
   return useMemo(() => ({
-    ownerKey, tab, filePath: selection?.filePath, fileMode: selection?.fileMode, revision: selection?.revision ?? 0,
+    ownerKey, tab, filePath: selection?.filePath, fileMode: selection?.fileMode, lastTab: selection?.lastTab, revision: selection?.revision ?? 0,
     target, setTarget, open, revealBrowser, close,
   }), [ownerKey, tab, selection, target, open, revealBrowser, close]);
 }

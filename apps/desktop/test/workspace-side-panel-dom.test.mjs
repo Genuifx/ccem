@@ -200,6 +200,20 @@ test('browser rollback preserves later manual choices and closing fences pending
   assert.equal(h.root.panel().tab, null);
 });
 
+test('closing remembers the last tab so reopening does not default to the browser', async (t) => {
+  const h = await setup(t, async () => file('# Report'));
+  assert.equal(h.root.panel().lastTab, undefined, 'fresh owner has no remembered tab');
+  await h.act(async () => { h.root.panel().open('changes'); });
+  await h.act(async () => { h.root.panel().close(); });
+  assert.equal(h.root.panel().tab, null);
+  assert.equal(h.root.panel().lastTab, 'changes');
+  await h.act(async () => { h.root.panel().open('browser'); });
+  await h.act(async () => { h.root.panel().close(); });
+  assert.equal(h.root.panel().lastTab, 'browser');
+  await h.act(async () => { h.root.panel().close(); });
+  assert.equal(h.root.panel().lastTab, 'browser', 'a repeated close keeps the remembered tab');
+});
+
 test('two failed native browser requests restore the original file tab', async (t) => {
   const h = await setup(t, async () => file('# Report'));
   await h.act(async () => { h.root.panel().open('browse', 'docs/report.md'); });
