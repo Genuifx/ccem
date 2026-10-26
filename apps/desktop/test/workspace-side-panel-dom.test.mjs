@@ -98,8 +98,10 @@ async function setup(t, invoke, content = '[Open report](ccem-file://preview?pat
     });
   };
   const byText = (text) => [...document.querySelectorAll('button')].find((button) => button.textContent.trim() === text);
+  // View buttons are icon-only unless active, so address them by accessible name.
+  const view = (label) => document.querySelector(`[role="group"][aria-label="文件视图"] button[aria-label="${label}"]`);
   t.after(async () => { await root.unmount(); dom.window.close(); await fs.rm(tempDir, { recursive: true, force: true }); stop(); });
-  return { root, props, click, byText, settle, act, createBrowserActivationController };
+  return { root, props, click, byText, view, settle, act, createBrowserActivationController };
 }
 
 test('changes stays in the side panel; source opens in browse and preserves per-tab files', async (t) => {
@@ -119,12 +121,12 @@ test('changes stays in the side panel; source opens in browse and preserves per-
   assert.equal(document.querySelector('[data-ccem-workspace-side-panel]').dataset.ccemWorkspaceSidePanel, 'browse');
   assert.match(document.querySelector('[data-ccem-file-source]').textContent, /# Rendered report/, 'view-source opens the raw source');
   assert.equal(calls.filter((call) => call.command === 'get_workspace_file_preview').at(-1).workingDir, '/project/one');
-  await h.click(h.byText('预览'));
+  await h.click(h.view('预览'));
   assert.equal(document.querySelector('[data-ccem-markdown-preview] h1')?.textContent, 'Rendered report');
   assert.equal(document.querySelector('[data-ccem-markdown-preview] strong')?.textContent, 'Ready');
-  await h.click(h.byText('源码'));
+  await h.click(h.view('源码'));
   assert.match(document.querySelector('[data-ccem-file-source]').textContent, /# Rendered report/);
-  await h.click(h.byText('差异'));
+  await h.click(h.view('差异'));
   assert.match(document.querySelector('[data-review-page="files"]').textContent, /changed text/);
   const browser = document.getElementById('retained-browser');
   await h.click(h.byText('浏览器'));
@@ -132,7 +134,7 @@ test('changes stays in the side panel; source opens in browse and preserves per-
   assert.equal(browser.hidden, false);
   await h.click(h.byText('浏览'));
   assert.match(document.querySelector('[data-ccem-file-source]').textContent, /# Rendered report/, 'browse source survives a tab round trip');
-  await h.click(h.byText('预览'));
+  await h.click(h.view('预览'));
   assert.equal(document.querySelector('[data-ccem-markdown-preview] h1')?.textContent, 'Rendered report');
   await h.click(document.querySelector('[data-ccem-file-link]'));
   assert.equal(browser.hidden, true);

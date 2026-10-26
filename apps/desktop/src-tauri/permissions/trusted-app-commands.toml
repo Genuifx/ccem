@@ -233,6 +233,7 @@ commands.allow = [
   "get_workspace_file_preview",
   "get_workspace_media_preview",
   "open_file_in_workspace",
+  "list_workspace_open_apps",
   "open_text_in_vscode",
   "save_file_dialog",
   "save_image_dialog",

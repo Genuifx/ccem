@@ -77,6 +77,7 @@ mod weixin;
 mod workspace_decorations;
 mod workspace_search;
 mod workspace_file_preview;
+mod workspace_open_with;
 
 #[cfg(target_os = "windows")]
 mod windows_bootstrap;
@@ -5051,8 +5052,15 @@ fn resolve_workspace_path(
 /// We deliberately do NOT expose a generic open-path command — every call must
 /// pass the session's project_dir, which the guard canonicalizes and checks
 /// via `Path::starts_with` (post-symlink-resolution).
+///
+/// `app_id` picks a catalog application (see `workspace_open_with`); `None`
+/// keeps the OS default handler.
 #[tauri::command]
-fn open_file_in_workspace(working_dir: String, file_path: String) -> Result<bool, String> {
+fn open_file_in_workspace(
+    working_dir: String,
+    file_path: String,
+    app_id: Option<String>,
+) -> Result<bool, String> {
     let resolved = resolve_workspace_path(&working_dir, &file_path)?;
 
     // We intentionally do not canonicalize again right before spawn: the
@@ -5061,15 +5069,7 @@ fn open_file_in_workspace(working_dir: String, file_path: String) -> Result<bool
     // resolve and spawn) can only redirect the OS handler, not escape the
     // workspace itself — and the OS open handler is the user's chosen editor,
     // which has no extra authority from this app.
-    #[cfg(target_os = "macos")]
-    let spawn_result = Command::new("open").arg(&resolved).spawn();
-    #[cfg(target_os = "windows")]
-    let spawn_result = Command::new("cmd")
-        .args(["/C", "start", ""])
-        .arg(&resolved)
-        .spawn();
-    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-    let spawn_result = Command::new("xdg-open").arg(&resolved).spawn();
+    let spawn_result = workspace_open_with::open_command(&resolved, app_id.as_deref())?.spawn();
 
     match spawn_result {
         Ok(_) => Ok(true),
@@ -5079,6 +5079,15 @@ fn open_file_in_workspace(working_dir: String, file_path: String) -> Result<bool
             err
         )),
     }
+}
+
+/// Applications from the "open with" catalog that are installed locally.
+/// Icon extraction spawns `sips`, so it stays off the main thread.
+#[tauri::command]
+async fn list_workspace_open_apps() -> Result<Vec<workspace_open_with::WorkspaceOpenApp>, String> {
+    tauri::async_runtime::spawn_blocking(workspace_open_with::installed_apps)
+        .await
+        .map_err(|err| format!("Failed to list apps: {err}"))
 }
 
 #[cfg(test)]
@@ -6282,6 +6291,7 @@ pub fn run_desktop_app() -> i32 {
             workspace_file_preview::get_workspace_file_preview,
             get_workspace_media_preview,
             open_file_in_workspace,
+            list_workspace_open_apps,
             open_text_in_vscode,
             save_file_dialog,
             save_image_dialog,

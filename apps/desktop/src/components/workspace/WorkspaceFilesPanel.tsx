@@ -3,10 +3,10 @@ import { invoke } from '@tauri-apps/api/core';
 import {
   ArrowLeft,
   ChevronRight,
-  ExternalLink,
   Eye,
   FileCode,
   FileDiff,
+  FileImage,
   FilePenLine,
   FileText,
   FolderClosed,
@@ -34,6 +34,14 @@ import type { ReviewChangedFile, ReviewSource, WorkspaceReviewModel } from './wo
 import { WorkspaceFileLinkContext, useWorkspaceFileLinks } from './WorkspaceFileLinkContext';
 import { useWorkspaceSidePanel } from './WorkspaceSidePanel';
 import { DiffPreview, MediaPreview, basename, isMarkdownPath, mediaKindForPath } from './WorkspaceFilePreview';
+import { WorkspaceOpenWithButton } from './WorkspaceOpenWithButton';
+import { openCategoryForPath } from './workspaceOpenWith';
+
+function BrowseFileIcon({ path }: { path: string }) {
+  const category = openCategoryForPath(path);
+  const Icon = category === 'image' ? FileImage : category === 'markdown' || category === 'pdf' ? FileText : FileCode;
+  return <Icon className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60" />;
+}
 
 export interface WorkspaceFilesPanelProps {
   session: NativeSessionSummary;
@@ -333,9 +341,9 @@ export function WorkspaceFilesPanel({
     return () => { cancelled = true; };
   }, [browseDir, scope, session.project_dir]);
 
-  const openInEditor = async (path: string) => {
+  const openInEditor = async (path: string, appId?: string) => {
     try {
-      await invoke<boolean>('open_file_in_workspace', { workingDir: session.project_dir, filePath: path });
+      await invoke<boolean>('open_file_in_workspace', { workingDir: session.project_dir, filePath: path, appId });
     } catch (err) {
       const message = String(err);
       if (message.includes('escapes working dir')) toast.error(t('workspace.reviewPathOutsideWorkspace'));
@@ -455,12 +463,13 @@ export function WorkspaceFilesPanel({
             <button
               type="button"
               onClick={() => setBrowseDir('')}
-              className="shrink-0 text-[10px] text-muted-foreground/60 transition-colors hover:text-foreground"
+              className="min-w-0 shrink-[4] truncate text-[10px] text-muted-foreground/60 transition-colors hover:text-foreground"
+              title={projectName}
             >
               {projectName}
             </button>
           ) : (
-            <span className="shrink-0 text-[10px] text-muted-foreground/55">{projectName}</span>
+            <span className="min-w-0 shrink-[4] truncate text-[10px] text-muted-foreground/55" title={projectName}>{projectName}</span>
           )}
           {dirnameOf(selectedPath) ? (
             <>
@@ -469,20 +478,20 @@ export function WorkspaceFilesPanel({
                 <button
                   type="button"
                   onClick={() => setBrowseDir(dirnameOf(selectedPath))}
-                  className="min-w-0 truncate text-[10px] text-muted-foreground/60 transition-colors hover:text-foreground"
+                  className="min-w-0 shrink-[4] truncate text-[10px] text-muted-foreground/60 transition-colors hover:text-foreground"
                   title={dirnameOf(selectedPath)}
                 >
                   {dirnameOf(selectedPath)}
                 </button>
               ) : (
-                <span className="min-w-0 truncate text-[10px] text-muted-foreground/60" title={dirnameOf(selectedPath)}>
+                <span className="min-w-0 shrink-[4] truncate text-[10px] text-muted-foreground/60" title={dirnameOf(selectedPath)}>
                   {dirnameOf(selectedPath)}
                 </span>
               )}
             </>
           ) : null}
           <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground/35" />
-          <span className="shrink-0 text-[11px] font-medium text-foreground">{basename(selectedPath)}</span>
+          <span className="min-w-[2.5rem] truncate text-[11px] font-medium text-foreground" title={selectedPath}>{basename(selectedPath)}</span>
           {selectedMark?.letter === 'A' ? (
             <span className="shrink-0 rounded bg-success/10 px-1 py-px text-[9px] font-medium text-success">{t('workspace.changesNewFile')}</span>
           ) : isDeleted ? (
@@ -495,7 +504,7 @@ export function WorkspaceFilesPanel({
       {selectedPath ? (
         <div className="flex shrink-0 items-center gap-1 pl-1">
           <FileStat additions={selectedAdditions} deletions={selectedDeletions} />
-          {scope === 'browse' ? <div className="flex items-center rounded-md bg-muted/35 p-0.5" role="group" aria-label={t('workspace.filesView')}>
+          {scope === 'browse' ? <div className="flex items-center rounded-full bg-muted/45 p-0.5" role="group" aria-label={t('workspace.filesView')}>
             {modeOptions.map(({ key, label, icon: Icon }) => (
               <button
                 key={key}
@@ -505,14 +514,15 @@ export function WorkspaceFilesPanel({
                 title={label}
                 onClick={() => void selectFile(selectedPath, key)}
                 className={cn(
-                  'inline-flex h-6 items-center gap-1 rounded px-1.5 text-[10px] font-medium transition-colors',
+                  'inline-flex h-6 items-center gap-1 rounded-full px-2 text-[10px] font-medium transition-colors',
                   mode === key
                     ? 'bg-background text-foreground shadow-sm'
                     : 'text-muted-foreground hover:text-foreground',
                 )}
               >
                 <Icon className="h-3 w-3" />
-                {compact ? null : <span>{label}</span>}
+                {/* Only the active view carries a label; the rest stay icon-only to leave room for the filename. */}
+                {!compact && mode === key ? <span>{label}</span> : null}
               </button>
             ))}
           </div> : null}
@@ -538,17 +548,7 @@ export function WorkspaceFilesPanel({
               <Eye className="h-3.5 w-3.5" />
             </Button>
           ) : null}
-          <Button
-            variant="outline"
-            size="sm"
-            className={cn('h-7 shrink-0 gap-1 rounded-full px-2 text-[10px]', compact && 'w-7 px-0')}
-            aria-label={t('workspace.reviewOpenInEditor')}
-            title={t('workspace.reviewOpenInEditor')}
-            onClick={() => void openInEditor(selectedPath)}
-          >
-            <ExternalLink className="h-3 w-3" />
-            {compact ? null : <span>{t('workspace.changesOpen')}</span>}
-          </Button>
+          <WorkspaceOpenWithButton path={selectedPath} compact={compact} onOpen={(appId) => void openInEditor(selectedPath, appId)} />
         </div>
       ) : null}
     </div>
@@ -612,7 +612,7 @@ export function WorkspaceFilesPanel({
             )}>
               {scope === 'changes' ? (
                 <>
-                  <div className="flex h-8 shrink-0 items-center gap-0.5 border-b border-border-subtle/40 px-1.5">
+                  <div className="flex h-9 shrink-0 items-center gap-0.5 border-b border-border-subtle/40 px-1.5">
                     <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-hidden" role="group" aria-label={t('workspace.fileSources')}>
                       {changeFilterChips.map(({ key, label, count }) => (
                         <button
@@ -656,7 +656,7 @@ export function WorkspaceFilesPanel({
                         placeholder={t('workspace.changesFilterPlaceholder')}
                         value={query}
                         onChange={(event) => setQuery(event.target.value)}
-                        className="h-6 rounded-md border-0 bg-surface-raised/30 pl-6 pr-2 text-[10px] shadow-none focus-visible:ring-1 focus-visible:ring-ring"
+                        className="h-6 rounded-md border-0 bg-surface-raised/30 pl-6 pr-2 text-[10px] md:text-[10px] shadow-none focus-visible:ring-1 focus-visible:ring-ring"
                       />
                     </div>
                   ) : null}
@@ -716,14 +716,14 @@ export function WorkspaceFilesPanel({
                 </>
               ) : (
                 <>
-                  <div className="relative shrink-0 border-b border-border-subtle/40 px-2 py-1.5">
-                    <Search className="pointer-events-none absolute left-3.5 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground/40" />
+                  <div className="relative flex h-9 shrink-0 items-center border-b border-border-subtle/40 px-1.5">
+                    <Search className="pointer-events-none absolute left-3.5 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground/50" />
                     <Input
                       aria-label={t('workspace.filesSearch')}
                       placeholder={t('workspace.filesSearch')}
                       value={query}
                       onChange={(event) => setQuery(event.target.value)}
-                      className="h-7 rounded-md border-0 bg-surface-raised/30 pl-6 pr-2 text-[10px] shadow-none focus-visible:ring-1 focus-visible:ring-ring"
+                      className="h-7 rounded-full border-0 bg-muted/45 pl-7 pr-2.5 text-[11px] md:text-[11px] shadow-none transition-colors placeholder:text-muted-foreground/55 hover:bg-muted/60 focus-visible:bg-background focus-visible:ring-1 focus-visible:ring-primary/35"
                     />
                   </div>
                   {!browseHasQuery ? (
@@ -756,15 +756,15 @@ export function WorkspaceFilesPanel({
                               void selectFile(item.relative_path);
                             }}
                             className={cn(
-                              'flex w-full items-center gap-1.5 px-2 py-[5px] text-left text-[11px] transition-colors',
+                              'mx-1 flex w-[calc(100%-0.5rem)] items-center gap-1.5 rounded-md px-1.5 py-[5px] text-left text-[11px] transition-colors',
                               selectedPath === item.relative_path
-                                ? 'bg-primary/[0.08] text-foreground ring-1 ring-inset ring-primary/20'
-                                : 'hover:bg-surface-raised/55',
+                                ? 'bg-primary/10 font-medium text-foreground'
+                                : 'text-foreground/85 hover:bg-muted/50 hover:text-foreground',
                             )}
                           >
                             {item.is_dir
-                              ? <><ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground/45" /><FolderClosed className="h-3.5 w-3.5 shrink-0 opacity-45" /></>
-                              : <><span className="w-3 shrink-0" /><FileText className="h-3.5 w-3.5 shrink-0 opacity-45" /></>}
+                              ? <><ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground/45" /><FolderClosed className="h-3.5 w-3.5 shrink-0 text-primary/55" /></>
+                              : <><span className="w-3 shrink-0" /><BrowseFileIcon path={item.relative_path} /></>}
                             <span className="min-w-0 flex-1 truncate">{item.display_name}</span>
                           </button>
                         ))}
