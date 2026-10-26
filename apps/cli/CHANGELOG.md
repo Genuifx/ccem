@@ -1,5 +1,11 @@
 # ccem
 
+## 2.104.0
+
+### Minor Changes
+
+- Improve live session responsiveness on slower Macs by avoiding duplicate transcript polling and unnecessary sidebar and composer updates. Add display visibility and macOS system pressure details to diagnostic exports.
+
 ## 2.103.0
 
 ### Minor Changes
