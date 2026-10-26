@@ -1,4 +1,4 @@
-import { memo, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { ExternalLink, Lightbulb } from '@/lib/lucide-react';
 import { cn } from '@/lib/utils';
@@ -16,6 +16,8 @@ export interface NextStepActions {
 // Monochrome only: a black primary and a ghost secondary, no accent color.
 const ACTION = 'h-6 gap-1 rounded-md bg-foreground px-2.5 text-[12px] font-normal text-background hover:bg-foreground/85';
 const GHOST_ACTION = 'h-6 rounded-md px-2.5 text-[12px] font-normal text-foreground/80 hover:text-foreground';
+/** Hold "started" in the button briefly, then settle into the Open action. */
+const STARTED_HINT_MS = 1600;
 
 export const WorkspaceNextStepsCard = memo(function WorkspaceNextStepsCard({
   nextSteps,
@@ -26,12 +28,28 @@ export const WorkspaceNextStepsCard = memo(function WorkspaceNextStepsCard({
 }) {
   const { t } = useLocale();
   const [pendingId, setPendingId] = useState<string | null>(null);
+  const [justStartedId, setJustStartedId] = useState<string | null>(null);
+  const startedHintTimer = useRef<number | null>(null);
 
-  const run = async (id: string, task: () => Promise<void>) => {
+  useEffect(() => () => {
+    if (startedHintTimer.current !== null) window.clearTimeout(startedHintTimer.current);
+  }, []);
+
+  const holdStartedHint = (id: string) => {
+    if (startedHintTimer.current !== null) window.clearTimeout(startedHintTimer.current);
+    setJustStartedId(id);
+    startedHintTimer.current = window.setTimeout(() => {
+      startedHintTimer.current = null;
+      setJustStartedId(null);
+    }, STARTED_HINT_MS);
+  };
+
+  const run = async (id: string, task: () => Promise<void>, onSettled?: () => void) => {
     if (pendingId) return;
     setPendingId(id);
     try {
       await task();
+      onSettled?.();
     } finally {
       setPendingId(null);
     }
@@ -64,24 +82,21 @@ export const WorkspaceNextStepsCard = memo(function WorkspaceNextStepsCard({
               </p>
               <div className="mt-1.5 flex items-center gap-1.5">
                 {childKeys ? (
-                  <>
-                    <span className="pr-1 text-[12px] text-muted-foreground/70">{t('workspace.nextStepStarted')}</span>
-                    <Button
-                      size="sm"
-                      className={ACTION}
-                      onClick={() => actions.onOpen(childKeys)}
-                    >
-                      <ExternalLink className="h-3 w-3" />
-                      {t('workspace.nextStepOpen')}
-                    </Button>
-                  </>
+                  <Button
+                    size="sm"
+                    className={ACTION}
+                    onClick={() => actions.onOpen(childKeys)}
+                  >
+                    <ExternalLink className="h-3 w-3" />
+                    {justStartedId === id ? t('workspace.nextStepStarted') : t('workspace.nextStepOpen')}
+                  </Button>
                 ) : (
                   <>
                     <Button
                       size="sm"
                       className={ACTION}
                       disabled={pendingId !== null}
-                      onClick={() => void run(id, () => actions.onStartSession(id, suggestion))}
+                      onClick={() => void run(id, () => actions.onStartSession(id, suggestion), () => holdStartedHint(id))}
                     >
                       {pendingId === id ? t('workspace.nextStepStarting') : t('workspace.nextStepStartSession')}
                     </Button>

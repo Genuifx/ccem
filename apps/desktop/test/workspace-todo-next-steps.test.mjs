@@ -199,6 +199,12 @@ test('next-steps card renders below the todo card once idle, with per-row state'
   assert.match(html, new RegExp(`data-next-step-id="next:a2:1" data-next-step-state="started"`));
   assert.doesNotMatch(html, /glass-card/);
 
+  // The started hint lives inside the action button so no extra label pushes it sideways.
+  const startedRow = html.match(/<li[^>]*data-next-step-id="next:a2:1"[\s\S]*?<\/li>/)?.[0] ?? '';
+  assert.match(startedRow, /打开/);
+  assert.doesNotMatch(startedRow, /已开始/);
+  assert.equal((startedRow.match(/<button/g) ?? []).length, 1, 'started row exposes a single Open action');
+
   const empty = renderTranscript({ messages, nextSteps: { anchorKey: 'a2', suggestions: [] }, nextStepActions: actions() });
   assert.doesNotMatch(empty, /data-workspace-next-steps/);
 });
