@@ -140,6 +140,7 @@ mod tests {
             config_source: None,
             task_stage: None,
             task_sticker: None,
+            archived: None,
             task_label: None,
             launch_mode: None,
         })

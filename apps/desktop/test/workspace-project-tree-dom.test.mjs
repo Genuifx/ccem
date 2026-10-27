@@ -123,7 +123,7 @@ async function importProjectTreeHarness() {
           buildWorkspaceSidebarSessions,
         } from '@/components/workspace/workspaceSidebarSessions';
 
-        function ControlledProjectTree({ historySessions, liveEntries, onSelect }) {
+        function ControlledProjectTree({ historySessions, liveEntries, onSelect, ...extraProps }) {
           const [selectedKey, setSelectedKey] = useState(null);
           const sidebarSessions = useMemo(
             () => buildWorkspaceSidebarSessions(historySessions, liveEntries),
@@ -153,6 +153,7 @@ async function importProjectTreeHarness() {
                     onSelect(session);
                   }}
                   onRefresh={() => {}}
+                  {...extraProps}
                 />
               </TooltipProvider>
             </LocaleProvider>
@@ -173,6 +174,11 @@ async function importProjectTreeHarness() {
             click(element) {
               act(() => {
                 element.click();
+              });
+            },
+            dispatch(element, event) {
+              act(() => {
+                element.dispatchEvent(event);
               });
             },
             unmount() {
@@ -863,4 +869,73 @@ test('ProjectTree folds worktrees into their repository and gathers other origin
     container.querySelector('[data-recent-bucket] [data-workspace-session-key="claude:home-chat"]').textContent,
     /无项目会话/,
   );
+});
+
+test('ProjectTree archives a row from its hover button and a project batch from the header menu', async (t) => {
+  const { dom } = installDom();
+  const { harness, tempDir } = await importProjectTreeHarness();
+  const container = document.querySelector('#root');
+  assert.ok(container);
+
+  let mounted;
+  t.after(async () => {
+    await mounted?.unmount();
+    dom.window.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+    await stopEsbuild();
+  });
+
+  const now = Date.now();
+  const RUNNING_PROVIDER_ID = 'running-provider';
+  const sessions = [
+    historySession({ id: 'stale-a', timestamp: now - 9 * 86_400_000 }),
+    historySession({ id: 'stale-b', timestamp: now - 20 * 86_400_000 }),
+    { ...historySession({ id: 'fresh-done', timestamp: now - 60_000 }), taskStage: 'done' },
+    historySession({ id: RUNNING_PROVIDER_ID, timestamp: now - 30 * 86_400_000 }),
+  ];
+  const archiveCalls = [];
+  mounted = await harness.mountProjectTree(container, {
+    historySessions: sessions,
+    liveEntries: [liveEntry({
+      runtimeId: 'native-running',
+      providerSessionId: RUNNING_PROVIDER_ID,
+      updatedAt: new Date(now).toISOString(),
+      title: 'running',
+    })],
+    onSelect: () => {},
+    onArchiveSessions: async (targets) => {
+      archiveCalls.push(targets.map((session) => session.id));
+    },
+  });
+
+  const row = (id) => container.querySelector(`[data-workspace-session-key="claude:${id}"]`);
+  const archiveButton = (id) => row(id)?.querySelector('[data-testid="workspace-session-archive"]');
+
+  // Running sessions offer no archive action; idle ones do.
+  assert.ok(row(RUNNING_PROVIDER_ID), 'running row is rendered');
+  assert.equal(archiveButton(RUNNING_PROVIDER_ID), null);
+  assert.ok(archiveButton('stale-a'));
+
+  // The hover button archives that row only, without selecting it.
+  await mounted.click(archiveButton('stale-a'));
+  assert.deepEqual(archiveCalls, [['stale-a']]);
+  assert.equal(row('stale-a').getAttribute('aria-selected'), null);
+
+  // Right-click the project header and use the stale batch action.
+  const header = container.querySelector(`[data-project-motion-key="project:main:${PROJECT}"] button[aria-expanded]`);
+  assert.ok(header, 'project header is rendered');
+  await mounted.dispatch(
+    header,
+    new window.MouseEvent('contextmenu', { bubbles: true, clientX: 10, clientY: 10 }),
+  );
+  const menuItems = Array.from(document.querySelectorAll('[role="menuitem"]'));
+  const staleItem = menuItems.find((item) => item.textContent.includes('归档 7 天前的会话'));
+  const doneItem = menuItems.find((item) => item.textContent.includes('归档已完成的会话'));
+  assert.ok(staleItem && doneItem, `menu items: ${menuItems.map((item) => item.textContent).join(' | ')}`);
+  // The running session is old but protected, so only the idle stale rows count.
+  assert.match(staleItem.textContent, /（2）/);
+  assert.match(doneItem.textContent, /（1）/);
+
+  await mounted.click(staleItem);
+  assert.deepEqual(archiveCalls.at(-1).slice().sort(), ['stale-a', 'stale-b']);
 });

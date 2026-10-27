@@ -42,6 +42,8 @@ export interface HistorySessionItem {
   taskStage?: SessionTaskStage;
   taskSticker?: SessionStickerId;
   taskLabel?: string;
+  /** Effective archive state (CCEM overlay over Codex native archive). */
+  archived?: boolean;
   /** Launch origin, e.g. `cron`, `external_control`, or Codex `automation` / `subagent`. */
   launchMode?: string;
 }

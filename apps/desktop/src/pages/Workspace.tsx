@@ -120,6 +120,11 @@ import type {
   WorkspaceProjectNode,
 } from '@/features/conversations/types';
 import { toSessionKey } from '@/features/conversations/types';
+import {
+  getArchivedSessions,
+  getSessionArchiveOverlay,
+  setSessionsArchived,
+} from '@/features/conversations/sessionArchiveClient';
 import { useWorkspaceSessionDecorations } from '@/components/workspace/useWorkspaceSessionDecorations';
 import { useWorkspaceAnnotations } from '@/components/workspace/useWorkspaceAnnotations';
 import type {
@@ -260,6 +265,15 @@ interface WorkspaceForkTurnRequest {
 const ACTIVE_LIVE_RUNTIME_STORAGE_KEY = 'ccem-workspace-live-runtime';
 const LIVE_RUNTIME_SET_STORAGE_KEY = 'ccem-workspace-live-runtimes';
 const WORKSPACE_HISTORY_SESSION_LIMIT = 240;
+
+/** Mirrors the backend rule: archived until activity newer than archived_at. */
+function isHiddenByArchive(
+  archivedAtBySessionKey: ReadonlyMap<string, number>,
+  session: Pick<HistorySessionItem, 'source' | 'id' | 'timestamp'>,
+) {
+  const archivedAt = archivedAtBySessionKey.get(`${session.source}:${session.id}`);
+  return archivedAt !== undefined && session.timestamp <= archivedAt;
+}
 const NATIVE_ACTIVITY_CONFLICT_RETRY_MS = 3000;
 const NATIVE_ACTIVITY_CONFLICT_MAX_RETRIES = 10;
 const NATIVE_ACTIVITY_CONFLICT_MAX_RETRY_MS = 60_000;
@@ -489,7 +503,13 @@ export function Workspace({
 
   const [sessions, setSessions] = useState<HistorySessionItem[]>([]);
   const sessionsRef = useRef<HistorySessionItem[]>([]);
-  const [precomputedProjectNodes, setPrecomputedProjectNodes] = useState<WorkspaceProjectNode[]>([]);
+  const [snapshotProjectNodes, setPrecomputedProjectNodes] = useState<WorkspaceProjectNode[]>([]);
+  // `source:id` -> archived_at (ms) for sessions archived in CCEM. History rows
+  // are already filtered by the backend; this also hides live native rows and
+  // makes archive/undo instant before the next snapshot.
+  const [archivedAtBySessionKey, setArchivedAtBySessionKey] = useState<ReadonlyMap<string, number>>(
+    () => new Map(),
+  );
   const [isLoadingSessions, setIsLoadingSessions] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -1016,7 +1036,20 @@ export function Workspace({
       });
   }, [installedSkills.length, loadInstalledSkills]);
 
+  // An archived session opened from the archive list is not in the history
+  // snapshot. Keep it in `sessions` while it stays selected so the history
+  // view can resolve it; the sidebar filters `archived` rows out.
+  const openedArchivedSessionRef = useRef<HistorySessionItem | null>(null);
   const replaceSessions = useCallback((nextSessions: HistorySessionItem[]) => {
+    const openedArchived = openedArchivedSessionRef.current;
+    if (openedArchived) {
+      const openedKey = toSessionKey(openedArchived);
+      if (selectedKeyRef.current !== openedKey) {
+        openedArchivedSessionRef.current = null;
+      } else if (!nextSessions.some((session) => toSessionKey(session) === openedKey)) {
+        nextSessions = [...nextSessions, openedArchived];
+      }
+    }
     const retainedSessions = retainStableHistorySessions(sessionsRef.current, nextSessions);
     sessionsRef.current = retainedSessions;
     setSessions(retainedSessions);
@@ -1752,13 +1785,33 @@ export function Workspace({
   // decoration poll do not redo work for all sessions on every refresh.
   const sidebarSessionsRef = useRef<HistorySessionItem[]>([]);
   const sidebarSessions = useMemo(() => {
+    const merged = buildWorkspaceSidebarSessions(sessions, liveSessionEntries);
     const next = retainStableHistorySessions(
       sidebarSessionsRef.current,
-      buildWorkspaceSidebarSessions(sessions, liveSessionEntries),
+      merged.filter((session) => !session.archived && !isHiddenByArchive(archivedAtBySessionKey, session)),
     );
     sidebarSessionsRef.current = next;
     return next;
-  }, [liveSessionEntries, sessions]);
+  }, [archivedAtBySessionKey, liveSessionEntries, sessions]);
+  const precomputedProjectNodes = useMemo(() => {
+    if (archivedAtBySessionKey.size === 0) return snapshotProjectNodes;
+    return snapshotProjectNodes
+      .map((node) => ({
+        ...node,
+        sessions: node.sessions.filter((session) => !isHiddenByArchive(archivedAtBySessionKey, session)),
+      }))
+      .filter((node) => node.sessions.length > 0);
+  }, [archivedAtBySessionKey, snapshotProjectNodes]);
+
+  useEffect(() => {
+    void getSessionArchiveOverlay()
+      .then((entries) => {
+        setArchivedAtBySessionKey(new Map(
+          entries.map((entry) => [`${entry.source}:${entry.sessionId}`, entry.archivedAt]),
+        ));
+      })
+      .catch((error) => console.error('Failed to load session archive overlay:', error));
+  }, []);
 
   // Live native sessions keep their launch dir in project_dir. When the
   // transcript moved into a worktree, review/diff surfaces must use the
@@ -4035,6 +4088,65 @@ export function Workspace({
     setPrecomputedProjectNodes(snapshot.projectNodes);
   }, [syncSessionState]);
 
+  const updateArchivedAt = useCallback((
+    targets: HistorySessionItem[],
+    archivedAt: number | null,
+  ) => {
+    setArchivedAtBySessionKey((previous) => {
+      const next = new Map(previous);
+      for (const session of targets) {
+        const key = `${session.source}:${session.id}`;
+        if (archivedAt === null) next.delete(key);
+        else next.set(key, archivedAt);
+      }
+      return next;
+    });
+  }, []);
+
+  const handleArchiveSessions = useCallback(async (targets: HistorySessionItem[]) => {
+    if (targets.length === 0) return;
+    try {
+      await setSessionsArchived(targets, true);
+    } catch (error) {
+      console.error('Failed to archive sessions:', error);
+      toast.error(t('workspace.archiveFailed'));
+      return;
+    }
+    invalidateHistoryCache();
+    updateArchivedAt(targets, Date.now());
+    toast(t('workspace.archivedCount').replace('{count}', String(targets.length)), {
+      duration: 8000,
+      action: {
+        label: t('workspace.archiveUndo'),
+        onClick: () => {
+          void setSessionsArchived(targets, null)
+            .then(() => {
+              updateArchivedAt(targets, null);
+              return handleProjectTreeSessionsChanged();
+            })
+            .catch((error) => {
+              console.error('Failed to undo archive:', error);
+              toast.error(t('workspace.archiveFailed'));
+            });
+        },
+      },
+    });
+  }, [handleProjectTreeSessionsChanged, t, updateArchivedAt]);
+
+  const handleUnarchiveSession = useCallback(async (session: HistorySessionItem) => {
+    await setSessionsArchived([session], false);
+    updateArchivedAt([session], null);
+    await handleProjectTreeSessionsChanged();
+  }, [handleProjectTreeSessionsChanged, updateArchivedAt]);
+
+  const handleOpenArchivedSession = useCallback((session: HistorySessionItem) => {
+    const key = toSessionKey(session);
+    openedArchivedSessionRef.current = session;
+    selectedKeyRef.current = key;
+    replaceSessions(sessionsRef.current);
+    void handleSelectRef.current(session);
+  }, [replaceSessions]);
+
   const handleProjectTreeNewSession = useCallback(() => {
     void handleNewSession(launchClient);
   }, [handleNewSession, launchClient]);
@@ -4098,6 +4210,10 @@ export function Workspace({
               onRefresh={handleProjectTreeRefresh}
               onSaveTitle={handleProjectTreeSaveTitle}
               onSaveAnnotation={handleProjectTreeSaveAnnotation}
+              onArchiveSessions={handleArchiveSessions}
+              onLoadArchivedSessions={getArchivedSessions}
+              onUnarchiveSession={handleUnarchiveSession}
+              onOpenArchivedSession={handleOpenArchivedSession}
               onSessionsChanged={handleProjectTreeSessionsChanged}
               onCreateForProject={handleCreateForProject}
               onNewSession={handleProjectTreeNewSession}

@@ -1,7 +1,7 @@
 import { memo, useMemo, useState, useCallback, useRef, useEffect, useLayoutEffect } from 'react';
 import { nestSessionsByParent } from './sessionLineage';
 import type { DragEvent, PointerEvent as ReactPointerEvent } from 'react';
-import { Check, Clock, Copy, FolderOpen, FolderTree, Link, Pin, RefreshCw, RotateCcw, X, Plus, ShieldAlert } from '@/lib/lucide-react';
+import { Archive, Check, Clock, Copy, FolderOpen, FolderTree, Link, Pin, RefreshCw, RotateCcw, X, Plus, ShieldAlert } from '@/lib/lucide-react';
 import { cn } from '@/lib/utils';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion } from '@/lib/gsapMotion';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -59,6 +59,8 @@ import {
   type ProjectClassificationOverride,
   type SessionOrigin,
 } from './workspaceSidebarGrouping';
+import { selectBulkArchiveCandidates } from './sessionArchive';
+import { WorkspaceArchivedSessions } from './WorkspaceArchivedSessions';
 
 interface ProjectTreeProps {
   sessions: HistorySessionItem[];
@@ -85,6 +87,10 @@ interface ProjectTreeProps {
     }
   ) => Promise<void>;
   onSessionsChanged?: () => Promise<void>;
+  onArchiveSessions?: (sessions: HistorySessionItem[]) => Promise<void>;
+  onLoadArchivedSessions?: () => Promise<HistorySessionItem[]>;
+  onUnarchiveSession?: (session: HistorySessionItem) => Promise<void>;
+  onOpenArchivedSession?: (session: HistorySessionItem) => void;
   onCreateForProject?: (projectPath: string) => void;
   onNewSession?: () => void;
   width?: number;
@@ -417,7 +423,7 @@ function SessionAnnotationPopover({
 
         {/* Sticker grid — compact 4-col, tactile hover */}
         <div className="mb-3 grid grid-cols-4 gap-1.5">
-          {SESSION_STICKERS.map((sticker) => {
+          {SESSION_STICKERS.filter((sticker) => sticker.id !== 'archived').map((sticker) => {
             const selected = draftSticker === sticker.id;
             return (
               <button
@@ -525,6 +531,10 @@ export const ProjectTree = memo(function ProjectTree({
   onSaveTitle,
   onSaveAnnotation,
   onSessionsChanged,
+  onArchiveSessions,
+  onLoadArchivedSessions,
+  onUnarchiveSession,
+  onOpenArchivedSession,
   onCreateForProject,
   onNewSession,
   width,
@@ -708,6 +718,23 @@ export const ProjectTree = memo(function ProjectTree({
       return [key, ...previous.filter((pinnedKey) => pinnedKey !== key)];
     });
   }, [canonicalizeSessionKey]);
+
+  const isSessionActive = useCallback((session: HistorySessionItem) => {
+    const rawKey = toKey(session);
+    return activeSessionKeys.has(rawKey) || activeSessionKeys.has(canonicalizeSessionKey(rawKey));
+  }, [activeSessionKeys, canonicalizeSessionKey]);
+
+  // Archiving drops the pin so a resurfaced session returns to its project.
+  const archiveSessions = useCallback((targets: HistorySessionItem[]) => {
+    if (!onArchiveSessions || targets.length === 0) return;
+    const keys = new Set(targets.map((session) => canonicalizeSessionKey(toKey(session))));
+    setPinnedSessionKeys((previous) => (
+      previous.some((key) => keys.has(canonicalizeSessionKey(key)))
+        ? previous.filter((key) => !keys.has(canonicalizeSessionKey(key)))
+        : previous
+    ));
+    void onArchiveSessions(targets);
+  }, [canonicalizeSessionKey, onArchiveSessions]);
 
   const copyText = useCallback(async (text: string) => {
     try {
@@ -969,7 +996,23 @@ export const ProjectTree = memo(function ProjectTree({
     onMarkTemporary: (project: string) => setProjectClassification(project, 'temporary'),
     onResetProjectClassification: (overrideKey: string) => setProjectClassification(overrideKey, null),
     onOrganizeSidebar: organizeSidebar,
-  }), [organizeSidebar, setProjectClassification]);
+    getArchiveCandidates: onArchiveSessions
+      ? (sessions: HistorySessionItem[]) => selectBulkArchiveCandidates(
+        sessions,
+        (session) => isSessionActive(session)
+          || pinnedSessionKeySet.has(canonicalizeSessionKey(toKey(session))),
+      )
+      : undefined,
+    onArchiveSessions: archiveSessions,
+  }), [
+    archiveSessions,
+    canonicalizeSessionKey,
+    isSessionActive,
+    onArchiveSessions,
+    organizeSidebar,
+    pinnedSessionKeySet,
+    setProjectClassification,
+  ]);
 
   const getProjectOverrideKey = useCallback(
     (project: string) => findProjectClassificationOverrideKey(projectClassificationOverrides, project),
@@ -1415,6 +1458,7 @@ export const ProjectTree = memo(function ProjectTree({
     const isEditing = editingKey === key;
     const isPinned = pinnedSessionKeySet.has(key);
     const pinLabel = isPinned ? t('workspace.unpinSession') : t('workspace.pinSession');
+    const canArchive = !!onArchiveSessions && !isSessionActive(session);
     const decoration = decorationsBySessionKey[rawKey];
     const approvalRequired = decoration?.attentionKind === 'permission_required';
     const rowChrome = options.pinnedSection || options.recentSection ? 'mx-0' : 'mx-1';
@@ -1647,6 +1691,35 @@ export const ProjectTree = memo(function ProjectTree({
             )}
           </span>
         </div>
+        {canArchive && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                draggable={false}
+                data-testid="workspace-session-archive"
+                onClick={(event) => {
+                  event.stopPropagation();
+                  archiveSessions([session]);
+                }}
+                onDoubleClick={(event) => event.stopPropagation()}
+                aria-label={t('workspace.archiveSession')}
+                className={cn(
+                  'absolute right-8 top-1/2 z-10 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-md',
+                  'pointer-events-none text-foreground/70 opacity-0 transition-opacity duration-150',
+                  'hover:text-foreground focus:text-foreground',
+                  'focus:pointer-events-auto focus:opacity-100 focus-visible:ring-1 focus-visible:ring-foreground/25',
+                  'group-hover/session:pointer-events-auto group-hover/session:opacity-100'
+                )}
+              >
+                <Archive className="h-3.5 w-3.5" />
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="right" sideOffset={6} className="whitespace-nowrap">
+              {t('workspace.archiveSession')}
+            </TooltipContent>
+          </Tooltip>
+        )}
         <Tooltip>
           <TooltipTrigger asChild>
             <button
@@ -1712,10 +1785,20 @@ export const ProjectTree = memo(function ProjectTree({
               {t('workspace.resetProjectClassification')}
             </ContextMenuItem>
           )}
+          {canArchive && (
+            <>
+              <ContextMenuSeparator />
+              <ContextMenuItem onClick={() => archiveSessions([session])}>
+                <Archive className="mr-2 h-3.5 w-3.5" />
+                {t('workspace.archiveSession')}
+              </ContextMenuItem>
+            </>
+          )}
         </ContextMenuContent>
       </ContextMenu>
     );
   }, [
+    archiveSessions,
     canonicalSelectedKey,
     canonicalizeSessionKey,
     clearDragState,
@@ -1732,7 +1815,9 @@ export const ProjectTree = memo(function ProjectTree({
     handlePinnedDragOver,
     handlePinnedDragStart,
     handlePinnedDrop,
+    isSessionActive,
     nodesWithMixedOrigins,
+    onArchiveSessions,
     onSaveAnnotation,
     onSelect,
     originOfSession,
@@ -1861,7 +1946,7 @@ export const ProjectTree = memo(function ProjectTree({
         t={t}
       />
 
-      {/* Footer: stats */}
+      {/* Footer: stats + archived sessions */}
       <div className="shrink-0 flex items-center gap-1 border-t border-border-subtle/30 px-2 py-1.5">
         {totalSessions > 0 && (
           <span className="min-w-0 flex-1 truncate px-1 text-2xs tabular-nums text-muted-foreground/60">
@@ -1870,6 +1955,15 @@ export const ProjectTree = memo(function ProjectTree({
           </span>
         )}
         {!totalSessions && <span className="flex-1" />}
+        {onLoadArchivedSessions && onUnarchiveSession && (
+          <WorkspaceArchivedSessions
+            loadArchivedSessions={onLoadArchivedSessions}
+            onUnarchive={onUnarchiveSession}
+            onOpen={onOpenArchivedSession ?? onSelect}
+            formatRelativeTime={formatRelativeTime}
+            t={t}
+          />
+        )}
       </div>
     </div>
   );

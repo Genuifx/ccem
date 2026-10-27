@@ -166,6 +166,36 @@ test('stabilized project sessions append backfilled sessions behind retained row
   assert.deepEqual(stable[0].sessions.map((session) => session.id), ['first', 'active', 'backfill']);
 });
 
+test('stabilized project sessions put a restored session back at its time position', async () => {
+  const { stabilizeProjectNodeSessions } = await importWorkspaceProjectTreeModel();
+  const session = (id, timestamp) => historySession({ id, project: '/repo/app', projectName: 'app', timestamp });
+  const previousNodes = [
+    {
+      project: '/repo/app',
+      projectName: 'app',
+      latestTimestamp: 5,
+      sessions: [session('newest', 5), session('middle', 3), session('oldest', 1)],
+    },
+  ];
+  // `restored` (e.g. an undone archive) falls between retained rows, while
+  // `backfill` is older than all of them like a pagination load.
+  const nextNodes = [
+    {
+      project: '/repo/app',
+      projectName: 'app',
+      latestTimestamp: 5,
+      sessions: [session('newest', 5), session('restored', 4), session('middle', 3), session('oldest', 1), session('backfill', 0)],
+    },
+  ];
+
+  const stable = stabilizeProjectNodeSessions(previousNodes, nextNodes);
+
+  assert.deepEqual(
+    stable[0].sessions.map((item) => item.id),
+    ['newest', 'restored', 'middle', 'oldest', 'backfill'],
+  );
+});
+
 test('runtime to provider identity migration keeps its prior slot among 155 sessions', async () => {
   const { stabilizeProjectNodeSessions } = await importWorkspaceProjectTreeModel();
   const project = '/repo/app';
