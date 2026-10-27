@@ -1,6 +1,6 @@
 [package]
 name = "ccem-desktop"
-version = "2.105.0"
+version = "2.106.0"
 description = "CCEM Desktop Application"
 authors = ["Genuifx"]
 edition = "2021"
