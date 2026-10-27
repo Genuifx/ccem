@@ -1734,10 +1734,20 @@ export function Workspace({
     },
   }), [sidePanel, closeSidePanel, activeBrowserSessionId, browserActivation]);
   const fileLinkTarget = useMemo(() => ({ workingDir: sidePanelWorkingDir, openFile: (path: string) => userSidePanel.open('browse', path) }), [sidePanelWorkingDir, userSidePanel.open]);
-  const toggleActiveBrowser = useCallback((workingDir: string | null | undefined) => {
-    if (sidePanelOpen) closeSidePanel();
-    else selectActiveBrowser(workingDir);
-  }, [sidePanelOpen, closeSidePanel, selectActiveBrowser]);
+  // Opening the panel returns to the tab the user last had. Without one, it
+  // lands on files: a browser instance is only created when explicitly chosen.
+  const toggleSidePanel = useCallback((workingDir: string | null | undefined, changeCount: number) => {
+    if (sidePanelOpen) {
+      closeSidePanel();
+      return;
+    }
+    const lastTab = sidePanel.lastTab;
+    if (lastTab === 'browser' && browserTargetBySessionIdRef.current[activeBrowserSessionId]) {
+      selectActiveBrowser(workingDir);
+      return;
+    }
+    userSidePanel.open(lastTab && lastTab !== 'browser' ? lastTab : changeCount > 0 ? 'changes' : 'browse');
+  }, [sidePanelOpen, closeSidePanel, sidePanel.lastTab, activeBrowserSessionId, selectActiveBrowser, userSidePanel.open]);
 
   useEffect(() => {
     setComposeEffort((previous) => normalizeEffortForProvider(previous, composeProvider));
@@ -4178,7 +4188,7 @@ export function Workspace({
             onNavigate={onNavigate}
             onOpenSearch={() => setIsGlobalSearchOpen(true)}
             browserOpen={sidePanelOpen}
-            onToggleBrowser={browserWorkspaceReady ? () => toggleActiveBrowser(skillsContext.workingDir) : undefined}
+            onToggleBrowser={browserWorkspaceReady ? () => toggleSidePanel(skillsContext.workingDir, workspaceReviewModel?.changedFiles.length ?? 0) : undefined}
             envContext={statusStripEnvContext}
             activeRuntimeId={
               workspaceMode === 'live' && activeLiveEntry?.session.provider === 'claude'

@@ -41,8 +41,8 @@ test('WorkspaceReviewDetails routes open-file through the workspace-guarded IPC 
   // session project_dir and rejects any path that escapes it.
   assert.match(
     component,
-    /invoke<boolean>\(\s*['"]open_file_in_workspace['"]\s*,\s*\{\s*workingDir:\s*session\.project_dir,\s*filePath:\s*path,?\s*\}\s*\)/,
-    'openInEditor must invoke open_file_in_workspace with workingDir + filePath',
+    /invoke<boolean>\(\s*['"]open_file_in_workspace['"]\s*,\s*\{\s*workingDir:\s*session\.project_dir,\s*filePath:\s*path,\s*appId,?\s*\}\s*\)/,
+    'openInEditor must invoke open_file_in_workspace with workingDir + filePath + catalog appId',
   );
 
   // The client MUST NOT pre-resolve absolute paths itself; resolution belongs
