@@ -48,7 +48,7 @@ import {
   safeJsonStringify,
   getSelectionRange,
 } from './dom-helpers'
-import { usePromptAreaEvents } from './use-prompt-area-events'
+import { isImeCompositionKeyEvent, usePromptAreaEvents } from './use-prompt-area-events'
 import { useTriggerSearch } from './use-trigger-search'
 
 // ---------------------------------------------------------------------------
@@ -983,8 +983,14 @@ export function usePromptArea({
         return
       }
 
+      // IME candidate commit (Enter/Tab/arrows) must never reach submit or
+      // suggestion selection.
+      const imeOwnsKey = isImeCompositionKeyEvent(e.nativeEvent)
+        || events.isComposing.current
+        || events.isWithinCompositionCooldown()
+
       // 2. Trigger dropdown navigation
-      if (activeTrigger && activeTrigger.config.mode === 'dropdown' && suggestions.length > 0) {
+      if (!imeOwnsKey && activeTrigger && activeTrigger.config.mode === 'dropdown' && suggestions.length > 0) {
         if (e.key === 'ArrowDown') {
           e.preventDefault()
           setSelectedSuggestionIndex((prev) => Math.min(prev + 1, suggestions.length - 1))
@@ -1043,7 +1049,7 @@ export function usePromptArea({
 
       // 2.8 Shift+Enter: insert newline at model level (avoids browser's broken
       // contentEditable behavior near <a> elements)
-      if (e.key === 'Enter' && e.shiftKey && !e.nativeEvent.isComposing && !events.isComposing.current && !events.isWithinCompositionCooldown()) {
+      if (e.key === 'Enter' && e.shiftKey && !imeOwnsKey) {
         e.preventDefault()
         const editor = editorRef.current
         if (editor) {
@@ -1062,7 +1068,7 @@ export function usePromptArea({
       }
 
       // 3. Submit on Enter (without Shift), skip during IME
-      if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing && !events.isComposing.current && !events.isWithinCompositionCooldown()) {
+      if (e.key === 'Enter' && !e.shiftKey && !imeOwnsKey) {
         // 3a. Check for list continuation first (only when markdown is enabled)
         const editor = editorRef.current
         if (editor && tryListContinuation(editor)) {
