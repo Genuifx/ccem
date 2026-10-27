@@ -60,6 +60,15 @@ type PromptAreaEventHandlers = {
   isWithinCompositionCooldown: () => boolean
 }
 
+/**
+ * Whether a native keydown belongs to an IME (e.g. the Enter that commits a
+ * pinyin candidate). WebKit fires `compositionend` before that keydown, so
+ * `isComposing` is already false there; `keyCode === 229` still marks it.
+ */
+export function isImeCompositionKeyEvent(e: { isComposing?: boolean; keyCode?: number }): boolean {
+  return e.isComposing === true || e.keyCode === 229
+}
+
 // ---------------------------------------------------------------------------
 // Undo/Redo Stack
 // ---------------------------------------------------------------------------
