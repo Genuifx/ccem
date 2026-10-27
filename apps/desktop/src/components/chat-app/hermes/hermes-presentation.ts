@@ -1,6 +1,6 @@
 import type { HermesPlatform } from '@/lib/hermes-ipc';
 
-export const INSTALLING = new Set(['checking', 'downloading', 'verifying', 'extracting', 'activating']);
+export const INSTALLING = new Set(['checking', 'downloading', 'verifying', 'extracting', 'health_check', 'verifying_final', 'activating']);
 export const TRANSITIONING = new Set(['starting', 'stopping', 'configuring', 'reconnecting']);
 export const SETUP_CANCELLABLE = new Set(['generating', 'waiting']);
 export const SETUP_WAIT_MS = 300_000;

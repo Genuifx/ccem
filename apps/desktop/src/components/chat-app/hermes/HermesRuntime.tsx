@@ -16,7 +16,11 @@ export function HermesRuntime({ installer, runtimeAvailable, installed, installi
   const [expanded, setExpanded] = useState(false);
   const attention = !runtimeAvailable || installing || Boolean(installer.error) || !installed;
   const open = attention || expanded;
-  const progress = installer.state === 'downloading' && installer.totalBytes ? Math.min(100, installer.downloadedBytes / installer.totalBytes * 100) : null;
+  const fileProgress = ['extracting', 'verifying', 'verifying_final'].includes(installer.state) && Boolean(installer.phaseTotal);
+  const completed = installer.phaseCompleted ?? 0;
+  const progress = installer.state === 'downloading' && installer.totalBytes
+    ? Math.min(100, installer.downloadedBytes / installer.totalBytes * 100)
+    : fileProgress ? Math.min(100, completed / installer.phaseTotal! * 100) : null;
   return <section className={`hermes-runtime${attention ? ' needs-attention' : ''}`} data-hermes-runtime>
     <Button variant="ghost" className="hermes-runtime-summary" aria-expanded={open} aria-controls="hermes-runtime-details"
       onClick={() => setExpanded((value) => !value)} disabled={attention}>
@@ -32,7 +36,7 @@ export function HermesRuntime({ installer, runtimeAvailable, installed, installi
         <Button size="sm" variant="ghost" disabled={hasActions || installing || activeConnection || setupActive} onClick={() => void run('removeRuntime')}>{t('hermes.removeComponent')}</Button>
       </div>}
       {installing && <div className="space-y-2"><Progress value={progress} aria-label={t('hermes.installProgress')} /><div className="hermes-install-progress">
-        <span>{installAccepted ? installer.state === 'downloading' ? <>{(installer.downloadedBytes / 1024 / 1024).toFixed(1)} MB{installer.totalBytes ? ` / ${(installer.totalBytes / 1024 / 1024).toFixed(1)} MB` : ''}</> : stateLabel(installer.state) : t('hermes.installRequested')}</span>
+        <span>{installAccepted ? installer.state === 'downloading' ? <>{(installer.downloadedBytes / 1024 / 1024).toFixed(1)} MB{installer.totalBytes ? ` / ${(installer.totalBytes / 1024 / 1024).toFixed(1)} MB` : ''}</> : <>{stateLabel(installer.state)}{fileProgress && <> · {t('hermes.installFiles', { completed: completed.toLocaleString(), total: installer.phaseTotal!.toLocaleString() })}</>}</> : t('hermes.installRequested')}</span>
         <Button size="sm" variant="ghost" disabled={!installAccepted || cancelling || cancelDisabled} onClick={() => void run('cancelInstall')}>{t('hermes.cancel')}</Button>
       </div></div>}
       {installer.error && <p role="alert" className="hermes-error">{errorText(installer.error)}</p>}

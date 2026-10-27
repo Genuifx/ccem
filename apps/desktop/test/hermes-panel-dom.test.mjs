@@ -497,7 +497,7 @@ test('an installed component updates explicitly and reuses install progress for 
 test('post-download installation phases show indeterminate progress instead of a completed download', async () => {
   current = snapshot({ installer: { state: 'verifying', downloadedBytes: 162 * 1024 * 1024, totalBytes: 162 * 1024 * 1024, retryable: false } });
   await mount();
-  for (const state of ['verifying', 'extracting', 'activating', 'checking']) {
+  for (const state of ['verifying', 'extracting', 'health_check', 'verifying_final', 'activating', 'checking']) {
     current.installer.state = state;
     await poll();
     const progress = container.querySelector('[role="progressbar"]');
@@ -506,6 +506,32 @@ test('post-download installation phases show indeterminate progress instead of a
     assert.equal(container.textContent.includes('162.0 MB'), false);
     assert.equal(container.querySelector('[role="status"]').textContent, state);
   }
+});
+
+test('file phases display measured progress, allow cancellation and reset for startup testing', async () => {
+  current = snapshot({ installer: { state: 'extracting', downloadedBytes: 170000000, totalBytes: 170000000,
+    phaseCompleted: 500, phaseTotal: 1000, retryable: false } });
+  await mount();
+  for (const state of ['extracting', 'verifying', 'verifying_final']) {
+    current.installer.state = state;
+    await poll();
+    const progress = container.querySelector('[role="progressbar"]');
+    assert.equal(progress.getAttribute('aria-valuenow'), '50');
+    assert.ok(container.textContent.includes('hermes.installFiles 500 1,000'));
+    assert.equal(button('hermes.cancel').disabled, false);
+  }
+  await click(button('hermes.cancel'));
+  assert.equal(actions('cancelInstall').length, 1);
+  current.installer = { ...current.installer, state: 'health_check', phaseCompleted: 0, phaseTotal: null };
+  await poll();
+  assert.equal(container.querySelector('[role="progressbar"]').getAttribute('aria-valuenow'), null);
+  assert.equal(container.textContent.includes('hermes.installFiles'), false);
+  assert.equal(button('hermes.cancel').disabled, false);
+  assert.equal(container.querySelector('[data-hermes-add]'), null);
+  current.installer = { state: 'cancelled', downloadedBytes: 170000000, retryable: true };
+  await poll();
+  assert.equal(container.querySelector('[role="progressbar"]'), null);
+  assert.ok(button('hermes.retryInstall'));
 });
 
 test('cancelled and failed updates keep the activated runtime connections available', async () => {
