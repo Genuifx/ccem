@@ -104,10 +104,28 @@ pub(crate) fn extract_runtime_archive_with_cancel(
     artifact: &RuntimeArtifact,
     cancelled: &AtomicBool,
 ) -> Result<ExtractionOutcome, ExtractionError> {
+    extract_runtime_archive_with_progress(
+        archive_path,
+        candidate_root,
+        artifact,
+        cancelled,
+        &mut |_, _| {},
+    )
+}
+
+/// Reports completed entries independently of downloaded bytes. The callback is never used
+/// to authorize extraction; all path, size, symlink and cancellation checks still run.
+pub(crate) fn extract_runtime_archive_with_progress(
+    archive_path: &Path,
+    candidate_root: &Path,
+    artifact: &RuntimeArtifact,
+    cancelled: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<ExtractionOutcome, ExtractionError> {
     check_cancelled(cancelled)?;
     validate_archive_file(archive_path, artifact.archive.byte_size)?;
     prepare_empty_candidate(candidate_root)?;
-    let result = extract_inner(archive_path, candidate_root, artifact, cancelled);
+    let result = extract_inner(archive_path, candidate_root, artifact, cancelled, progress);
     if result.is_err() {
         let _ = fs::remove_dir_all(candidate_root);
     }
@@ -119,6 +137,7 @@ fn extract_inner(
     candidate_root: &Path,
     artifact: &RuntimeArtifact,
     cancelled: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
 ) -> Result<ExtractionOutcome, ExtractionError> {
     let mut archive_file = File::open(archive_path).map_err(|_| io_error())?;
     let central_entry_count =
@@ -139,6 +158,9 @@ fn extract_inner(
         .map(|link| (link.path.as_str(), link))
         .collect::<BTreeMap<_, _>>();
     let mut unpacked_bytes = 0_u64;
+    let total = plans.len() as u64;
+    let mut completed = 0;
+    progress(0, total);
 
     for plan in plans.iter().filter(|plan| plan.kind != EntryKind::Symlink) {
         check_cancelled(cancelled)?;
@@ -165,6 +187,10 @@ fn extract_inner(
                     checked_total(unpacked_bytes, actual, artifact.archive.max_unpacked_bytes)?;
             }
             EntryKind::Symlink => unreachable!(),
+        }
+        completed += 1;
+        if completed % 64 == 0 || completed == total {
+            progress(completed, total);
         }
     }
 
@@ -195,6 +221,8 @@ fn extract_inner(
             plan.size,
             artifact.archive.max_unpacked_bytes,
         )?;
+        completed += 1;
+        progress(completed, total);
     }
     if created_symlinks.len() != declared_symlinks.len()
         || declared_symlinks
@@ -214,7 +242,7 @@ fn extract_inner(
             ExtractionErrorCode::RequiredEntryMissing,
         ));
     }
-    sync_directory(candidate_root).map_err(|_| io_error())?;
+    sync_candidate(candidate_root, cancelled)?;
     Ok(ExtractionOutcome {
         candidate_root: candidate_root.to_path_buf(),
         entry_count: plans.len() as u64,
@@ -608,9 +636,60 @@ fn write_new_file_bounded<R: Read>(
     if copied != declared_size {
         return Err(ExtractionError::new(ExtractionErrorCode::InvalidArchive));
     }
-    output.sync_all().map_err(|_| io_error())?;
     set_private_file(destination, unix_mode)?;
+    sync_extracted_file(&output).map_err(|_| io_error())?;
     Ok(copied)
+}
+
+// On macOS Rust's sync_all/sync_data both use F_FULLFSYNC, which flushes the drive
+// cache. Doing that for every Python source file turns a 30k-file install into minutes.
+// Push each file to the device with fsync, then perform ONE full barrier after all
+// files and directory entries are synced, before the candidate can be activated.
+#[cfg(target_os = "macos")]
+fn sync_extracted_file(file: &File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    loop {
+        // SAFETY: the owned File keeps this descriptor valid for the synchronous call.
+        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sync_extracted_file(file: &File) -> std::io::Result<()> {
+    file.sync_all()
+}
+
+fn sync_candidate(root: &Path, cancelled: &AtomicBool) -> Result<(), ExtractionError> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut directories = vec![root.to_path_buf()];
+        let mut index = 0;
+        while index < directories.len() {
+            check_cancelled(cancelled)?;
+            for entry in fs::read_dir(&directories[index]).map_err(|_| io_error())? {
+                let entry = entry.map_err(|_| io_error())?;
+                // Do not follow declared symlinks while syncing the extracted tree.
+                if entry.file_type().map_err(|_| io_error())?.is_dir() {
+                    directories.push(entry.path());
+                }
+            }
+            index += 1;
+        }
+        // Children before parents, so all new directory entries reach the device too.
+        for directory in directories.iter().rev() {
+            check_cancelled(cancelled)?;
+            let file = File::open(directory).map_err(|_| io_error())?;
+            sync_extracted_file(&file).map_err(|_| io_error())?;
+        }
+    }
+    check_cancelled(cancelled)?;
+    sync_directory(root).map_err(|_| io_error())
 }
 
 fn check_cancelled(cancelled: &AtomicBool) -> Result<(), ExtractionError> {
@@ -895,6 +974,75 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, ExtractionErrorCode::Cancelled);
         assert!(!candidate.exists());
+    }
+
+    #[test]
+    fn measured_extraction_cancels_between_files_and_retries_cleanly() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = write_zip(&temp, |writer| {
+            add_file(writer, "runtime-root/App/Browser", b"browser");
+            for index in 0..128 {
+                add_file(writer, &format!("runtime-root/source/{index}.py"), b"x");
+            }
+        });
+        let mut artifact = artifact(fs::metadata(&archive).unwrap().len());
+        artifact.archive.max_entries = 129;
+        let candidate = temp.path().join("candidate");
+        let cancelled = AtomicBool::new(false);
+        let error = extract_runtime_archive_with_progress(
+            &archive,
+            &candidate,
+            &artifact,
+            &cancelled,
+            &mut |done, total| {
+                assert_eq!(total, 129);
+                if done >= 64 {
+                    cancelled.store(true, Ordering::Release);
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ExtractionErrorCode::Cancelled);
+        assert!(!candidate.exists());
+        cancelled.store(false, Ordering::Release);
+        let mut reports = Vec::new();
+        let outcome = extract_runtime_archive_with_progress(
+            &archive,
+            &candidate,
+            &artifact,
+            &cancelled,
+            &mut |done, total| reports.push((done, total)),
+        )
+        .unwrap();
+        assert_eq!(reports.first(), Some(&(0, 129)));
+        assert_eq!(reports.last(), Some(&(129, 129)));
+        assert!(reports.windows(2).all(|w| w[0].0 <= w[1].0));
+        assert_eq!(outcome.unpacked_bytes, 135);
+        assert_eq!(fs::read(candidate.join("App/Browser")).unwrap(), b"browser");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn many_small_files_do_not_flush_the_drive_cache_individually() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = write_zip(&temp, |writer| {
+            add_file(writer, "runtime-root/App/Browser", b"browser");
+            for index in 0..2_000 {
+                add_file(writer, &format!("runtime-root/source/{index}.py"), b"x");
+            }
+        });
+        let mut artifact = artifact(fs::metadata(&archive).unwrap().len());
+        artifact.archive.max_entries = 2_001;
+        artifact.archive.max_unpacked_bytes = 2_007;
+        let started = std::time::Instant::now();
+        let outcome =
+            extract_runtime_archive(&archive, &temp.path().join("candidate"), &artifact).unwrap();
+        assert_eq!(outcome.entry_count, 2_001);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(15),
+            "small-file extraction took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

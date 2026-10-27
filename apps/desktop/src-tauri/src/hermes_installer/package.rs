@@ -7,6 +7,10 @@ use std::{
     time::Instant,
 };
 
+#[cfg(test)]
+#[path = "package_tests.rs"]
+mod verification_tests;
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct PackageIdentity {
@@ -35,8 +39,25 @@ pub(super) fn verify_package(
     manifest: &VerifiedRuntimeManifest,
     archive: &Path,
 ) -> Result<(), HermesInstallError> {
+    verify_package_with_control(
+        launch,
+        manifest,
+        archive,
+        &AtomicBool::new(false),
+        &mut |_, _| {},
+    )
+}
+
+pub(super) fn verify_package_with_control(
+    launch: &HermesLaunch,
+    manifest: &VerifiedRuntimeManifest,
+    archive: &Path,
+    cancelled: &AtomicBool,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Result<(), HermesInstallError> {
+    check_cancelled(cancelled)?;
     let artifact = &manifest.manifest.artifact;
-    if hash_file(archive, artifact.archive.byte_size)? != artifact.archive.sha256 {
+    if hash_file(archive, artifact.archive.byte_size, cancelled)? != artifact.archive.sha256 {
         return Err(failure(
             "archive_hash",
             "聊天组件缓存校验失败，请重新安装。",
@@ -83,7 +104,10 @@ pub(super) fn verify_package(
     }
     let mut expected = BTreeSet::new();
     let root = fs::canonicalize(&launch.runtime_root).map_err(|_| io_failure())?;
-    for item in &identity.files {
+    let total = identity.files.len() as u64;
+    progress(0, total);
+    for (index, item) in identity.files.iter().enumerate() {
+        check_cancelled(cancelled)?;
         if !safe_path(&item.path)
             || [
                 "runtime.json",
@@ -104,12 +128,16 @@ pub(super) fn verify_package(
         }
         let file = root.join(&item.path);
         let canonical = fs::canonicalize(&file).map_err(|_| io_failure())?;
-        if !canonical.starts_with(&root) || hash_file(&file, item.size)? != item.sha256 {
+        if !canonical.starts_with(&root) || hash_file(&file, item.size, cancelled)? != item.sha256 {
             return Err(failure(
                 "package_integrity",
                 "聊天组件文件校验失败。",
                 false,
             ));
+        }
+        let completed = index as u64 + 1;
+        if completed % 64 == 0 || completed == total {
+            progress(completed, total);
         }
     }
     if ![
@@ -128,7 +156,9 @@ pub(super) fn verify_package(
     // bytecode is disabled at launch; no runtime writes belong inside the version directory.
     let mut pending = vec![root.clone()];
     while let Some(dir) = pending.pop() {
+        check_cancelled(cancelled)?;
         for entry in fs::read_dir(dir).map_err(|_| io_failure())? {
+            check_cancelled(cancelled)?;
             let entry = entry.map_err(|_| io_failure())?;
             let meta = fs::symlink_metadata(entry.path()).map_err(|_| io_failure())?;
             let relative = entry
@@ -296,7 +326,16 @@ fn safe_path(path: &str) -> bool {
             .components()
             .all(|c| matches!(c, std::path::Component::Normal(_)))
 }
-fn hash_file(path: &Path, size: u64) -> Result<String, HermesInstallError> {
+fn check_cancelled(cancelled: &AtomicBool) -> Result<(), HermesInstallError> {
+    if cancelled.load(Ordering::Acquire) {
+        Err(failure("cancelled", "已取消安装。", true))
+    } else {
+        Ok(())
+    }
+}
+
+fn hash_file(path: &Path, size: u64, cancelled: &AtomicBool) -> Result<String, HermesInstallError> {
+    check_cancelled(cancelled)?;
     let meta = fs::symlink_metadata(path).map_err(|_| io_failure())?;
     if !meta.is_file() || meta.file_type().is_symlink() || meta.len() != size {
         return Err(failure(
@@ -310,6 +349,7 @@ fn hash_file(path: &Path, size: u64) -> Result<String, HermesInstallError> {
     let mut buf = [0u8; 64 * 1024];
     let mut total = 0;
     loop {
+        check_cancelled(cancelled)?;
         let read = file.read(&mut buf).map_err(|_| io_failure())?;
         if read == 0 {
             break;

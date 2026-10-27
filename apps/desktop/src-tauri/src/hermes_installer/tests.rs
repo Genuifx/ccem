@@ -1,5 +1,58 @@
 use super::*;
 
+/// Opt-in timing of the exact production payload, without changing the installed runtime.
+#[test]
+#[ignore = "requires CCEM_HERMES_BENCH_RUNTIME and CCEM_HERMES_BENCH_ARCHIVE"]
+fn real_package_stage_timings() {
+    let runtime = PathBuf::from(std::env::var("CCEM_HERMES_BENCH_RUNTIME").unwrap());
+    let archive = PathBuf::from(std::env::var("CCEM_HERMES_BENCH_ARCHIVE").unwrap());
+    let temp = tempfile::tempdir().unwrap();
+    let installer = HermesInstaller::new(temp.path().join("runtime"));
+    let source = Source::configured().unwrap();
+    let verified = installer
+        .verify_manifest(
+            &source,
+            &fs::read(runtime.join("manifest.json")).unwrap(),
+            &fs::read(runtime.join("manifest.json.sig")).unwrap(),
+            1,
+        )
+        .unwrap();
+    let candidate = temp.path().join("candidate");
+    let timed = |stage: &str, run: &mut dyn FnMut()| {
+        let started = std::time::Instant::now();
+        run();
+        eprintln!(
+            "HERMES_TIMING {stage}: {:.3}s",
+            started.elapsed().as_secs_f64()
+        );
+    };
+    timed("extract", &mut || {
+        extract_runtime_archive_with_progress(
+            &archive,
+            &candidate,
+            &verified.manifest.artifact,
+            &installer.cancelled,
+            &mut |_, _| {},
+        )
+        .unwrap();
+    });
+    let launch = HermesLaunch {
+        python: candidate.join("python/bin/python3.11"),
+        source: candidate.join("source"),
+        host: candidate.join("ccem_gateway_host.py"),
+        runtime_root: candidate,
+    };
+    timed("verify_before_health", &mut || {
+        package::verify_package(&launch, &verified, &archive).unwrap()
+    });
+    timed("health", &mut || {
+        package::health_check(&launch, &installer.cancelled).unwrap()
+    });
+    timed("verify_after_health", &mut || {
+        package::verify_package(&launch, &verified, &archive).unwrap()
+    });
+}
+
 #[test]
 fn unopened_installer_does_not_create_runtime_or_profile() {
     let temp = tempfile::tempdir().unwrap();

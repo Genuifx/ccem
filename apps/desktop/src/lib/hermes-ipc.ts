@@ -127,6 +127,8 @@ export interface HermesStatus {
     launch?: { runtimeRoot: string; python: string; source: string; host: string } | null;
     downloadedBytes: number;
     totalBytes?: number | null;
+    phaseCompleted?: number;
+    phaseTotal?: number | null;
     error?: { code: string; message: string; retryable?: boolean } | string | null;
     retryable: boolean;
   };

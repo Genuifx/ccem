@@ -16,7 +16,7 @@ use crate::browser::runtime::{
         download_archive_with_redirect_policy, DownloadControl, DownloadErrorCode,
         DownloadProgressReporter, DownloadSpec,
     },
-    extract::{extract_runtime_archive_with_cancel, ExtractionErrorCode},
+    extract::{extract_runtime_archive_with_progress, ExtractionErrorCode},
     maintenance::RuntimeMaintenanceStore,
     manifest::{
         ManifestEnvironment, ManifestTrustStore, RuntimeArchitecture, RuntimePlatform,
@@ -76,6 +76,10 @@ pub struct HermesInstallStatus {
     pub version: Option<String>,
     pub downloaded_bytes: u64,
     pub total_bytes: Option<u64>,
+    #[serde(default)]
+    pub phase_completed: u64,
+    #[serde(default)]
+    pub phase_total: Option<u64>,
     pub error: Option<HermesInstallError>,
     pub retryable: bool,
     /// A previous verified runtime may remain available after a failed update.
@@ -89,6 +93,8 @@ impl Default for HermesInstallStatus {
             version: None,
             downloaded_bytes: 0,
             total_bytes: None,
+            phase_completed: 0,
+            phase_total: None,
             error: None,
             retryable: false,
             launch: None,
@@ -345,15 +351,22 @@ impl HermesInstaller {
             .filter(|p| p.active.manifest_sha256 == verified.exact_bytes_sha256)
         {
             let launch = launch_for(&paths, &active.active);
-            package::verify_package(&launch, &verified, &archive_path(&paths, &verified)).map_err(
-                |_| {
-                    failure(
-                        "installed_package_corrupt",
-                        "组件文件校验失败，请卸载组件后重新安装；连接授权会保留。",
-                        false,
-                    )
-                },
-            )?;
+            self.verify_install_package(
+                "verifying",
+                &launch,
+                &verified,
+                &archive_path(&paths, &verified),
+            )
+            .map_err(|error| {
+                if error.code == "cancelled" {
+                    return error;
+                }
+                failure(
+                    "installed_package_corrupt",
+                    "组件文件校验失败，请卸载组件后重新安装；连接授权会保留。",
+                    false,
+                )
+            })?;
             self.check_cancel()?;
             self.try_report(artifact.archive.byte_size, artifact.archive.byte_size);
             return Ok(());
@@ -436,16 +449,17 @@ impl HermesInstaller {
         }
         self.try_report(artifact.archive.byte_size, artifact.archive.byte_size);
         self.check_cancel()?;
-        self.set_phase("verifying");
+        self.set_phase("extracting");
         let candidate = paths
             .create_candidate(&format!("hermes-{}", random_id()))
             .map_err(|_| io_failure())?;
         let result = (|| {
-            extract_runtime_archive_with_cancel(
+            extract_runtime_archive_with_progress(
                 &spec.completed_path,
                 &candidate,
                 artifact,
                 &self.cancelled,
+                &mut |completed, total| self.report_phase_progress(completed, total),
             )
             .map_err(|e| {
                 if e.code == ExtractionErrorCode::Cancelled {
@@ -465,9 +479,15 @@ impl HermesInstaller {
                 host: candidate.join("ccem_gateway_host.py"),
                 runtime_root: candidate.clone(),
             };
-            package::verify_package(&launch, &verified, &spec.completed_path)?;
+            self.verify_install_package("verifying", &launch, &verified, &spec.completed_path)?;
+            self.set_phase("health_check");
             package::health_check(&launch, &self.cancelled)?;
-            package::verify_package(&launch, &verified, &spec.completed_path)?;
+            self.verify_install_package(
+                "verifying_final",
+                &launch,
+                &verified,
+                &spec.completed_path,
+            )?;
             self.check_cancel()?;
             let _active_not_in_use = exclusive_active_lease(&paths)?;
             write_private(&candidate.join("manifest.json"), &manifest)?;
@@ -606,11 +626,34 @@ impl HermesInstaller {
             Ok(())
         }
     }
+    fn verify_install_package(
+        &self,
+        phase: &str,
+        launch: &HermesLaunch,
+        manifest: &VerifiedRuntimeManifest,
+        archive: &Path,
+    ) -> Result<(), HermesInstallError> {
+        self.set_phase(phase);
+        package::verify_package_with_control(
+            launch,
+            manifest,
+            archive,
+            &self.cancelled,
+            &mut |completed, total| self.report_phase_progress(completed, total),
+        )
+    }
+    fn report_phase_progress(&self, completed: u64, total: u64) {
+        let mut p = self.progress.lock().unwrap_or_else(|p| p.into_inner());
+        p.phase_completed = completed;
+        p.phase_total = Some(total);
+    }
     fn set_phase(&self, state: &str) {
         let mut p = self.progress.lock().unwrap_or_else(|p| p.into_inner());
         p.state = state.into();
         p.error = None;
         p.retryable = false;
+        p.phase_completed = 0;
+        p.phase_total = None;
     }
 }
 
