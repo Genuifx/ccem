@@ -4,6 +4,8 @@
 
 #[path = "claude_runtime/package.rs"]
 mod package;
+#[path = "claude_runtime/registry.rs"]
+mod registry;
 #[cfg(test)]
 #[path = "claude_runtime/tests.rs"]
 mod tests;
@@ -92,6 +94,8 @@ pub struct ClaudeInstallProgress {
 #[serde(rename_all = "camelCase")]
 pub struct ClaudeRuntimeStatus {
     pub preference: ClaudeRuntimeSource,
+    pub registry_url: String,
+    pub registry_error: Option<String>,
     pub recommended_version: String,
     pub minimum_system_version: String,
     pub system: RuntimeCandidate,
@@ -229,6 +233,7 @@ pub struct ClaudeRuntimeManager {
     system_cache: Mutex<Option<ProbeCache>>,
     managed_cache: Mutex<Option<ProbeCache>>,
     progress: Mutex<ClaudeInstallProgress>,
+    registry_mutation: Mutex<()>,
     busy: AtomicBool,
     cancelled: AtomicBool,
 }
@@ -259,6 +264,7 @@ impl ClaudeRuntimeManager {
                 state: "idle".into(),
                 ..Default::default()
             }),
+            registry_mutation: Mutex::new(()),
             busy: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
         }
@@ -266,6 +272,50 @@ impl ClaudeRuntimeManager {
 
     fn preference_path(&self) -> PathBuf {
         self.root.join("preference.json")
+    }
+
+    fn registry_path(&self) -> PathBuf {
+        self.root.join("registry.json")
+    }
+
+    fn read_registry(&self) -> Result<String, String> {
+        let path = self.registry_path();
+        reject_symlink(&self.root)?;
+        reject_symlink(&path)?;
+        match read_small_file(&path, 4096) {
+            Ok(bytes) => {
+                let value: String = serde_json::from_slice(&bytes).map_err(|error| {
+                    format!("Invalid Claude runtime registry configuration: {error}")
+                })?;
+                registry::normalize(&value)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(registry::DEFAULT_REGISTRY.into())
+            }
+            Err(error) => Err(format!(
+                "Cannot read Claude runtime registry configuration: {error}"
+            )),
+        }
+    }
+
+    pub fn set_registry(&self, value: &str) -> Result<ClaudeRuntimeStatus, String> {
+        let guard = self
+            .registry_mutation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.busy.load(Ordering::Acquire) {
+            return Err("Wait for the current Claude runtime installation to finish before changing its registry".into());
+        }
+        let registry_url = registry::normalize(value)?;
+        reject_symlink(&self.root)?;
+        reject_symlink(&self.registry_path())?;
+        crate::secure_fs::write_private_atomic(
+            &self.registry_path(),
+            &serde_json::to_vec(&registry_url).unwrap(),
+        )
+        .map_err(|error| format!("Cannot save Claude runtime registry: {error}"))?;
+        drop(guard);
+        Ok(self.status(false))
     }
 
     fn read_preference(&self) -> Result<ClaudeRuntimeSource, String> {
@@ -296,6 +346,7 @@ impl ClaudeRuntimeManager {
 
     pub fn status(&self, refresh: bool) -> ClaudeRuntimeStatus {
         let preference = self.read_preference();
+        let registry = self.read_registry();
         let system = self.system_candidate(refresh);
         let support = current_package();
         let managed = match &support {
@@ -316,6 +367,8 @@ impl ClaudeRuntimeManager {
         }
         ClaudeRuntimeStatus {
             preference: preference.unwrap_or_default(),
+            registry_url: registry.as_ref().cloned().unwrap_or_default(),
+            registry_error: registry.err(),
             recommended_version: manifest().claude_version.clone(),
             minimum_system_version: manifest().minimum_system_version.clone(),
             system,
@@ -565,6 +618,11 @@ impl ClaudeRuntimeManager {
 
     pub fn prepare_install(self: &Arc<Self>) -> Result<PreparedClaudeInstall, String> {
         current_package()?;
+        let _registry_guard = self
+            .registry_mutation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let registry_url = self.read_registry()?;
         self.busy
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| "A Claude runtime installation is already running".to_string())?;
@@ -576,6 +634,7 @@ impl ClaudeRuntimeManager {
         };
         Ok(PreparedClaudeInstall {
             manager: self.clone(),
+            registry_url,
             settled: false,
         })
     }
@@ -603,8 +662,8 @@ impl ClaudeRuntimeManager {
         }
     }
 
-    fn finish_install(&self) -> Result<ClaudeRuntimeStatus, String> {
-        let result = package::install(self);
+    fn finish_install(&self, registry_url: &str) -> Result<ClaudeRuntimeStatus, String> {
+        let result = package::install(self, registry_url);
         let mut progress = self.progress.lock().unwrap_or_else(|e| e.into_inner());
         match &result {
             Ok(()) => {
@@ -639,12 +698,13 @@ fn valid_generation_name(name: &str, package: &RuntimePackage) -> bool {
 
 pub struct PreparedClaudeInstall {
     manager: Arc<ClaudeRuntimeManager>,
+    registry_url: String,
     settled: bool,
 }
 
 impl PreparedClaudeInstall {
     pub fn run(mut self) -> Result<ClaudeRuntimeStatus, String> {
-        let result = self.manager.finish_install();
+        let result = self.manager.finish_install(&self.registry_url);
         self.settled = true;
         result
     }

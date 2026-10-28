@@ -24,6 +24,7 @@ const candidate = (state = 'missing', overrides = {}) => ({ state, path: null, v
 const selection = (source = 'system') => ({ source, path: source === 'system' ? '/usr/local/bin/claude' : '/ccem/runtime/claude', version: '2.1.220' });
 const snapshot = (overrides = {}) => ({
   preference: 'auto', recommendedVersion: '2.1.220', minimumSystemVersion: '2.1.220',
+  registryUrl: 'https://registry.npmjs.org/', registryError: null,
   system: candidate('available', selection()), managed: candidate(), selected: selection(),
   install: { state: 'idle', downloadedBytes: 0, totalBytes: null, error: null },
   supported: true, unsupportedReason: null, ...overrides,
@@ -39,11 +40,15 @@ test.before(async () => {
     ResizeObserver: class { observe() {} unobserve() {} disconnect() {} },
     MessageChannel: class { constructor() { this.port1 = { onmessage: null }; this.port2 = { postMessage: data => queueMicrotask(() => this.port1.onmessage?.({ data })) }; } },
   };
-  for (const key of ['HTMLElement', 'HTMLInputElement', 'HTMLButtonElement', 'NodeFilter', 'Element', 'Node', 'DocumentFragment', 'MutationObserver', 'Event', 'MouseEvent', 'CustomEvent']) values[key] = dom.window[key];
+  for (const key of ['HTMLElement', 'HTMLInputElement', 'HTMLButtonElement', 'HTMLSelectElement', 'KeyboardEvent', 'NodeFilter', 'Element', 'Node', 'DocumentFragment', 'MutationObserver', 'Event', 'MouseEvent', 'CustomEvent']) values[key] = dom.window[key];
   for (const [key, value] of Object.entries(values)) {
     globals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
     Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
   }
+  dom.window.HTMLElement.prototype.scrollIntoView = () => {};
+  dom.window.HTMLElement.prototype.hasPointerCapture = () => false;
+  dom.window.HTMLElement.prototype.setPointerCapture = () => {};
+  dom.window.HTMLElement.prototype.releasePointerCapture = () => {};
   const outfile = path.join(directory, 'harness.cjs');
   const workspaceSource = await fs.readFile(path.join(desktop, 'src/pages/Workspace.tsx'), 'utf8');
   const ast = ts.createSourceFile('Workspace.tsx', workspaceSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
@@ -61,7 +66,7 @@ test.before(async () => {
       import {nativeCreateFailure} from '@/components/workspace/composerSubmissionResult';
       export {act, isClaudeRuntimeRequiredError};
       export function mount(host, dialog=false) { function Harness() { const [open,setOpen]=useState(true);
-        return dialog === 'profile' ? <AgentProfilesSettings /> : dialog ? <ClaudeRuntimeRequiredDialog open={open} onOpenChange={setOpen} /> : <ClaudeRuntimeSettings />; }
+        return dialog === 'profile' ? <AgentProfilesSettings /> : dialog === 'two' ? <><ClaudeRuntimeSettings /><ClaudeRuntimeSettings /></> : dialog ? <ClaudeRuntimeRequiredDialog open={open} onOpenChange={setOpen} /> : <ClaudeRuntimeSettings />; }
         const root=createRoot(host); act(()=>root.render(<Harness />)); return root; }
       export function forkFailure(error) {
         const state = { calls: 0, prompts: [], errors: [], busy: [], setup: false, forkClosed: false };
@@ -101,6 +106,10 @@ test.beforeEach(() => {
       current.preference = args.source;
       current.selected = args.source === 'managed' ? null : selection();
     }
+    if (name === 'set_claude_runtime_registry') {
+      current.registryUrl = args.registryUrl.replace(/\/?$/, '/');
+      current.registryError = null;
+    }
     return structuredClone(current);
   };
   globalThis.__claudeRuntimeInvoke = async (name, args) => { calls.push({ name, args }); return handler(name, args); };
@@ -131,6 +140,28 @@ async function click(selector) {
 async function poll() { harness.act(() => { for (const callback of [...intervals]) callback?.(); }); await settle(); }
 const commands = name => calls.filter(call => call.name === name);
 
+async function chooseRegistry(choice, panel = 0) {
+  const trigger = document.querySelectorAll('[data-claude-runtime-registry-select]')[panel];
+  harness.act(() => {
+    trigger.focus(); trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+  });
+  await settle();
+  const option = document.querySelector(`[data-claude-runtime-registry-option="${choice}"]`);
+  assert.ok(option, `registry option ${choice}`);
+  harness.act(() => { option.focus(); option.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true })); });
+  await settle();
+}
+
+async function editRegistry(value) {
+  const input = document.querySelector('[data-claude-runtime-registry-input]');
+  assert.ok(input);
+  harness.act(() => {
+    Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, value);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  await settle();
+}
+
 test('opening settings only detects; choices persist without downloading or changing profiles', async () => {
   await mount();
   assert.match(host.textContent, /\/usr\/local\/bin\/claude/);
@@ -153,6 +184,118 @@ test('failed source change keeps the saved selection and displays its error', as
   await mount(); await click('[data-claude-runtime-source="managed"]');
   assert.equal(document.querySelector('[data-claude-runtime-source="auto"]').getAttribute('aria-pressed'), 'true');
   assert.match(host.querySelector('[role="alert"]').textContent, /Cannot save runtime preference/);
+  assert.equal(commands('install_claude_runtime').length, 0);
+});
+
+test('registry presets save independently, sync other panels, and persist through detection and remount', async () => {
+  await mount('two');
+  await chooseRegistry('mirror');
+  assert.deepEqual(commands('set_claude_runtime_registry'), [{ name: 'set_claude_runtime_registry', args: { registryUrl: 'https://registry.npmmirror.com/' } }]);
+  for (const select of document.querySelectorAll('[data-claude-runtime-registry-select]')) assert.match(select.textContent, /registryMirror/);
+  assert.equal(current.preference, 'auto');
+  assert.equal(current.selected.source, 'system');
+  assert.equal(commands('set_claude_runtime_source').length, 0);
+  assert.equal(commands('install_claude_runtime').length, 0);
+  await click('[data-claude-runtime-refresh]');
+  assert.match(document.querySelector('[data-claude-runtime-registry-select]').textContent, /registryMirror/);
+  await harness.act(async () => root.unmount()); root = null;
+  await mount();
+  assert.match(document.querySelector('[data-claude-runtime-registry-select]').textContent, /registryMirror/);
+});
+
+test('custom registry is saved explicitly, retains failed input, and download retry uses the saved source', async () => {
+  let failSave = true;
+  const downloadedFrom = [];
+  handler = async (name, args) => {
+    if (name === 'set_claude_runtime_registry') {
+      if (failSave) throw new Error('Registry must use HTTPS without credentials, query, or fragment');
+      current.registryUrl = args.registryUrl.replace(/\/?$/, '/');
+    }
+    if (name === 'install_claude_runtime') {
+      downloadedFrom.push(current.registryUrl);
+      current.install.state = 'downloading';
+    }
+    if (name === 'cancel_claude_runtime_install') current.install.state = 'cancelled';
+    return structuredClone(current);
+  };
+  await mount(true); await chooseRegistry('custom');
+  await editRegistry('http://registry.example.com/npm');
+  assert.equal(commands('set_claude_runtime_registry').length, 0);
+  assert.equal(document.querySelector('[data-claude-runtime-download]').disabled, true);
+  await click('[data-claude-runtime-registry-save]');
+  assert.match(document.body.textContent, /Registry must use HTTPS/);
+  assert.equal(document.querySelector('[data-claude-runtime-registry-input]').value, 'http://registry.example.com/npm');
+  assert.equal(current.registryUrl, 'https://registry.npmjs.org/');
+  failSave = false;
+  await editRegistry('https://registry.example.com/npm');
+  await click('[data-claude-runtime-registry-save]');
+  assert.equal(document.querySelector('[data-claude-runtime-registry-input]').value, 'https://registry.example.com/npm/');
+  assert.equal(document.querySelector('[data-claude-runtime-download]').disabled, false);
+  await click('[data-claude-runtime-download]');
+  await click('[data-claude-runtime-cancel]');
+  await click('[data-claude-runtime-download]');
+  assert.deepEqual(downloadedFrom, ['https://registry.example.com/npm/', 'https://registry.example.com/npm/']);
+  assert.equal(commands('create_native_session').length, 0);
+});
+
+test('registry saving and active installation disable registry controls', async () => {
+  const save = deferred();
+  handler = async (name, args) => {
+    if (name === 'set_claude_runtime_registry') { current.registryUrl = args.registryUrl; return save.promise; }
+    if (name === 'install_claude_runtime') current.install.state = 'downloading';
+    return structuredClone(current);
+  };
+  await mount(); await chooseRegistry('custom'); await editRegistry('https://registry.example.com/');
+  await click('[data-claude-runtime-registry-save]');
+  for (const attribute of ['select', 'input', 'save']) assert.equal(document.querySelector(`[data-claude-runtime-registry-${attribute}]`).disabled, true);
+  assert.match(host.textContent, /registrySaving/);
+  await harness.act(async () => save.resolve(structuredClone(current)));
+  await click('[data-claude-runtime-download]');
+  for (const attribute of ['select', 'input', 'save']) assert.equal(document.querySelector(`[data-claude-runtime-registry-${attribute}]`).disabled, true);
+});
+
+test('stale detection cannot overwrite a newly saved registry', async () => {
+  const stale = deferred();
+  await mount();
+  let firstRead = true;
+  handler = async (name, args) => {
+    if (name === 'get_claude_runtime_status' && firstRead) { firstRead = false; return stale.promise; }
+    if (name === 'set_claude_runtime_registry') current.registryUrl = args.registryUrl;
+    return structuredClone(current);
+  };
+  harness.act(() => window.dispatchEvent(new Event('ccem-claude-runtime-changed')));
+  await chooseRegistry('mirror');
+  await harness.act(async () => stale.resolve(snapshot()));
+  assert.match(document.querySelector('[data-claude-runtime-registry-select]').textContent, /registryMirror/);
+});
+
+test('a panel with a pending action catches up with registry changes saved from another panel', async () => {
+  const source = deferred();
+  let staleStatus;
+  handler = async (name, args) => {
+    if (name === 'set_claude_runtime_source') {
+      current.preference = args.source; staleStatus = structuredClone(current); return source.promise;
+    }
+    if (name === 'set_claude_runtime_registry') current.registryUrl = args.registryUrl;
+    return structuredClone(current);
+  };
+  await mount('two');
+  await click('[data-claude-runtime-source="system"]');
+  await chooseRegistry('mirror', 1);
+  await harness.act(async () => source.resolve(staleStatus));
+  await settle();
+  for (const select of document.querySelectorAll('[data-claude-runtime-registry-select]')) assert.match(select.textContent, /registryMirror/);
+});
+
+test('invalid saved registry blocks downloads until explicitly corrected, without blocking installed runtime selection', async () => {
+  current.registryError = 'Invalid saved registry URL';
+  await mount();
+  assert.match(host.textContent, /Invalid saved registry URL/);
+  assert.match(host.textContent, /\/usr\/local\/bin\/claude/);
+  assert.equal(document.querySelector('[data-claude-runtime-download]').disabled, true);
+  await chooseRegistry('official');
+  assert.deepEqual(commands('set_claude_runtime_registry'), [{ name: 'set_claude_runtime_registry', args: { registryUrl: 'https://registry.npmjs.org/' } }]);
+  assert.equal(document.querySelector('[data-claude-runtime-download]').disabled, false);
   assert.equal(commands('install_claude_runtime').length, 0);
 });
 
@@ -247,6 +390,7 @@ test('profile login opens runtime setup only for the explicit resolver error, wi
   assert.match(document.querySelector('[data-claude-runtime-required]').textContent, /requiredLoginDescription/);
   assert.equal(commands('install_claude_runtime').length, 0);
   assert.equal(commands('login_agent_profile').length, 1);
+  assert.equal(commands('set_claude_runtime_registry').length, 0);
   assert.deepEqual(globalThis.__runtimeToasts, []);
 });
 
@@ -260,6 +404,7 @@ test('profile login auth failures do not trigger installation setup', async () =
   assert.equal(document.querySelector('[data-claude-runtime-required]'), null);
   assert.deepEqual(globalThis.__runtimeToasts, ['Authentication failed']);
   assert.equal(commands('install_claude_runtime').length, 0);
+  assert.equal(commands('set_claude_runtime_registry').length, 0);
 });
 
 test('actual fork callback preserves its dialog and draft while opening setup only for certified startup rejection', async () => {

@@ -40,6 +40,7 @@ export interface TauriCommands {
   login_agent_profile: [{ provider: 'claude' | 'codex' }, void];
   get_claude_runtime_status: [{ refresh?: boolean } | void, ClaudeRuntimeStatus];
   set_claude_runtime_source: [{ source: ClaudeRuntimeSource }, ClaudeRuntimeStatus];
+  set_claude_runtime_registry: [{ registryUrl: string }, ClaudeRuntimeStatus];
   install_claude_runtime: [void, ClaudeRuntimeStatus];
   cancel_claude_runtime_install: [void, ClaudeRuntimeStatus];
   // 环境管理

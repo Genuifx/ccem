@@ -12,6 +12,8 @@ export interface ClaudeRuntimeCandidate {
 
 export interface ClaudeRuntimeStatus {
   preference: ClaudeRuntimeSource;
+  registryUrl: string;
+  registryError: string | null;
   recommendedVersion: string;
   minimumSystemVersion: string;
   system: ClaudeRuntimeCandidate;
@@ -31,6 +33,8 @@ export const getClaudeRuntimeStatus = (refresh = false) =>
   invoke<ClaudeRuntimeStatus>('get_claude_runtime_status', { refresh });
 export const setClaudeRuntimeSource = (source: ClaudeRuntimeSource) =>
   invoke<ClaudeRuntimeStatus>('set_claude_runtime_source', { source });
+export const setClaudeRuntimeRegistry = (registryUrl: string) =>
+  invoke<ClaudeRuntimeStatus>('set_claude_runtime_registry', { registryUrl });
 export const installClaudeRuntime = () => invoke<ClaudeRuntimeStatus>('install_claude_runtime');
 export const cancelClaudeRuntimeInstall = () => invoke<ClaudeRuntimeStatus>('cancel_claude_runtime_install');
 

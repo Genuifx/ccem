@@ -15,8 +15,20 @@ perform no model requests. The floor deliberately follows the SDK's bundled
 Claude version; it is a tested integration baseline rather than a claim that all
 older versions are broken.
 
-Downloads come from the official npm registry using an exact version, archive
-size and SHA-512 digest. The installer extracts only the expected regular files,
+Downloads default to the official npm registry. Agent settings and the setup
+dialog allow choosing npm, npmmirror, or a custom HTTPS npm-compatible registry.
+This separate preference lives in `~/.ccem/runtimes/claude/registry.json`; it does
+not modify npm configuration or change which runtime launches. Custom URLs may
+include a registry path prefix, but not credentials, query strings or fragments.
+Private registries requiring authentication are not supported.
+
+Each installation captures its registry before downloading. Changing the source
+is disabled during installation; after a failure or cancellation, users can
+choose another registry and retry. There is no automatic fallback to a different
+registry. HTTPS CDN redirects are bounded and validated before each request.
+The package path, exact version, archive size and SHA-512 digest always come from
+the embedded manifest, never from the selected registry. A mirror that changes
+the package bytes is rejected. The installer extracts only the expected regular files,
 preserves the upstream license, checks the original binary's size and SHA-256,
 and checks version/capabilities before activation. macOS requirements are checked
 separately from the Desktop application's minimum OS. Unsupported managed

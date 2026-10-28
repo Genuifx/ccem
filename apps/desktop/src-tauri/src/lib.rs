@@ -3403,6 +3403,13 @@ async fn set_claude_runtime_source(source: claude_runtime::ClaudeRuntimeSource) 
 }
 
 #[tauri::command]
+async fn set_claude_runtime_registry(registry_url: String) -> Result<claude_runtime::ClaudeRuntimeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || claude_runtime::shared().set_registry(&registry_url))
+        .await
+        .map_err(|e| format!("Claude runtime registry task failed: {e}"))?
+}
+
+#[tauri::command]
 async fn install_claude_runtime() -> Result<claude_runtime::ClaudeRuntimeStatus, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let manager = claude_runtime::shared();
@@ -6261,6 +6268,7 @@ pub fn run_desktop_app() -> i32 {
             check_claude_installed,
             get_claude_runtime_status,
             set_claude_runtime_source,
+            set_claude_runtime_registry,
             install_claude_runtime,
             cancel_claude_runtime_install,
             check_codex_installed,

@@ -17,7 +17,7 @@ test('Codex defaults to shared state, toggles persist, and failed preparation ke
       this.port2 = { postMessage: (data) => queueMicrotask(() => this.port1.onmessage?.({ data })) };
     }
   };
-  for (const [key, value] of Object.entries({ window: dom.window, document: dom.window.document, IS_REACT_ACT_ENVIRONMENT: true, MessageChannel })) {
+  for (const [key, value] of Object.entries({ window: dom.window, document: dom.window.document, DocumentFragment: dom.window.DocumentFragment, HTMLElement: dom.window.HTMLElement, HTMLSelectElement: dom.window.HTMLSelectElement, Event: dom.window.Event, IS_REACT_ACT_ENVIRONMENT: true, MessageChannel })) {
     saved.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
     Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
   }
@@ -44,6 +44,7 @@ test('Codex defaults to shared state, toggles persist, and failed preparation ke
       }
       if (command === 'get_claude_runtime_status') return {
         preference: 'auto', recommendedVersion: '2.1.220', minimumSystemVersion: '2.1.220',
+        registryUrl: 'https://registry.npmjs.org/', registryError: null,
         system: { state: 'available', path: '/system/claude', version: '2.1.220', detail: null },
         managed: { state: 'missing', path: null, version: null, detail: null },
         selected: { source: 'system', path: '/system/claude', version: '2.1.220' },

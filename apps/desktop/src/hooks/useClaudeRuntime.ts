@@ -5,6 +5,7 @@ import {
   getClaudeRuntimeStatus,
   installClaudeRuntime,
   isClaudeRuntimeInstalling,
+  setClaudeRuntimeRegistry,
   setClaudeRuntimeSource,
   type ClaudeRuntimeSource,
   type ClaudeRuntimeStatus,
@@ -16,20 +17,22 @@ export function useClaudeRuntime() {
   const [status, setStatus] = useState<ClaudeRuntimeStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [pending, setPending] = useState<'source' | 'install' | 'cancel' | null>(null);
+  const [pending, setPending] = useState<'source' | 'registry' | 'install' | 'cancel' | null>(null);
   const mountedRef = useRef(false);
   const revisionRef = useRef(0);
   const actionRef = useRef(false);
   const cancellingRef = useRef(false);
+  const originRef = useRef({});
+  const refreshAfterActionRef = useRef(false);
 
-  const refresh = useCallback(async (probe = false) => {
+  const refresh = useCallback(async (probe = false, clearError = true) => {
     const revision = ++revisionRef.current;
     if (probe) setLoading(true);
     try {
       const next = await getClaudeRuntimeStatus(probe);
       if (mountedRef.current && revision === revisionRef.current) {
         setStatus(next);
-        setError(null);
+        if (clearError) setError(null);
       }
     } catch (failure) {
       if (mountedRef.current && revision === revisionRef.current) setError(claudeRuntimeErrorText(failure));
@@ -41,7 +44,11 @@ export function useClaudeRuntime() {
   useEffect(() => {
     mountedRef.current = true;
     void refresh();
-    const changed = () => { if (!actionRef.current && !cancellingRef.current) void refresh(); };
+    const changed = (event: Event) => {
+      if ((event as CustomEvent).detail === originRef.current) return;
+      if (actionRef.current || cancellingRef.current) refreshAfterActionRef.current = true;
+      else void refresh();
+    };
     window.addEventListener(RUNTIME_CHANGED_EVENT, changed);
     return () => {
       mountedRef.current = false;
@@ -57,8 +64,8 @@ export function useClaudeRuntime() {
     return () => window.clearInterval(timer);
   }, [installing, refresh]);
 
-  const run = useCallback(async (kind: 'source' | 'install', action: () => Promise<ClaudeRuntimeStatus>) => {
-    if (actionRef.current) return;
+  const run = useCallback(async (kind: 'source' | 'registry' | 'install', action: () => Promise<ClaudeRuntimeStatus>) => {
+    if (actionRef.current) return null;
     actionRef.current = true;
     revisionRef.current += 1;
     setPending(kind);
@@ -69,19 +76,26 @@ export function useClaudeRuntime() {
         revisionRef.current += 1;
         setStatus(next);
       }
+      return next;
     } catch (failure) {
       // A failed install can follow an explicitly requested source change.
       // Re-read that persisted choice instead of displaying the old selection.
       await refresh();
       if (mountedRef.current) setError(claudeRuntimeErrorText(failure));
+      return null;
     } finally {
       if (mountedRef.current) setPending(null);
-      window.dispatchEvent(new Event(RUNTIME_CHANGED_EVENT));
+      window.dispatchEvent(new CustomEvent(RUNTIME_CHANGED_EVENT, { detail: originRef.current }));
       actionRef.current = false;
+      if (refreshAfterActionRef.current && !cancellingRef.current) {
+        refreshAfterActionRef.current = false;
+        void refresh(false, false);
+      }
     }
   }, [refresh]);
 
   const setSource = useCallback((source: ClaudeRuntimeSource) => run('source', () => setClaudeRuntimeSource(source)), [run]);
+  const setRegistry = useCallback((registryUrl: string) => run('registry', () => setClaudeRuntimeRegistry(registryUrl)), [run]);
   const install = useCallback((useManaged = false) => run('install', async () => {
     if (useManaged) await setClaudeRuntimeSource('managed');
     return installClaudeRuntime();
@@ -103,10 +117,14 @@ export function useClaudeRuntime() {
       if (mountedRef.current) setError(claudeRuntimeErrorText(failure));
     } finally {
       if (mountedRef.current) setPending(actionRef.current ? 'install' : null);
-      window.dispatchEvent(new Event(RUNTIME_CHANGED_EVENT));
+      window.dispatchEvent(new CustomEvent(RUNTIME_CHANGED_EVENT, { detail: originRef.current }));
       cancellingRef.current = false;
+      if (refreshAfterActionRef.current && !actionRef.current) {
+        refreshAfterActionRef.current = false;
+        void refresh(false, false);
+      }
     }
-  }, []);
+  }, [refresh]);
 
-  return { status, error, loading, pending, installing, refresh, setSource, install, cancel };
+  return { status, error, loading, pending, installing, refresh, setSource, setRegistry, install, cancel };
 }

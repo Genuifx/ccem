@@ -57,7 +57,7 @@ impl Drop for StagingDirectory {
     }
 }
 
-pub(super) fn install(manager: &ClaudeRuntimeManager) -> Result<(), String> {
+pub(super) fn install(manager: &ClaudeRuntimeManager, registry_url: &str) -> Result<(), String> {
     let package = current_package()?;
     manager.check_cancelled()?;
     reject_symlink(&manager.root)?;
@@ -94,7 +94,7 @@ pub(super) fn install(manager: &ClaudeRuntimeManager) -> Result<(), String> {
     )));
     fs::create_dir(&stage.0).map_err(|e| e.to_string())?;
     let archive = stage.0.join("package.tgz");
-    tauri::async_runtime::block_on(download(manager, package, &archive))?;
+    tauri::async_runtime::block_on(download(manager, package, registry_url, &archive))?;
     manager.check_cancelled()?;
     manager.update_progress("verifying", None);
     verify_archive(&archive, package, || manager.check_cancelled())?;
@@ -132,23 +132,16 @@ pub(super) fn install(manager: &ClaudeRuntimeManager) -> Result<(), String> {
 async fn download(
     manager: &ClaudeRuntimeManager,
     package: &RuntimePackage,
+    registry_url: &str,
     destination: &Path,
 ) -> Result<(), String> {
-    let url = reqwest::Url::parse(&package.url).map_err(|e| e.to_string())?;
-    if url.scheme() != "https"
-        || url.host_str() != Some("registry.npmjs.org")
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.port().is_some()
-        || !url.path().starts_with("/@anthropic-ai/claude-agent-sdk-")
-    {
-        return Err("Claude runtime source is not an approved Anthropic npm artifact".into());
-    }
+    let url = registry::download_url(registry_url, package)?;
     if package.archive_bytes == 0 || package.archive_bytes > MAX_ARCHIVE_BYTES {
         return Err("Claude runtime archive size is outside the allowed limit".into());
     }
     let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(registry::redirect_policy())
+        .https_only(true)
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(600))
         .build()

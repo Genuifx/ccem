@@ -1,5 +1,8 @@
+import { useEffect, useId, useState } from 'react';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 import { Progress } from '@/components/ui/progress';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import {
   Dialog,
   DialogContent,
@@ -12,6 +15,9 @@ import { useClaudeRuntime } from '@/hooks/useClaudeRuntime';
 import { isClaudeRuntimeInstalling, type ClaudeRuntimeSource } from '@/lib/claude-runtime';
 import { useLocale } from '@/locales';
 
+const REGISTRIES = { official: 'https://registry.npmjs.org/', mirror: 'https://registry.npmmirror.com/' };
+const registryPreset = (url: string) => url === REGISTRIES.official ? 'official' : url === REGISTRIES.mirror ? 'mirror' : 'custom';
+
 export function ClaudeRuntimeSettings({ disabled = false, required = false }: {
   disabled?: boolean;
   required?: boolean;
@@ -19,6 +25,16 @@ export function ClaudeRuntimeSettings({ disabled = false, required = false }: {
   const { t } = useLocale();
   const runtime = useClaudeRuntime();
   const { status, loading, error, pending, installing } = runtime;
+  const registryId = useId();
+  const [editingRegistry, setEditingRegistry] = useState(false);
+  const [registryDraft, setRegistryDraft] = useState('');
+  useEffect(() => {
+    if (!status) return;
+    setRegistryDraft(status.registryUrl);
+    setEditingRegistry(false);
+  }, [status?.registryUrl]);
+  const registryChoice = editingRegistry ? 'custom' : registryPreset(status?.registryUrl ?? REGISTRIES.official);
+  const registryUnsaved = registryChoice === 'custom' && registryDraft.trim() !== status?.registryUrl;
   const busy = disabled || loading || pending !== null || installing;
   const selected = status?.selected;
   const downloadAndUse = required && status?.preference === 'system';
@@ -69,6 +85,41 @@ export function ClaudeRuntimeSettings({ disabled = false, required = false }: {
           )}
         </div>
         <p className="text-xs text-muted-foreground">{t('claudeRuntime.newSessionsOnly')}</p>
+        <div className="space-y-2 border-t border-border/40 pt-3" data-claude-runtime-registry>
+          <label htmlFor={registryId} className="text-sm font-medium">{t('claudeRuntime.registry')}</label>
+          <Select value={status.registryError && !editingRegistry ? '' : registryChoice} disabled={busy} onValueChange={(choice) => {
+            if (choice === 'custom') {
+              setRegistryDraft(registryPreset(status.registryUrl) === 'custom' ? status.registryUrl : '');
+              setEditingRegistry(true);
+            } else if (choice === 'official' || choice === 'mirror') {
+              setEditingRegistry(false);
+              const url = REGISTRIES[choice];
+              if (url !== status.registryUrl || status.registryError) void runtime.setRegistry(url);
+            }
+          }}>
+            <SelectTrigger id={registryId} data-claude-runtime-registry-select><SelectValue placeholder={t('claudeRuntime.registrySelect')} /></SelectTrigger>
+            <SelectContent>
+              <SelectItem value="official" data-claude-runtime-registry-option="official">{t('claudeRuntime.registryOfficial')}</SelectItem>
+              <SelectItem value="mirror" data-claude-runtime-registry-option="mirror">{t('claudeRuntime.registryMirror')}</SelectItem>
+              <SelectItem value="custom" data-claude-runtime-registry-option="custom">{t('claudeRuntime.registryCustom')}</SelectItem>
+            </SelectContent>
+          </Select>
+          {registryChoice === 'custom' && <div className="flex items-center gap-2">
+            <Input value={registryDraft} disabled={busy} onChange={(event) => setRegistryDraft(event.target.value)}
+              aria-label={t('claudeRuntime.registryUrl')} placeholder="https://registry.example.com/npm/"
+              autoCapitalize="none" autoCorrect="off" spellCheck={false} data-claude-runtime-registry-input />
+            <Button size="sm" variant="outline" disabled={busy || !registryDraft.trim() || (!registryUnsaved && !status.registryError)}
+              onClick={async () => {
+                const next = await runtime.setRegistry(registryDraft.trim());
+                if (next) { setRegistryDraft(next.registryUrl); setEditingRegistry(false); }
+              }} data-claude-runtime-registry-save>
+              {t('common.save')}
+            </Button>
+          </div>}
+          <p className="text-xs text-muted-foreground">{t('claudeRuntime.registryHint')}</p>
+          {pending === 'registry' && <p role="status" className="text-xs text-muted-foreground">{t('claudeRuntime.registrySaving')}</p>}
+          {status.registryError && <p role="alert" className="break-words text-sm text-destructive">{status.registryError}</p>}
+        </div>
         {!status.supported && <p role="alert" className="text-sm text-muted-foreground">
           {status.unsupportedReason || t('claudeRuntime.unsupported')}
         </p>}
@@ -91,7 +142,7 @@ export function ClaudeRuntimeSettings({ disabled = false, required = false }: {
           <p role="status" className="text-xs text-muted-foreground">{t('claudeRuntime.cancelled')}</p>
         )}
         {status.install.error && <p role="alert" className="break-words text-sm text-destructive">{status.install.error}</p>}
-        {canDownload && !installing && <Button size="sm" variant={required ? 'default' : 'outline'} disabled={busy}
+        {canDownload && !installing && <Button size="sm" variant={required ? 'default' : 'outline'} disabled={busy || registryUnsaved || Boolean(status.registryError)}
           onClick={() => void runtime.install(downloadAndUse)} data-claude-runtime-download>
           {t(downloadLabel, { version: status.recommendedVersion })}
         </Button>}
@@ -117,7 +168,7 @@ export function ClaudeRuntimeRequiredDialog({ open, onOpenChange, context = 'dra
   const { t } = useLocale();
   const closeLabel = t(context === 'login' ? 'claudeRuntime.backToSettings' : 'claudeRuntime.backToDraft');
   return <Dialog open={open} onOpenChange={onOpenChange}>
-    <DialogContent data-claude-runtime-required closeLabel={closeLabel}>
+    <DialogContent className="overflow-y-auto" data-claude-runtime-required closeLabel={closeLabel}>
       <DialogHeader>
         <DialogTitle>{t('claudeRuntime.requiredTitle')}</DialogTitle>
         <DialogDescription>{t(context === 'login' ? 'claudeRuntime.requiredLoginDescription' : 'claudeRuntime.requiredDescription')}</DialogDescription>

@@ -341,3 +341,202 @@ fn claude_runtime_preference_and_managed_binary_reject_symlinks() {
     symlink(&binary, &link).unwrap();
     assert!(package::verify_binary(&link, &fixture_package(b"trusted")).is_err());
 }
+
+fn manager_without_system_probe(root: PathBuf) -> Arc<ClaudeRuntimeManager> {
+    let manager = Arc::new(ClaudeRuntimeManager::new(root));
+    *manager.system_cache.lock().unwrap() = Some(ProbeCache {
+        candidate: RuntimeCandidate::missing(),
+        identity: None,
+        at: Instant::now(),
+    });
+    manager
+}
+
+#[test]
+fn claude_runtime_registry_normalizes_https_bases_and_rejects_unsafe_configuration() {
+    assert_eq!(
+        registry::normalize(" https://REGISTRY.NPMJS.ORG ").unwrap(),
+        registry::DEFAULT_REGISTRY
+    );
+    assert_eq!(
+        registry::normalize("https://example.test:8443/repository/npm").unwrap(),
+        "https://example.test:8443/repository/npm/"
+    );
+    assert_eq!(
+        registry::normalize("https://example.test/npm%20proxy/").unwrap(),
+        "https://example.test/npm%20proxy/"
+    );
+    for invalid in [
+        "",
+        "registry.npmjs.org",
+        "http://registry.npmjs.org/",
+        "file:///registry/",
+        "https://user:secret@example.test/",
+        "https://user@example.test/",
+        "https://example.test/?token=secret",
+        "https://example.test/#fragment",
+        "https://example.test/?",
+        "https://example.test/#",
+        "https://example.test/a\nb",
+    ] {
+        assert!(
+            registry::normalize(invalid).is_err(),
+            "must reject {invalid}"
+        );
+    }
+    assert!(registry::normalize(&format!("https://example.test/{}", "a".repeat(2048))).is_err());
+}
+
+#[test]
+fn claude_runtime_registry_download_keeps_manifest_identity_and_custom_path_prefix() {
+    for package in &manifest().packages {
+        assert_eq!(
+            registry::download_url(registry::DEFAULT_REGISTRY, package)
+                .unwrap()
+                .as_str(),
+            package.url
+        );
+        let mirrored =
+            registry::download_url("https://mirror.example/repository/npm", package).unwrap();
+        let official = reqwest::Url::parse(&package.url).unwrap();
+        assert_eq!(mirrored.host_str(), Some("mirror.example"));
+        assert_eq!(
+            mirrored.path(),
+            format!("/repository/npm{}", official.path())
+        );
+        assert!(mirrored.query().is_none());
+        assert!(mirrored.fragment().is_none());
+    }
+    let mut changed = manifest().packages[0].clone();
+    changed.url =
+        "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk-darwin-arm64/-/latest.tgz"
+            .into();
+    assert!(registry::download_url(registry::DEFAULT_REGISTRY, &changed).is_err());
+}
+
+#[test]
+fn claude_runtime_registry_default_status_is_read_only_and_persistence_is_independent() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("runtime");
+    let manager = manager_without_system_probe(root.clone());
+    let status = manager.status(false);
+    assert_eq!(status.registry_url, registry::DEFAULT_REGISTRY);
+    assert!(status.registry_error.is_none());
+    assert!(!root.exists());
+
+    let status = manager.set_registry("https://mirror.example/npm").unwrap();
+    assert_eq!(status.registry_url, "https://mirror.example/npm/");
+    assert_eq!(status.preference, ClaudeRuntimeSource::Auto);
+    assert!(
+        !manager.preference_path().exists(),
+        "registry must not rewrite runtime source selection"
+    );
+    manager
+        .set_preference(ClaudeRuntimeSource::Managed)
+        .unwrap();
+    let reloaded = manager_without_system_probe(root);
+    assert_eq!(
+        reloaded.read_registry().unwrap(),
+        "https://mirror.example/npm/"
+    );
+    assert_eq!(
+        reloaded.read_preference().unwrap(),
+        ClaudeRuntimeSource::Managed
+    );
+    reloaded.set_registry(registry::DEFAULT_REGISTRY).unwrap();
+    assert_eq!(
+        reloaded.read_preference().unwrap(),
+        ClaudeRuntimeSource::Managed
+    );
+}
+
+#[test]
+fn claude_runtime_registry_bad_disk_configuration_never_falls_back_or_starts_installation() {
+    let temp = tempfile::tempdir().unwrap();
+    let manager = manager_without_system_probe(temp.path().join("runtime"));
+    fs::create_dir_all(&manager.root).unwrap();
+    for invalid in [
+        b"broken-json".to_vec(),
+        br#""http://mirror.example/""#.to_vec(),
+        vec![b'x'; 4097],
+    ] {
+        fs::write(manager.registry_path(), invalid).unwrap();
+        let status = manager.status(false);
+        assert_eq!(status.registry_url, "");
+        assert!(status.registry_error.is_some());
+        assert!(manager.read_registry().is_err());
+        assert!(manager.prepare_install().is_err());
+        assert!(!manager.busy.load(Ordering::Acquire));
+        assert!(!manager.root.join("versions").exists());
+        assert!(!manager.root.join("install.lock").exists());
+    }
+}
+
+#[test]
+fn claude_runtime_registry_is_snapshotted_at_install_claim_and_cannot_change_while_busy() {
+    if current_package().is_err() {
+        return;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let manager = manager_without_system_probe(temp.path().join("runtime"));
+    manager.set_registry("https://first.example/npm").unwrap();
+    let prepared = manager.prepare_install().unwrap();
+    assert_eq!(prepared.registry_url, "https://first.example/npm/");
+    assert!(manager.set_registry("https://second.example/npm/").is_err());
+    assert_eq!(manager.read_registry().unwrap(), prepared.registry_url);
+
+    // Simulate another CCEM process changing its settings after this worker was
+    // claimed. The request must still use the first registry's captured URL.
+    fs::write(manager.registry_path(), br#""https://second.example/npm/""#).unwrap();
+    assert_eq!(
+        manager.read_registry().unwrap(),
+        "https://second.example/npm/"
+    );
+    assert_eq!(
+        registry::download_url(&prepared.registry_url, current_package().unwrap())
+            .unwrap()
+            .host_str(),
+        Some("first.example")
+    );
+    manager.cancel_install();
+    assert!(prepared.run().unwrap_err().contains("cancelled"));
+    assert!(!manager.root.join("versions").exists());
+    let next = manager.prepare_install().unwrap();
+    assert_eq!(next.registry_url, "https://second.example/npm/");
+}
+
+#[test]
+fn claude_runtime_registry_redirects_allow_https_cdns_but_reject_downgrade_credentials_and_sixth_hop(
+) {
+    let cdn = reqwest::Url::parse("https://cdn.example/package.tgz?signature=temporary").unwrap();
+    for hop in 1..=5 {
+        assert!(registry::validate_redirect(&cdn, hop).is_ok());
+    }
+    assert!(registry::validate_redirect(&cdn, 6).is_err());
+    for unsafe_url in [
+        "http://cdn.example/package.tgz",
+        "https://user:secret@cdn.example/package.tgz",
+        "file:///package.tgz",
+    ] {
+        assert!(registry::validate_redirect(&reqwest::Url::parse(unsafe_url).unwrap(), 1).is_err());
+    }
+    let too_long =
+        reqwest::Url::parse(&format!("https://cdn.example/{}", "a".repeat(8192))).unwrap();
+    assert!(registry::validate_redirect(&too_long, 1).is_err());
+}
+
+#[test]
+#[cfg(unix)]
+fn claude_runtime_registry_symlink_is_rejected_without_modifying_its_target() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let manager = manager_without_system_probe(temp.path().join("runtime"));
+    fs::create_dir_all(&manager.root).unwrap();
+    let outside = temp.path().join("outside.json");
+    let original = br#""https://original.example/""#;
+    fs::write(&outside, original).unwrap();
+    symlink(&outside, manager.registry_path()).unwrap();
+    assert!(manager.read_registry().is_err());
+    assert!(manager.set_registry("https://mirror.example/").is_err());
+    assert_eq!(fs::read(&outside).unwrap(), original);
+}

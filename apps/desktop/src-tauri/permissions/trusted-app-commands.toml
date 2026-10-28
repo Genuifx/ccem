@@ -7,6 +7,7 @@ commands.allow = [
   "login_agent_profile",
   "get_claude_runtime_status",
   "set_claude_runtime_source",
+  "set_claude_runtime_registry",
   "install_claude_runtime",
   "cancel_claude_runtime_install",
   "webcontent_debug_main_process_id",
