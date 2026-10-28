@@ -2682,6 +2682,12 @@ export function Workspace({
       toast.info(t('workspace.splitFull', { count: MAX_SPLIT_PANES }));
       return;
     }
+    // Nothing on screen to pair with: a lone history pane would never render
+    // (split needs two), so just open the session the normal way.
+    if (result.kind === 'added' && result.paneIds.length < 2 && isSplitHistoryPaneId(paneId)) {
+      void handleSelect(session);
+      return;
+    }
     setSplitRuntimeIds(result.paneIds);
     const nextActive = result.kind === 'added'
       ? paneId
@@ -2694,7 +2700,7 @@ export function Workspace({
       focusSplitPane(nextActive);
       setWorkspaceMode('live');
     }
-  }, [activeLiveRuntimeId, focusSplitPane, resolveSplitPaneForSession, splitRuntimeIds, t, workspaceMode]);
+  }, [activeLiveRuntimeId, focusSplitPane, handleSelect, resolveSplitPaneForSession, splitRuntimeIds, t, workspaceMode]);
 
   const handleCloseSplitPane = useCallback((paneId: string) => {
     const nextActive = focusAfterClosingPane(splitRuntimeIds, paneId, activeLiveRuntimeId);
@@ -2872,6 +2878,19 @@ export function Workspace({
       (payload: ComposerSubmitPayload) => handleResumeSplitPaneRef.current(id, payload),
     ]),
   ), [splitRuntimeIds]);
+  // History panes start from the same controls the single history view
+  // would: saved per-session preferences, then the session's env.
+  const splitHistoryPaneControls = useMemo(() => Object.fromEntries(
+    Object.entries(splitHistorySessions).map(([paneId, session]) => [
+      paneId,
+      resolveHistorySessionControls({
+        session,
+        preferences: historySessionPreferences,
+        currentEnv,
+        defaultPermMode: permissionMode,
+      }),
+    ]),
+  ), [currentEnv, historySessionPreferences, permissionMode, splitHistorySessions]);
   const resumeHistoryPaneHandlers = useMemo(() => Object.fromEntries(
     splitRuntimeIds.map((id) => [
       id,
@@ -4749,6 +4768,7 @@ export function Workspace({
                         <div className="relative min-h-0 flex-1">
                           <WorkspaceSplitHistoryPane
                             session={historySession}
+                            initialControls={splitHistoryPaneControls[paneId]}
                             onResume={resumeHistoryPaneHandlers[paneId]}
                           />
                         </div>

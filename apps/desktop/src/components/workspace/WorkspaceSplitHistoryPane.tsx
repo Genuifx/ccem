@@ -27,6 +27,8 @@ export interface SplitHistoryResumeControls {
 
 interface WorkspaceSplitHistoryPaneProps {
   session: HistorySessionItem;
+  /** Same env/permission/effort the single history view would start with. */
+  initialControls: SplitHistoryResumeControls;
   /** Resume the provider session into a live runtime that takes this pane over. */
   onResume: (
     payload: ComposerSubmitPayload,
@@ -41,14 +43,13 @@ interface WorkspaceSplitHistoryPaneProps {
  */
 export const WorkspaceSplitHistoryPane = memo(function WorkspaceSplitHistoryPane({
   session,
+  initialControls,
   onResume,
 }: WorkspaceSplitHistoryPaneProps) {
   const { t } = useLocale();
-  const { environments, enabledEnvironments, currentEnv, permissionMode } = useAppStore((state) => ({
+  const { environments, enabledEnvironments } = useAppStore((state) => ({
     environments: state.environments,
     enabledEnvironments: state.enabledEnvironments,
-    currentEnv: state.currentEnv,
-    permissionMode: state.permissionMode,
   }), shallow);
   const [messages, setMessages] = useState<ConversationMessageData[]>([]);
   const [segments, setSegments] = useState<HistorySegment[]>([]);
@@ -56,9 +57,9 @@ export const WorkspaceSplitHistoryPane = memo(function WorkspaceSplitHistoryPane
   const [isLoading, setIsLoading] = useState(true);
   const [text, setText] = useState('');
   const [isResuming, setIsResuming] = useState(false);
-  const [envName, setEnvName] = useState(() => session.envName || currentEnv || '');
-  const [permMode, setPermMode] = useState<PermissionModeName>(permissionMode);
-  const [effort, setEffort] = useState<EffortLevel>('max');
+  const [envName, setEnvName] = useState(initialControls.envName);
+  const [permMode, setPermMode] = useState<PermissionModeName>(initialControls.permMode);
+  const [effort, setEffort] = useState<EffortLevel>(initialControls.effort);
   const provider = session.source === 'codex' ? 'codex' : 'claude';
 
   useEffect(() => {
