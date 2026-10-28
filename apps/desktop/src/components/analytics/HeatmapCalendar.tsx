@@ -1,5 +1,5 @@
 // apps/desktop/src/components/analytics/HeatmapCalendar.tsx
-import { useMemo } from 'react';
+import { useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { DailyActivity } from '@/types/analytics';
 import { useLocale } from '@/locales';
 import { cn, formatTokens } from '@/lib/utils';
@@ -18,11 +18,12 @@ const LEVEL_STYLES: Record<number, React.CSSProperties> = {
 };
 
 const COMPACT_WEEK_COUNT = 12;
-const MOBILE_WEEK_COUNT = 13;
-const DESKTOP_WEEK_COUNT = 26;
-const GRID_LABEL_COLUMN = '1.75rem';
-
-type HeatmapDensity = 'mobile' | 'desktop';
+const DEFAULT_WEEK_COUNT = 26;
+const MIN_WEEK_COUNT = 8;
+const MAX_WEEK_COUNT = 53;
+const LABEL_COLUMN_PX = 28;
+const MIN_CELL_PX = 14;
+const CELL_GAP_PX = 4;
 
 type ActivityWeek = (DailyActivity | null)[];
 
@@ -104,21 +105,11 @@ export function HeatmapCalendar({ activities, compact = false }: HeatmapCalendar
     return computedWeeks;
   }, [activities]);
 
-  const cellSize = compact ? 'w-3 h-3' : 'w-3 h-3';
-  const gapClass = compact ? 'gap-[3px]' : 'gap-[3px]';
-  const displayWeeks = compact ? weeks.slice(-COMPACT_WEEK_COUNT) : weeks.slice(-DESKTOP_WEEK_COUNT);
-  const mobileDisplayWeeks = weeks.slice(-MOBILE_WEEK_COUNT);
-  const desktopMonthLabels = getMonthLabelsForWeeks(displayWeeks, dateLocale);
-  const mobileMonthLabels = getMonthLabelsForWeeks(mobileDisplayWeeks, dateLocale);
-  const getExpandedGridStyle = (weekCount: number, density: HeatmapDensity): React.CSSProperties => ({
-    gridTemplateColumns: `${GRID_LABEL_COLUMN} repeat(${Math.max(weekCount, 1)}, ${density === 'mobile' ? '0.875rem' : '0.875rem'})`,
-    columnGap: density === 'mobile'
-      ? 'clamp(0.45rem, 1.45cqw, 1rem)'
-      : 'clamp(0.3rem, 0.82cqw, 0.75rem)',
-    justifyContent: 'center',
-  });
+  const cellSize = 'w-3 h-3';
+  const gapClass = 'gap-[3px]';
 
   if (compact) {
+    const displayWeeks = weeks.slice(-COMPACT_WEEK_COUNT);
     return (
       <div className="heatmap-enter">
         <div className={`flex ${gapClass}`}>
@@ -151,36 +142,64 @@ export function HeatmapCalendar({ activities, compact = false }: HeatmapCalendar
   }
 
   return (
-    <div className="heatmap-enter w-full">
-      <div className="lg:hidden">
-        <div className="w-full [container-type:inline-size]">
-          <HeatmapGrid
-            weeks={mobileDisplayWeeks}
-            monthLabels={mobileMonthLabels}
-            dayLabels={dayLabels}
-            density="mobile"
-            formatTooltip={formatTooltip}
-            getExpandedGridStyle={getExpandedGridStyle}
-          />
-          <HeatmapLegend t={t} className="mt-3" />
-        </div>
-      </div>
+    <ExpandedHeatmap
+      weeks={weeks}
+      dayLabels={dayLabels}
+      dateLocale={dateLocale}
+      formatTooltip={formatTooltip}
+      t={t}
+    />
+  );
+}
 
-      <div className="hidden overflow-x-auto [scrollbar-width:none] lg:block [&::-webkit-scrollbar]:hidden">
-        <div className="min-w-[640px] [container-type:inline-size]">
-          <div className="mb-2 flex justify-end">
-            <HeatmapLegend t={t} />
-          </div>
-          <HeatmapGrid
-            weeks={displayWeeks}
-            monthLabels={desktopMonthLabels}
-            dayLabels={dayLabels}
-            density="desktop"
-            formatTooltip={formatTooltip}
-            getExpandedGridStyle={getExpandedGridStyle}
-          />
+/** Fits as many whole weeks as the container width allows, so the grid always fills its row. */
+function ExpandedHeatmap({
+  weeks,
+  dayLabels,
+  dateLocale,
+  formatTooltip,
+  t,
+}: {
+  weeks: ActivityWeek[];
+  dayLabels: string[];
+  dateLocale: string;
+  formatTooltip: (activity: DailyActivity) => string;
+  t: (key: string, params?: Record<string, string | number>) => string;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(0);
+
+  useLayoutEffect(() => {
+    const node = containerRef.current;
+    if (!node) return;
+    setWidth(node.getBoundingClientRect().width);
+    const observer = new ResizeObserver(([entry]) => setWidth(entry.contentRect.width));
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  const fittedWeekCount = width > 0
+    ? Math.floor((width - LABEL_COLUMN_PX + CELL_GAP_PX) / (MIN_CELL_PX + CELL_GAP_PX))
+    : DEFAULT_WEEK_COUNT;
+  const weekCount = Math.max(MIN_WEEK_COUNT, Math.min(MAX_WEEK_COUNT, fittedWeekCount, weeks.length || MIN_WEEK_COUNT));
+  const displayWeeks = weeks.slice(-weekCount);
+  const monthLabels = getMonthLabelsForWeeks(displayWeeks, dateLocale);
+
+  return (
+    <div ref={containerRef} className="heatmap-enter w-full min-w-0">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+        <div className="flex items-baseline gap-2">
+          <span className="text-sm font-medium text-foreground">{t('analytics.activityHeatmap')}</span>
+          <span className="text-xs text-muted-foreground">{t('analytics.recentWeeks', { count: displayWeeks.length })}</span>
         </div>
+        <HeatmapLegend t={t} />
       </div>
+      <HeatmapGrid
+        weeks={displayWeeks}
+        monthLabels={monthLabels}
+        dayLabels={dayLabels}
+        formatTooltip={formatTooltip}
+      />
     </div>
   );
 }
@@ -189,44 +208,39 @@ interface HeatmapGridProps {
   weeks: ActivityWeek[];
   monthLabels: { label: string; weekIndex: number; span: number }[];
   dayLabels: string[];
-  density: HeatmapDensity;
   formatTooltip: (activity: DailyActivity) => string;
-  getExpandedGridStyle: (weekCount: number, density: HeatmapDensity) => React.CSSProperties;
 }
 
-function HeatmapGrid({
-  weeks,
-  monthLabels,
-  dayLabels,
-  density,
-  formatTooltip,
-  getExpandedGridStyle,
-}: HeatmapGridProps) {
-  const expandedGridStyle = getExpandedGridStyle(weeks.length, density);
+function HeatmapGrid({ weeks, monthLabels, dayLabels, formatTooltip }: HeatmapGridProps) {
+  const gridStyle: React.CSSProperties = {
+    gridTemplateColumns: `${LABEL_COLUMN_PX}px repeat(${Math.max(weeks.length, 1)}, minmax(0, 1fr))`,
+    gap: CELL_GAP_PX,
+  };
 
   return (
     <>
-      <div className="mb-2 grid text-[11px] text-muted-foreground/90" style={expandedGridStyle}>
+      <div className="mb-1.5 grid text-[11px] text-muted-foreground" style={gridStyle}>
         <span aria-hidden="true" />
         {monthLabels.map(({ label, weekIndex, span }, i) => (
           <div
             key={i}
-            className="min-w-0 leading-none"
+            className="min-w-0 overflow-visible whitespace-nowrap leading-none"
             style={{ gridColumn: `${weekIndex + 2} / span ${span}` }}
           >
-            {label}
+            {/* A month that only touches one column has no room for its label */}
+            {span >= 2 ? label : null}
           </div>
         ))}
       </div>
 
-      <div className={cn('grid', density === 'mobile' ? 'gap-y-1' : 'gap-y-[3px]')} style={expandedGridStyle}>
+      <div className="grid" style={gridStyle}>
         {dayLabels.map((label, index) => (
           <div
             key={label}
-            className="flex items-center text-[11px] leading-none text-muted-foreground/90"
+            className="flex items-center text-[11px] leading-none text-muted-foreground"
             style={{ gridColumn: 1, gridRow: index + 1 }}
           >
-            {label}
+            {index % 2 === 0 ? label : null}
           </div>
         ))}
 
@@ -238,19 +252,14 @@ function HeatmapGrid({
                 role="button"
                 tabIndex={0}
                 aria-label={formatTooltip(activity)}
-                className={cn(
-                  'relative aspect-square w-full cursor-pointer shadow-[inset_0_1px_0_hsl(var(--surface)/0.35)] transition-[filter,box-shadow,transform] duration-150 hover:-translate-y-px hover:brightness-110 hover:ring-2 hover:ring-primary/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary',
-                  density === 'mobile' ? 'rounded-[4px]' : 'rounded-[4px]'
-                )}
+                className="relative aspect-square w-full cursor-pointer rounded-[3px] transition-[filter,box-shadow] duration-150 hover:brightness-110 hover:ring-2 hover:ring-primary/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
                 style={{
                   ...LEVEL_STYLES[activity.level],
                   gridColumn: weekIndex + 2,
                   gridRow: dayIndex + 1,
                 }}
                 title={formatTooltip(activity)}
-              >
-                <span className="absolute -inset-1.5" aria-hidden="true" />
-              </div>
+              />
             ) : (
               <div
                 key={`empty-${weekIndex}-${dayIndex}`}

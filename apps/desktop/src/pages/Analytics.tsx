@@ -3,6 +3,7 @@ import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } fro
 import { invoke } from '@tauri-apps/api/core';
 import { Flame, RefreshCw, Share2, TrendingDown, TrendingUp } from '@/lib/lucide-react';
 import { ErrorBanner } from '@/components/ui/EmptyState';
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
 import { HeatmapCalendar } from '@/components/analytics/HeatmapCalendar';
 import { useAppStore } from '@/store';
@@ -479,10 +480,14 @@ export function Analytics() {
       )}
 
       {/* Summary Section */}
-      <section data-analytics-motion-panel className="rounded-2xl border border-border-subtle bg-[hsl(var(--surface-sunken))] px-5 py-5 sm:px-8 sm:py-6">
+      <section data-analytics-motion-panel className="rounded-2xl border border-border-subtle bg-[hsl(var(--surface-sunken))] p-3 sm:p-4">
         {/* Source filter + actions row */}
-        <div className="mb-5 flex items-start justify-between gap-3">
-          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2 sm:flex-nowrap sm:overflow-x-auto sm:[scrollbar-width:none] sm:[&::-webkit-scrollbar]:hidden" role="radiogroup" aria-label="Source filter">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <div
+            className="inline-flex min-w-0 items-center gap-0.5 overflow-x-auto rounded-full border border-border-subtle bg-[hsl(var(--surface))] p-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+            role="radiogroup"
+            aria-label="Source filter"
+          >
             {(['all', 'claude', 'codex', 'opencode', 'dsh'] as UsageSourceFilter[]).map((source) => (
               <button
                 key={source}
@@ -492,13 +497,11 @@ export function Analytics() {
                 aria-checked={usageSource === source}
                 onClick={() => setUsageSource(source)}
                 className={cn(
-                  'shrink-0 rounded-full px-4 py-1.5 text-sm transition-all duration-200',
-                  'tracking-[-0.01em]',
+                  'shrink-0 rounded-full px-3 py-1 text-[13px] transition-colors duration-150',
                   usageSource === source
-                    ? 'border-2 border-primary bg-[hsl(var(--surface))] font-medium text-foreground shadow-sm'
-                    : 'border border-border-subtle bg-[hsl(var(--surface))] text-muted-foreground hover:text-foreground'
+                    ? 'bg-foreground font-medium text-background'
+                    : 'text-muted-foreground hover:bg-[hsl(var(--surface-sunken))] hover:text-foreground'
                 )}
-                style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}
               >
                 {source === 'all' && t('analytics.sourceAll')}
                 {source === 'claude' && t('analytics.sourceClaude')}
@@ -509,68 +512,95 @@ export function Analytics() {
             ))}
           </div>
 
-          <div className="flex items-center gap-2">
-            <button
-              data-analytics-motion-action
-              type="button"
-              disabled={isRefreshing}
-              onClick={() => void handleRefresh()}
-              className="flex h-9 w-9 items-center justify-center rounded-full bg-[hsl(var(--surface))] text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50"
-              aria-label="Refresh"
-            >
-              <RefreshCw className={cn('h-4 w-4', isRefreshing && 'animate-spin')} />
-            </button>
-            <button
-              data-analytics-motion-action
-              type="button"
-              onClick={() => setShowSharePoster(true)}
-              className="flex h-9 w-9 items-center justify-center rounded-full bg-[hsl(var(--surface))] text-muted-foreground transition-colors hover:text-foreground"
-              aria-label={t('analytics.sharePoster')}
-            >
-              <Share2 className="h-4 w-4" />
-            </button>
+          <div className="flex shrink-0 items-center gap-1">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  data-analytics-motion-action
+                  type="button"
+                  disabled={isRefreshing}
+                  onClick={() => void handleRefresh()}
+                  className="flex h-8 w-8 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-[hsl(var(--surface))] hover:text-foreground disabled:opacity-50"
+                  aria-label={t('analytics.refresh')}
+                >
+                  <RefreshCw className={cn('h-4 w-4', isRefreshing && 'animate-spin')} />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>{t('analytics.refresh')}</TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  data-analytics-motion-action
+                  type="button"
+                  onClick={() => setShowSharePoster(true)}
+                  className="flex h-8 w-8 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-[hsl(var(--surface))] hover:text-foreground"
+                  aria-label={t('analytics.sharePoster')}
+                >
+                  <Share2 className="h-4 w-4" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>{t('analytics.sharePoster')}</TooltipContent>
+            </Tooltip>
           </div>
         </div>
 
-        <div className="grid gap-5 border-t border-[hsl(var(--border-subtle)/0.5)] pt-5 xl:grid-cols-[minmax(320px,0.4fr)_minmax(620px,1fr)] xl:gap-7">
-          <div className="grid min-w-0 grid-cols-2 gap-x-5 gap-y-4 xl:border-r xl:border-[hsl(var(--border-subtle)/0.5)] xl:pr-7">
-            <MetricCell
-              value={animatedTotalTokens.toLocaleString()}
-              label={t('analytics.totalTokens')}
-              trend={tokenChange}
-              featured
-              className="col-span-2"
-            />
-            <MetricCell
-              value={`$${(animatedTotalCostCents / 100).toFixed(2)}`}
-              label={totalCostIncomplete ? t('analytics.costKnown') : t('analytics.costTotal')}
-              annotation={totalCostIncomplete ? `+${totalUnpricedTokens.toLocaleString()} unpriced tokens` : undefined}
-            />
-            <MetricCell
-              value={`$${(animatedWeeklyCostCents / 100).toFixed(2)}`}
-              label={weeklyCostIncomplete ? t('analytics.costKnown') : t('analytics.costThisWeek')}
-            />
-            <MetricCell
-              value={animatedWeeklyTokens.toLocaleString()}
-              label={t('analytics.tokenThisWeek')}
-            />
-            <MetricCell
-              value={String(animatedStreakDays)}
-              label={t('analytics.streak')}
-              suffix={
-                <Flame
-                  className={cn(
-                    'h-4 w-4 transition-colors duration-300',
-                    streakDays >= 7 ? 'text-[hsl(25_90%_50%)] drop-shadow-[0_0_4px_hsl(25_90%_50%/0.4)]' : 'text-muted-foreground'
-                  )}
-                />
-              }
-            />
-          </div>
+        <div className="grid grid-cols-2 gap-2 sm:gap-3 lg:grid-cols-4">
+          <MetricTile
+            label={t('analytics.totalTokens')}
+            value={formatKpiTokens(animatedTotalTokens)}
+            title={totalTokensRaw.toLocaleString()}
+            meta={<span className="tabular-nums">{totalTokensRaw.toLocaleString()}</span>}
+          />
+          <MetricTile
+            label={t('analytics.tokenThisWeek')}
+            value={formatKpiTokens(animatedWeeklyTokens)}
+            title={weeklyTokensRaw.toLocaleString()}
+            meta={tokenChange != null ? <TrendBadge value={tokenChange} label={t('analytics.vsLastWeek')} /> : null}
+          />
+          <MetricTile
+            label={t('analytics.costTotal')}
+            value={formatUsd(animatedTotalCostCents / 100)}
+            badge={totalCostIncomplete ? (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span
+                    data-testid="cost-incomplete-annotation"
+                    tabIndex={0}
+                    className="cursor-help rounded-full bg-[hsl(var(--warning)/0.12)] px-1.5 py-0.5 text-[11px] font-medium leading-none text-[hsl(var(--warning-foreground))]"
+                  >
+                    {t('analytics.costPartial')}
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent>
+                  {t('analytics.unpricedTokens', { count: formatKpiTokens(totalUnpricedTokens) })}
+                </TooltipContent>
+              </Tooltip>
+            ) : null}
+            meta={(
+              <span className="tabular-nums">
+                {t('analytics.thisWeekValue', { value: formatUsd(animatedWeeklyCostCents / 100) })}
+                {weeklyCostIncomplete && ` · ${t('analytics.costPartial')}`}
+              </span>
+            )}
+          />
+          <MetricTile
+            label={t('analytics.streak')}
+            value={String(animatedStreakDays)}
+            unit={t('analytics.days')}
+            badge={(
+              <Flame
+                className={cn(
+                  'h-4 w-4 transition-colors duration-300',
+                  streakDays >= 7 ? 'text-[hsl(25_90%_50%)]' : 'text-muted-foreground/60'
+                )}
+              />
+            )}
+          />
+        </div>
 
-          <div className="min-w-0">
-            <HeatmapCalendar activities={dailyActivities} compact={false} />
-          </div>
+        <div data-analytics-motion-cell className="mt-2 rounded-xl bg-[hsl(var(--surface))] px-4 py-4 sm:mt-3 sm:px-5">
+          <HeatmapCalendar activities={dailyActivities} compact={false} />
         </div>
       </section>
 
@@ -604,72 +634,69 @@ export function Analytics() {
   );
 }
 
-/** A single metric in the horizontal row */
-function MetricCell({
-  value,
+function formatKpiTokens(n: number): string {
+  const value = Math.abs(n);
+  if (value >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
+  if (value >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
+  if (value >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+  return String(Math.round(n));
+}
+
+const usdFormatter = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' });
+
+function formatUsd(n: number): string {
+  return usdFormatter.format(n);
+}
+
+function TrendBadge({ value, label }: { value: number; label: string }) {
+  const up = value >= 0;
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <span
+        className={cn(
+          'inline-flex items-center gap-0.5 rounded-full px-1.5 py-0.5 text-[11px] font-medium leading-none tabular-nums',
+          up
+            ? 'bg-[hsl(var(--success)/0.12)] text-[hsl(var(--success))]'
+            : 'bg-[hsl(var(--destructive)/0.1)] text-[hsl(var(--destructive))]'
+        )}
+      >
+        {up ? <TrendingUp className="h-3 w-3" /> : <TrendingDown className="h-3 w-3" />}
+        {Math.abs(value).toFixed(1)}%
+      </span>
+      <span>{label}</span>
+    </span>
+  );
+}
+
+/** One KPI tile: label on top, headline value, optional one-line context below. */
+function MetricTile({
   label,
-  trend,
-  suffix,
-  annotation,
-  featured = false,
-  className,
+  value,
+  unit,
+  title,
+  badge,
+  meta,
 }: {
-  value: string;
   label: string;
-  trend?: number | null;
-  suffix?: React.ReactNode;
-  annotation?: string;
-  featured?: boolean;
-  className?: string;
+  value: string;
+  unit?: string;
+  title?: string;
+  badge?: React.ReactNode;
+  meta?: React.ReactNode;
 }) {
   return (
-    <div data-analytics-motion-cell className={cn('min-w-0 border-t border-[hsl(var(--border-subtle)/0.42)] pt-2.5 first:border-t-0 first:pt-0', className)}>
-      <div className="flex min-w-0 items-center gap-2">
-        <span
-          className={cn(
-            'min-w-0 truncate font-semibold tabular-nums text-foreground',
-            featured ? 'text-[1.65rem] leading-none sm:text-[2rem]' : 'text-[1.22rem] leading-tight sm:text-[1.45rem]'
-          )}
-          style={{
-            fontFamily: 'system-ui, -apple-system, sans-serif',
-            letterSpacing: '-0.02em',
-          }}
-        >
+    <div data-analytics-motion-cell className="flex min-w-0 flex-col rounded-xl bg-[hsl(var(--surface))] px-4 py-3.5">
+      <div className="flex min-w-0 items-center justify-between gap-2">
+        <span className="truncate text-xs text-muted-foreground">{label}</span>
+        {badge}
+      </div>
+      <div className="mt-2 flex min-w-0 items-baseline gap-1" title={title}>
+        <span className="truncate text-[1.6rem] font-semibold leading-none tracking-[-0.02em] tabular-nums text-foreground">
           {value}
         </span>
-        {suffix}
-        {trend != null && (
-          <span
-            className={cn(
-              'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium tabular-nums',
-              trend >= 0
-                ? 'bg-[hsl(var(--success)/0.1)] text-[hsl(var(--success))]'
-                : 'bg-[hsl(var(--destructive)/0.1)] text-[hsl(var(--destructive))]'
-            )}
-          >
-            {trend >= 0 ? (
-              <TrendingUp className="h-3 w-3" />
-            ) : (
-              <TrendingDown className="h-3 w-3" />
-            )}
-            {Math.abs(trend).toFixed(1)}%
-          </span>
-        )}
+        {unit && <span className="text-sm text-muted-foreground">{unit}</span>}
       </div>
-      <span
-        className="mt-1.5 block text-sm text-muted-foreground"
-        style={{
-          fontFamily: 'system-ui, -apple-system, sans-serif',
-          letterSpacing: '-0.01em',
-        }}
-      >
-        {label}
-      </span>
-      {annotation && (
-        <span data-testid="cost-incomplete-annotation" className="mt-0.5 block text-xs text-[hsl(var(--warning-foreground))]">
-          {annotation}
-        </span>
-      )}
+      <div className="mt-2 min-h-[18px] truncate text-xs text-muted-foreground">{meta}</div>
     </div>
   );
 }
