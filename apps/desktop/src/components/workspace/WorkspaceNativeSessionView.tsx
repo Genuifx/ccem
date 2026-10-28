@@ -310,6 +310,8 @@ interface WorkspaceNativeSessionViewProps {
    * are visible but only the focused one owns these.
    */
   isFocused?: boolean;
+  /** Split-view pane: tighter transcript gutters and a compact composer. */
+  compact?: boolean;
   onSessionUpdate: (session: NativeSessionSummary) => void;
   onStartNew: () => void;
   codexInstalled?: boolean;
@@ -1519,6 +1521,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
   workspaceCommands = [],
   isVisible = true,
   isFocused = isVisible,
+  compact = false,
   onSessionUpdate,
   onStartNew,
   codexInstalled = false,
@@ -4641,7 +4644,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
       ) : null}
 
       <ScrollArea viewportRef={containerRef} className="workspace-transcript-scroll flex-1 bg-background/30">
-        <div ref={contentRef} className="relative mx-auto max-w-[960px] px-8 py-8">
+        <div ref={contentRef} className={cn('relative mx-auto max-w-[960px]', compact ? 'px-5 py-5' : 'px-8 py-8')}>
           <WorkspaceTranscriptSelection
             rootRef={containerRef}
             contentRef={contentRef}
@@ -4710,7 +4713,8 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
         recoveryDraftKey={recoveryDraftKey('live', session.runtime_id)}
         onValueChange={handleComposerTextChange}
         onSubmit={handleSend}
-        placeholder={t('workspace.composePlaceholder')}
+        placeholder={compact ? t('workspace.splitComposerPlaceholder') : t('workspace.composePlaceholder')}
+        compact={compact}
         disabled={isTerminalStatus(session.status) && session.lifecycle?.active_command_id == null}
         canSubmit={canSend}
         isSubmitting={false}

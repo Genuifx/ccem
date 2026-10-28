@@ -193,6 +193,8 @@ interface WorkspaceSessionComposerProps {
   onValueChange: (value: string) => void;
   onSubmit: (payload: ComposerSubmitPayload) => ComposerSubmitResult | Promise<ComposerSubmitResult>;
   placeholder: string;
+  /** Dense layout for split-view panes: short prompt area, tight chrome. */
+  compact?: boolean;
   disabled?: boolean;
   canSubmit: boolean;
   isSubmitting?: boolean;
@@ -918,6 +920,7 @@ export function WorkspaceSessionComposer({
   onValueChange,
   onSubmit,
   placeholder,
+  compact = false,
   disabled = false,
   canSubmit,
   isSubmitting = false,
@@ -1934,7 +1937,7 @@ export function WorkspaceSessionComposer({
   }, { dependencies: [resolvedActionLabel, isSubmitting], scope: composerShellRef, revertOnUpdate: true });
 
   return (
-    <div className="shrink-0 px-2 pb-3 pt-2 sm:px-4">
+    <div className={cn('shrink-0', compact ? 'px-3 pb-3 pt-1' : 'px-2 pb-3 pt-2 sm:px-4')}>
       <div ref={composerShellRef} className="relative mx-auto w-full max-w-5xl">
         {floatingAboveComposer ? (
           <div data-composer-attention-layout="overlay" className="workspace-attention-dock pointer-events-none absolute inset-x-0 bottom-[calc(100%-18px)] z-30 flex justify-center">
@@ -1990,6 +1993,7 @@ export function WorkspaceSessionComposer({
           data-composer-drop-active={isDragTarget || undefined}
           className={cn(
             'relative z-20 rounded-[20px] border border-border/40 bg-surface-raised px-5 py-3 shadow-[0_40px_120px_-70px_rgba(0,0,0,0.38)] transition-[border-color,box-shadow] duration-300',
+            compact && 'rounded-[14px] px-3.5 py-2 shadow-[0_1px_2px_hsl(var(--glass-shadow-base)/0.06)]',
             isDragTarget && 'border-primary/45 ring-4 ring-primary/10',
             planModeEnabled && 'border-primary/15',
           )}
@@ -2150,7 +2154,7 @@ export function WorkspaceSessionComposer({
               </div>
             </div>
           ) : null}
-          <div className="relative min-h-[72px]">
+          <div className={cn('relative', compact ? 'min-h-[24px]' : 'min-h-[72px]')}>
             <PromptArea
               ref={promptAreaRef}
               value={composerSegments}
@@ -2158,8 +2162,8 @@ export function WorkspaceSessionComposer({
               triggers={promptAreaTriggers}
               placeholder={placeholder}
               disabled={disabled}
-              minHeight={72}
-              maxHeight={260}
+              minHeight={compact ? 24 : 72}
+              maxHeight={compact ? 160 : 260}
               autoGrow
               markdown={false}
               onSubmit={() => void handleComposerSubmit()}
@@ -2218,7 +2222,10 @@ export function WorkspaceSessionComposer({
           <div
             ref={composerFooterRef}
             data-compact={composerFooterCompact || undefined}
-            className="group/composer-footer mt-2 flex flex-wrap items-center gap-2.5 border-t border-border/40 pt-2"
+            className={cn(
+              'group/composer-footer flex flex-wrap items-center gap-2.5 border-t border-border/40',
+              compact ? 'mt-1.5 pt-1.5' : 'mt-2 pt-2',
+            )}
           >
             <ComposerQuickMenu
               codexInstalled={codexInstalled}

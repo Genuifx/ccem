@@ -4401,7 +4401,7 @@ export function Workspace({
                   } : undefined}
                   className={cn(
                     'relative min-h-0 flex-1 overflow-hidden',
-                    workspaceMode === 'live' && activeLiveEntry ? (isSplitView ? 'grid gap-2 pt-1' : 'block') : 'hidden',
+                    workspaceMode === 'live' && activeLiveEntry ? (isSplitView ? 'workspace-split-grid grid' : 'block') : 'hidden',
                   )}
                 >
                   {liveSessionEntries.map((entry) => {
@@ -4427,29 +4427,14 @@ export function Workspace({
                         className={cn(
                           'min-h-0',
                           isSplitPane
-                            ? cn(
-                              'relative flex min-w-0 flex-col overflow-hidden rounded-xl border bg-background/40 transition-[border-color,box-shadow] duration-150',
-                              isActiveLiveEntry
-                                ? 'border-primary/35 shadow-[0_0_0_1px_hsl(var(--primary)/0.12)]'
-                                : 'border-[var(--glass-border-light)] opacity-[0.92] hover:opacity-100',
-                            )
+                            ? 'workspace-split-pane group/split-pane relative flex min-w-0 flex-col overflow-hidden'
                             : cn('absolute inset-0', isActiveLiveEntry ? 'flex flex-col' : 'hidden'),
                         )}
                       >
                         {isSplitPane ? (
-                          <div className="flex h-8 shrink-0 items-center gap-2 border-b border-[var(--glass-border-light)] pl-3 pr-1">
+                          <div className="workspace-split-pane-header flex h-9 shrink-0 items-center gap-2 pl-3.5 pr-1.5">
                             <span
-                              className={cn(
-                                'h-1.5 w-1.5 shrink-0 rounded-full',
-                                isActiveLiveEntry ? 'bg-primary' : 'bg-muted-foreground/30',
-                              )}
-                              aria-label={isActiveLiveEntry ? t('workspace.splitFocusedPane') : undefined}
-                            />
-                            <span
-                              className={cn(
-                                'min-w-0 flex-1 truncate text-xs font-medium',
-                                isActiveLiveEntry ? 'text-foreground' : 'text-muted-foreground',
-                              )}
+                              className="min-w-0 flex-1 truncate text-[12.5px] font-medium"
                               title={entry.session.project_dir}
                             >
                               {toLiveHistorySessionItem(entry)?.display
@@ -4460,7 +4445,11 @@ export function Workspace({
                               type="button"
                               variant="ghost"
                               size="icon"
-                              className="h-6 w-6 shrink-0 text-muted-foreground hover:text-foreground"
+                              className={cn(
+                                'h-6 w-6 shrink-0 rounded-md text-muted-foreground transition-opacity duration-150 hover:text-foreground',
+                                'opacity-0 focus-visible:opacity-100 group-hover/split-pane:opacity-100',
+                                isActiveLiveEntry && 'opacity-100',
+                              )}
                               aria-label={t('workspace.splitClosePane')}
                               title={t('workspace.splitClosePane')}
                               onClick={(event) => {
@@ -4484,6 +4473,7 @@ export function Workspace({
                           workspaceCommands={workspaceCommands}
                           isVisible={isActive && (isActiveLiveEntry || isSplitPane)}
                           isFocused={isActive && isActiveLiveEntry}
+                          compact={isSplitPane}
                           onSessionUpdate={handleLiveSessionUpdate}
                           codexInstalled={codexInstalled}
                           opencodeInstalled={opencodeInstalled}

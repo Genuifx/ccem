@@ -1833,6 +1833,47 @@
     0 8px 24px hsl(40 10% 10% / 0.03);
 }
 
+/* === Workspace split view ===
+   Panes are regions of the one reading surface, not cards inside it: a
+   hairline grid (the 1px gap shows the divider colour), like editor groups.
+   The focused pane is marked by a primary rim on its header. */
+.workspace-split-grid {
+  gap: 1px;
+  background: hsl(var(--border) / 0.7);
+}
+
+.workspace-split-pane {
+  background: hsl(var(--reading-surface));
+}
+
+.workspace-split-pane-header {
+  position: relative;
+  color: hsl(var(--muted-foreground));
+  border-bottom: 1px solid hsl(var(--border) / 0.5);
+  transition:
+    color var(--duration-fast) ease-out,
+    background-color var(--duration-fast) ease-out;
+}
+
+.workspace-split-pane[data-ccem-split-pane-focused='true'] .workspace-split-pane-header {
+  color: hsl(var(--foreground));
+  background: hsl(var(--primary) / 0.04);
+}
+
+.workspace-split-pane-header::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto;
+  height: 2px;
+  background: hsl(var(--primary) / 0.85);
+  opacity: 0;
+  transition: opacity var(--duration-fast) ease-out;
+}
+
+.workspace-split-pane[data-ccem-split-pane-focused='true'] .workspace-split-pane-header::before {
+  opacity: 1;
+}
+
 .workspace-browser-panel {
   --browser-chrome-background: hsl(var(--background) / 0.96);
   background: var(--browser-chrome-background);
