@@ -22,6 +22,7 @@ The file-size CI gate blocks new source files over 2000 lines unless they are do
 - `apps/desktop/src-tauri/src/weixin/mod.rs`: Weixin bridge integration remains a large monolith and needs phased extraction.
 - `apps/desktop/src-tauri/resources/native-runtime-helper.mjs`: Generated bundled sidecar resource mirrors the native-runtime-helper build output and is not maintained as hand-written source.
 - `apps/desktop/src-tauri/resources/dsh-history/lib/dsh-history-helper.mjs`: Generated DSH history sidecar resource mirrors the bundled helper build output and is not maintained as hand-written source.
+- `apps/desktop/src/components/workspace/ProjectTree.tsx`: Workspace project tree rendering and filtering have grown past the gate on main and await incremental splitting.
 - `apps/desktop/src/components/workspace/WorkspaceMessageBubble.tsx`: Workspace transcript rendering is still bundled with attachment, diff, and tool-call presentation during the workspace redesign.
 - `apps/desktop/src/components/workspace/WorkspaceNativeSessionView.tsx`: Native workspace transcript, attention handling, and composer orchestration remain concentrated during the workspace redesign.
 - `apps/desktop/src/pages/Workspace.tsx`: Workspace navigation, history, compose, and live-session coordination remain centralized during the workspace redesign.
