@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CCEM — 编排每一个模型</title>
+<meta name="description" content="CCEM：让 Claude 与 Codex 编排更划算的模型。按 subagent 路由、11 个模型预设一键切换、会话随时交给 Telegram / 微信 / 企业微信 / 飞书机器人。免费开源。" />
+<meta property="og:title" content="CCEM — Orchestrate every model." />
+<meta property="og:description" content="Orchestration, per-subagent routing, multi-model presets and portable chat-bot sessions for Claude Code, Codex and OpenCode." />
+<meta property="og:image" content="assets/workspace.webp" />
+<meta name="theme-color" content="#050507" />
+<script>
+  // Resolve the theme before first paint: saved choice, else the system preference.
+  (function () {
+    var t = localStorage.getItem('ccem-theme') || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+    document.documentElement.dataset.theme = t;
+  })();
+</script>
+<link rel="icon" href="assets/logo.png" />
+<link rel="stylesheet" href="styles.css" />
+<script type="importmap">{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.186.1/build/three.module.min.js" } }</script>
+</head>
+<body>
+
+<header class="gnav">
+  <nav class="gnav-inner" aria-label="Global">
+    <a class="gnav-brand" href="#top"><img src="assets/logo.png" alt="" width="20" height="20" />CCEM</a>
+    <div class="gnav-links">
+      <a href="#orchestrator" data-en="Orchestrator">编排</a>
+      <a href="#routing" data-en="Routing">路由</a>
+      <a href="#models" data-en="Models">多模型</a>
+      <a href="#bots" data-en="Bots">机器人</a>
+      <a href="https://github.com/Genuifx/ccem" target="_blank" rel="noopener">GitHub</a>
+    </div>
+    <div class="gnav-actions">
+      <button class="theme-toggle" type="button" aria-label="Toggle light/dark theme">
+        <svg class="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" /></svg>
+        <svg class="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></svg>
+      </button>
+      <button class="lang-toggle" type="button" aria-label="Switch language">EN</button>
+      <a class="btn-utility" href="#download" data-en="Download">下载</a>
+    </div>
+  </nav>
+</header>
+
+<main id="top">
+
+  <!-- Scroll-driven 3D story -->
+  <section class="stage" id="story" data-chapter="0" aria-label="CCEM overview">
+    <div class="stage-sticky">
+      <canvas class="stage-canvas" aria-hidden="true"></canvas>
+      <div class="stage-fallback" aria-hidden="true"></div>
+
+      <div class="stage-labels" aria-hidden="true">
+        <span class="node-label is-plan" data-node="claude">Claude<small class="tag" data-ch="1" data-en="planning">规划中</small><small class="tag" data-ch="2" data-en="main thread">主线程</small></span>
+        <span class="node-label is-plan" data-node="codex">Codex<small class="tag" data-ch="1" data-en="planning">规划中</small></span>
+        <span class="node-label" data-node="deepseek">DeepSeek<small class="tag" data-ch="1" data-en="auth tests">鉴权测试</small><small class="tag" data-ch="2" data-en="background">后台任务</small></span>
+        <span class="node-label" data-node="glm">GLM<small class="tag" data-ch="1" data-en="API docs">API 文档</small><small class="tag" data-ch="2">Explore</small></span>
+        <span class="node-label" data-node="kimi">KIMI<small class="tag" data-ch="1" data-en="config keys">配置项</small></span>
+        <span class="node-label" data-node="qwen">Qwen<small class="tag" data-ch="1" data-en="lint triage">lint 整理</small></span>
+        <span class="node-label" data-node="minimax">MiniMax</span>
+        <span class="node-label" data-node="mimo">MiMo</span>
+        <span class="node-label" data-node="openrouter">OpenRouter</span>
+        <span class="node-label" data-node="ollama">Ollama</span>
+        <span class="node-label is-bot" data-node="telegram">Telegram</span>
+        <span class="node-label is-bot" data-node="wechat" data-en="WeChat">微信</span>
+        <span class="node-label is-bot" data-node="wecom" data-en="WeCom">企业微信</span>
+        <span class="node-label is-bot" data-node="feishu" data-en="Feishu">飞书</span>
+      </div>
+
+      <div class="chapter chapter-hero" data-i="0">
+        <p class="eyebrow load" style="--d:0">Claude Code · Codex · OpenCode</p>
+        <h1 class="hero-title load" style="--d:1" data-en="Orchestrate<br />every model">编排<br />每一个模型</h1>
+        <p class="lead load" style="--d:2" data-en="Your best model plans. Best-value models do the work. Every subagent is routed, and every session follows you to your phone.">最好的模型负责规划，更划算的模型负责干活。每个 subagent 都有路由，每个会话都能跟你到手机上。</p>
+        <div class="cta-row load" style="--d:3">
+          <a class="btn-primary" href="#download" data-en="Download for Desktop">下载桌面版</a>
+          <button class="btn-ghost" type="button" data-copy="npx ccem"><code>npx ccem</code><span class="copy-hint" data-en="Copy">复制</span></button>
+        </div>
+      </div>
+
+      <article class="chapter" data-i="1">
+        <p class="chapter-no">01 · <span data-en="Orchestrator">编排</span></p>
+        <h2 data-en="Claude plans<br />CCEM hands off">Claude 规划<br />CCEM 派活</h2>
+        <p data-en="With the bundled ccem agent skill, the Claude and Codex apps keep planning on your best model and start background sessions on cheaper environments for the routine part — then read their events, send follow-ups and pull results back.">装上内置的 ccem agent skill，Claude 和 Codex 继续用最好的模型做规划，把常规部分作为后台会话派给更划算的环境，再读取事件、发送追问、取回结果。</p>
+        <code class="chapter-cmd">ccem desktop create --env deepseek</code>
+      </article>
+
+      <article class="chapter" data-i="2">
+        <p class="chapter-no">02 · <span data-en="Routing">路由</span></p>
+        <h2 data-en="Every subagent<br />on the right model">每个 subagent<br />都走对的模型</h2>
+        <p data-en="Turn on dynamic routing and the session runs through a local proxy on 127.0.0.1: Explore goes to GLM, background tasks to DeepSeek, and the main thread follows your composer. Re-bind mid-session.">开启动态路由后，会话经由本地 127.0.0.1 的路由代理：Explore 发给 GLM，后台任务发给 DeepSeek，主线程跟随你选的环境。会话进行中也能改绑。</p>
+        <code class="chapter-cmd">ccem desktop routes &lt;id&gt; --set Explore=glm</code>
+      </article>
+
+      <article class="chapter" data-i="3">
+        <p class="chapter-no">03 · <span data-en="Multi-model">多模型</span></p>
+        <h2 data-en="11 presets<br />One keystroke">11 个预设<br />一键切换</h2>
+        <p data-en="GLM, KIMI, DeepSeek, Qwen, MiniMax, MiMo, OpenRouter, Ollama and more. Pick a preset, paste a key, and Opus / Sonnet / Haiku tiers map to the right models. CLI and Desktop share one config.">GLM、KIMI、DeepSeek、Qwen、MiniMax、MiMo、OpenRouter、Ollama 等。选预设、粘贴密钥，Opus / Sonnet / Haiku 三档自动映射。CLI 与桌面版共用一份配置。</p>
+        <code class="chapter-cmd">ccem use kimi</code>
+      </article>
+
+      <article class="chapter" data-i="4">
+        <p class="chapter-no">04 · <span data-en="Bots">机器人</span></p>
+        <h2 data-en="Leave your desk<br />The session comes along">离开工位<br />会话跟你走</h2>
+        <p data-en="Hand a running session to a paired bot — Hermes-powered WeCom and Feishu, plus Telegram, WeChat and WeCom bridges. Hermes decides which updates are worth sending; reply in chat and the session continues.">把正在运行的会话交给已配对的机器人：Hermes 驱动的企业微信与飞书，以及 Telegram、微信、企业微信桥接。Hermes 决定哪些进展值得推送，你在聊天里回复，会话就接着跑。</p>
+        <code class="chapter-cmd">ccem bot-bind</code>
+      </article>
+
+      <p class="scroll-cue load" style="--d:5"><span data-en="Scroll to explore">向下滚动</span><i></i></p>
+
+      <nav class="stage-dots" aria-label="Chapters">
+        <button type="button" aria-label="Intro"></button>
+        <button type="button" aria-label="Orchestrator"></button>
+        <button type="button" aria-label="Routing"></button>
+        <button type="button" aria-label="Models"></button>
+        <button type="button" aria-label="Bots"></button>
+      </nav>
+    </div>
+  </section>
+
+  <!-- 01 Orchestrator -->
+  <section class="tile" id="orchestrator">
+    <div class="split">
+      <div class="split-copy reveal">
+        <p class="eyebrow">01 · <span data-en="Orchestrator">编排</span></p>
+        <h2 class="display" data-en="Stop paying top-model prices for busywork">别再用顶级模型<br />干杂活</h2>
+        <p class="body-lg muted" data-en="The app you're talking to stays the planner. CCEM gives it four verbs to run a team of cheaper agents.">你正在对话的应用继续当规划者。CCEM 给它四个动作，去指挥一队更便宜的 agent。</p>
+        <ol class="verbs">
+          <li><code>create</code><span data-en="start a background session on any environment">在任意环境启动后台会话</span></li>
+          <li><code>events</code><span data-en="read what it did, incrementally">增量读取它做了什么</span></li>
+          <li><code>send</code><span data-en="follow up, idempotent with --message-id">追加指令，可用 --message-id 去重</span></li>
+          <li><code>routes</code><span data-en="re-bind a routing key mid-session">会话中途改绑路由</span></li>
+        </ol>
+      </div>
+      <div class="handoff reveal tilt" aria-label="Delegation demo">
+        <div class="handoff-head">
+          <span class="planner"><i class="dot dot-accent"></i>Claude · <span data-en="planning">规划中</span></span>
+          <span class="handoff-sub" data-en="redesign data flow">重构数据流</span>
+        </div>
+        <ul class="handoff-list">
+          <li style="--i:0"><span class="task" data-en="write auth tests">写鉴权测试</span><span class="model">DeepSeek</span><span class="cost">$<b>$$</b></span><span class="status"></span></li>
+          <li style="--i:1"><span class="task" data-en="update API docs">更新 API 文档</span><span class="model">GLM</span><span class="cost">$<b>$$</b></span><span class="status"></span></li>
+          <li style="--i:2"><span class="task" data-en="rename config keys">重命名配置项</span><span class="model">KIMI</span><span class="cost">$$<b>$</b></span><span class="status"></span></li>
+          <li style="--i:3"><span class="task" data-en="triage lint errors">整理 lint 报错</span><span class="model">Qwen</span><span class="cost">$<b>$$</b></span><span class="status"></span></li>
+        </ul>
+        <p class="handoff-foot" data-en="Background sessions · tracked in CCEM">后台会话 · 在 CCEM 中统一跟踪</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 02 Routing -->
+  <section class="tile tile-deep" id="routing">
+    <div class="center reveal">
+      <p class="eyebrow">02 · <span data-en="Routing">路由</span></p>
+      <h2 class="display" data-en="Why pay Opus prices for grep?">grep 何必用 Opus 的价钱？</h2>
+      <p class="body-lg muted" data-en="Per-subagent routing is opt-in per session. The top bar shows Direct or Routed at a glance.">按 subagent 路由，每个会话单独开启。顶栏一眼看出是直连还是已路由。</p>
+    </div>
+    <figure class="tilt-frame reveal"><img class="tilt" src="assets/routing.webp" width="2400" height="758" alt="Dynamic routing popover" loading="lazy" /></figure>
+    <div class="cards3">
+      <article class="fcard reveal">
+        <h3 data-en="Bind by subagent type">按 subagent 类型绑定</h3>
+        <p data-en="Send Explore, background tasks or any subagent type to its own environment.">把 Explore、后台任务或任意 subagent 类型绑定到各自的环境。</p>
+      </article>
+      <article class="fcard reveal">
+        <h3 data-en="Route profiles">路由档案</h3>
+        <p data-en="Save reusable profiles, or start from templates: Budget chores and Specialty split.">保存可复用的档案，或从「省钱杂活」「专长分工」模板生成。</p>
+      </article>
+      <article class="fcard reveal">
+        <h3 data-en="Routed usage">按路由看用量</h3>
+        <p data-en="See which environment handled what, and let the agent re-route itself within an allow-list.">看清每个环境处理了什么；也可以让 agent 在白名单内自行改路由。</p>
+      </article>
+    </div>
+  </section>
+
+  <!-- 03 Models -->
+  <section class="tile" id="models">
+    <div class="center reveal">
+      <p class="eyebrow">03 · <span data-en="Multi-model">多模型</span></p>
+      <h2 class="display" data-en="Every provider, one config">所有供应商，一份配置</h2>
+      <p class="body-lg muted" data-en="No more hand-exporting env vars across eight terminal tabs. Keys are encrypted with AES-256 and never leave your machine.">不用再在八个终端标签里手动 export。密钥以 AES-256 加密，只留在你的电脑上。</p>
+    </div>
+    <div class="models-grid">
+      <div class="switcher reveal">
+        <div class="chips" role="tablist" aria-label="Provider presets"></div>
+        <div class="terminal" aria-live="polite">
+          <div class="terminal-bar"><i></i><i></i><i></i><span>zsh</span></div>
+          <pre class="terminal-body"></pre>
+        </div>
+      </div>
+      <figure class="tilt-frame tilt-side reveal"><img class="tilt" src="assets/environments.webp" width="1239" height="1128" alt="CCEM Desktop environments" loading="lazy" /></figure>
+    </div>
+  </section>
+
+  <!-- 04 Bots -->
+  <section class="tile tile-deep" id="bots">
+    <div class="center reveal">
+      <p class="eyebrow">04 · <span data-en="Bots">机器人</span></p>
+      <h2 class="display" data-en="Your agents, in your pocket">口袋里的 agent</h2>
+      <p class="body-lg muted" data-en="A red test while you're out for coffee? Approve, steer or get results from the chat app you already use.">出门买咖啡时测试挂了？在你本来就用的聊天应用里审批、追问、收结果。</p>
+    </div>
+    <figure class="tilt-frame reveal"><img class="tilt" src="assets/chat-bots.webp" width="2400" height="942" alt="Remote control via chat bots" loading="lazy" /></figure>
+    <div class="cards4">
+      <article class="fcard reveal">
+        <h3 data-en="Hermes · WeCom &amp; Feishu">Hermes · 企业微信与飞书</h3>
+        <p data-en="Scan a QR code to create a bot, choose which workspaces it can reach.">扫码创建机器人，选择它能访问的工作区。</p>
+      </article>
+      <article class="fcard reveal">
+        <h3>Telegram</h3>
+        <p data-en="Forum Topics: one topic, one project, one long-lived session.">Forum Topics：一个话题对应一个项目、一个长期会话。</p>
+      </article>
+      <article class="fcard reveal">
+        <h3 data-en="WeChat">微信</h3>
+        <p data-en="QR login, user allowlist, and /approve or /deny for permission prompts.">扫码登录、用户白名单，用 /approve、/deny 处理权限请求。</p>
+      </article>
+      <article class="fcard reveal">
+        <h3 data-en="WeCom">企业微信</h3>
+        <p data-en="Multiple bots, admin/user separation, group chats with @mention.">多机器人、管理员与用户分离，群聊 @ 即触发。</p>
+      </article>
+    </div>
+  </section>
+
+  <!-- Download -->
+  <section class="tile tile-end" id="download">
+    <div class="center reveal">
+      <img class="end-logo" src="assets/logo.png" width="96" height="96" alt="" />
+      <h2 class="display" data-en="Free. Open source. Yours">免费，开源，归你所有</h2>
+      <p class="body-lg muted" data-en="Apache 2.0. A native Tauri app for macOS and Windows, plus a CLI that runs anywhere.">Apache 2.0 协议。原生 Tauri 桌面应用支持 macOS 与 Windows，CLI 哪里都能跑。</p>
+      <div class="dl-row">
+        <a class="dl" href="https://github.com/Genuifx/ccem/releases/latest" target="_blank" rel="noopener">
+          <span class="dl-os">macOS</span><span class="dl-sub">Apple Silicon · Intel · .dmg</span>
+        </a>
+        <a class="dl" href="https://github.com/Genuifx/ccem/releases/latest" target="_blank" rel="noopener">
+          <span class="dl-os">Windows</span><span class="dl-sub">x64 · .exe</span>
+        </a>
+        <button class="dl" type="button" data-copy="npm install -g ccem">
+          <span class="dl-os">npm</span><span class="dl-sub mono">npm install -g ccem</span>
+        </button>
+      </div>
+      <p class="links"><a href="https://github.com/Genuifx/ccem" target="_blank" rel="noopener" data-en="Star on GitHub ›">在 GitHub 上点个 Star ›</a></p>
+    </div>
+  </section>
+</main>
+
+<footer class="footer">
+  <div class="footer-inner">
+    <span>© 2026 Genuifx · Apache 2.0</span>
+    <span class="footer-links">
+      <a href="https://github.com/Genuifx/ccem" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://www.npmjs.com/package/ccem" target="_blank" rel="noopener">npm</a>
+      <a href="https://github.com/Genuifx/ccem/releases" target="_blank" rel="noopener">Releases</a>
+      <a href="https://deepwiki.com/Genuifx/ccem" target="_blank" rel="noopener">DeepWiki</a>
+    </span>
+  </div>
+</footer>
+
+<div class="toast" role="status" aria-live="polite"></div>
+<script src="main.js"></script>
+<script type="module" src="scene.js"></script>
+<script>
+  // If three.js can't load (offline / blocked CDN), show the static fallback.
+  setTimeout(() => { if (!document.documentElement.classList.contains('webgl-ready')) document.documentElement.classList.add('no-webgl'); }, 6000);
+</script>
+</body>
+</html>
