@@ -1,7 +1,7 @@
 import { memo, useMemo, useState, useCallback, useRef, useEffect, useLayoutEffect } from 'react';
 import { nestSessionsByParent } from './sessionLineage';
 import type { DragEvent, PointerEvent as ReactPointerEvent } from 'react';
-import { Archive, Check, Clock, Copy, FolderOpen, FolderTree, Link, Pin, RefreshCw, RotateCcw, X, Plus, ShieldAlert } from '@/lib/lucide-react';
+import { Archive, Check, Clock, Columns2, Copy, FolderOpen, FolderTree, Link, Pin, RefreshCw, RotateCcw, X, Plus, ShieldAlert } from '@/lib/lucide-react';
 import { cn } from '@/lib/utils';
 import { ccemMotion, clearMotionProps, gsap, shouldReduceMotion } from '@/lib/gsapMotion';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -11,6 +11,7 @@ import {
   ContextMenuContent,
   ContextMenuItem,
   ContextMenuSeparator,
+  ContextMenuShortcut,
   ContextMenuTrigger,
 } from '@/components/ui/context-menu';
 import { getHistorySessionDisplay } from '@/components/history/historySession';
@@ -75,6 +76,10 @@ interface ProjectTreeProps {
   isRefreshing?: boolean;
   selectedKey: string | null;
   onSelect: (session: HistorySessionItem) => void;
+  /** Session keys shown together in the workspace split view. */
+  splitSessionKeys?: ReadonlySet<string>;
+  /** Cmd/Ctrl+click: add the session to, or remove it from, the split view. */
+  onToggleSplit?: (session: HistorySessionItem) => void;
   onRefresh: () => void;
   /** Save a title override. Returns a promise so callers can await it. */
   onSaveTitle?: (session: HistorySessionItem, title: string) => Promise<void>;
@@ -527,6 +532,8 @@ export const ProjectTree = memo(function ProjectTree({
   isRefreshing = false,
   selectedKey,
   onSelect,
+  splitSessionKeys = EMPTY_SESSION_KEY_SET,
+  onToggleSplit,
   onRefresh,
   onSaveTitle,
   onSaveAnnotation,
@@ -567,6 +574,10 @@ export const ProjectTree = memo(function ProjectTree({
     return (key: string) => canonicalKeyBySessionKey[key] ?? key;
   }, [canonicalKeyBySessionKey]);
   const canonicalSelectedKey = selectedKey ? canonicalizeSessionKey(selectedKey) : null;
+  const canonicalSplitKeys = useMemo(
+    () => new Set(Array.from(splitSessionKeys, canonicalizeSessionKey)),
+    [canonicalizeSessionKey, splitSessionKeys],
+  );
 
   useEffect(() => {
     setPinnedSessionKeys((previous) => {
@@ -1455,6 +1466,7 @@ export const ProjectTree = memo(function ProjectTree({
     const rawKey = toKey(session);
     const key = canonicalizeSessionKey(rawKey);
     const isSelected = key === canonicalSelectedKey;
+    const isInSplit = canonicalSplitKeys.has(key);
     const isEditing = editingKey === key;
     const isPinned = pinnedSessionKeySet.has(key);
     const pinLabel = isPinned ? t('workspace.unpinSession') : t('workspace.pinSession');
@@ -1569,7 +1581,13 @@ export const ProjectTree = memo(function ProjectTree({
         onDragOver={options.pinnedSection ? (event) => handlePinnedDragOver(event, session) : undefined}
         onDrop={options.pinnedSection ? (event) => handlePinnedDrop(event, session) : undefined}
         onDragEnd={options.pinnedSection ? clearDragState : undefined}
-        onClick={() => onSelect(session)}
+        onClick={(event) => {
+          if ((event.metaKey || event.ctrlKey) && onToggleSplit) {
+            onToggleSplit(session);
+            return;
+          }
+          onSelect(session);
+        }}
         onDoubleClick={() => {
           setEditingKey(key);
           setEditValue(getHistorySessionDisplay(session, ''));
@@ -1588,6 +1606,7 @@ export const ProjectTree = memo(function ProjectTree({
           isSelected
             ? 'bg-primary/[0.08] text-primary'
             : 'hover:bg-muted/50 text-muted-foreground hover:text-foreground',
+          isInSplit && !isSelected && 'bg-primary/[0.04] text-foreground',
           options.pinnedSection && 'hover:bg-primary/[0.07]',
           options.pinnedSection && draggingKey !== key && 'cursor-grab active:cursor-grabbing',
           draggingKey === key && 'opacity-40'
@@ -1753,6 +1772,16 @@ export const ProjectTree = memo(function ProjectTree({
       <ContextMenu key={key}>
         <ContextMenuTrigger asChild>{row}</ContextMenuTrigger>
         <ContextMenuContent className="w-52">
+          {onToggleSplit && (
+            <>
+              <ContextMenuItem onClick={() => onToggleSplit(session)}>
+                <Columns2 className="mr-2 h-3.5 w-3.5" />
+                {isInSplit ? t('workspace.splitRemove') : t('workspace.splitAdd')}
+                <ContextMenuShortcut>{t('workspace.splitShortcut')}</ContextMenuShortcut>
+              </ContextMenuItem>
+              <ContextMenuSeparator />
+            </>
+          )}
           <ContextMenuItem
             onClick={() => {
               void copyText(session.id);
@@ -1800,6 +1829,7 @@ export const ProjectTree = memo(function ProjectTree({
   }, [
     archiveSessions,
     canonicalSelectedKey,
+    canonicalSplitKeys,
     canonicalizeSessionKey,
     clearDragState,
     copyText,
@@ -1820,6 +1850,7 @@ export const ProjectTree = memo(function ProjectTree({
     onArchiveSessions,
     onSaveAnnotation,
     onSelect,
+    onToggleSplit,
     originOfSession,
     pinnedSessionKeySet,
     projectActions,

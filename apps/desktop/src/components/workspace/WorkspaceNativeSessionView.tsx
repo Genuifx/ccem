@@ -304,6 +304,19 @@ interface WorkspaceNativeSessionViewProps {
   onRefreshSkills?: () => Promise<InstalledSkill[]>;
   workspaceCommands?: WorkspaceCommand[];
   isVisible?: boolean;
+  /**
+   * Owns workspace-wide surfaces (side panel, file links, review popover,
+   * text annotations). Defaults to `isVisible`; in split view several panes
+   * are visible but only the focused one owns these.
+   */
+  isFocused?: boolean;
+  /** Split-view pane: tighter transcript gutters and a compact composer. */
+  compact?: boolean;
+  /**
+   * When set, an ended session keeps a working composer: sending resumes the
+   * provider session into a new runtime (split-view panes).
+   */
+  onResumeTerminal?: (payload: ComposerSubmitPayload) => Promise<ComposerSubmitResult>;
   onSessionUpdate: (session: NativeSessionSummary) => void;
   onStartNew: () => void;
   codexInstalled?: boolean;
@@ -341,6 +354,8 @@ const ACTIVE_POLL_INTERVAL_MS = 140;
 const IDLE_POLL_INTERVAL_MS = 700;
 const TERMINAL_POLL_INTERVAL_MS = 1100;
 const FAILED_POLL_INTERVAL_MS = 5000;
+// Visible but unfocused split-view panes: still live, at a fraction of the cost.
+const BACKGROUND_PANE_POLL_INTERVAL_MS = { active: 700, idle: 2000, terminal: 3000 } as const;
 const SUMMARY_REFRESH_COOLDOWN_MS = 2000;
 // Streaming flushes of the sessionStorage mirror are trailing-edge and at
 // most one per interval; idle/terminal/switch/unmount flush immediately. The
@@ -1492,10 +1507,11 @@ export const WorkspaceNativeSessionView = memo(function WorkspaceNativeSessionVi
   // Workspace's contexts follow the selected owner. Keep those updates outside
   // hidden transcripts; memo alone cannot stop a context subscription. Revealing
   // a session supplies the current owner and callbacks in the same render.
-  const isVisible = props.isVisible !== false;
+  // Split-view panes (compact) never own the side panel: it is hidden there.
+  const ownsSidePanel = (props.isFocused ?? props.isVisible !== false) && !props.compact;
   return (
-    <WorkspaceSidePanelContext.Provider value={isVisible ? sidePanel : null}>
-      <WorkspaceFileLinkContext.Provider value={isVisible ? fileLinks : null}>
+    <WorkspaceSidePanelContext.Provider value={ownsSidePanel ? sidePanel : null}>
+      <WorkspaceFileLinkContext.Provider value={ownsSidePanel ? fileLinks : null}>
         <WorkspaceNativeSessionViewContent {...props} session={session} />
       </WorkspaceFileLinkContext.Provider>
     </WorkspaceSidePanelContext.Provider>
@@ -1512,6 +1528,9 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
   onRefreshSkills,
   workspaceCommands = [],
   isVisible = true,
+  isFocused = isVisible,
+  compact = false,
+  onResumeTerminal,
   onSessionUpdate,
   onStartNew,
   codexInstalled = false,
@@ -1640,9 +1659,9 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
   const reviewPanelOpen = useAppStore((state) => state.reviewPanelOpen);
   const setReviewPanelOpen = useAppStore((state) => state.setReviewPanelOpen);
   const setReviewEntry = useAppStore((state) => state.setReviewEntry);
-  const isReviewPopoverOpen = isVisible && reviewPanelOpen;
+  const isReviewPopoverOpen = isFocused && !compact && reviewPanelOpen;
   const sidePanel = useWorkspaceSidePanel();
-  const isReviewDetailOpen = isVisible && (isFileTab(sidePanel?.tab ?? null) || sidePanel?.tab === 'agents');
+  const isReviewDetailOpen = isFocused && !compact && (isFileTab(sidePanel?.tab ?? null) || sidePanel?.tab === 'agents');
   const [gitSnapshot, setGitSnapshot] = useState<WorkspaceGitSnapshot | null>(null);
   const [recentFiles, setRecentFiles] = useState<WorkspaceRecentFile[] | null>(null);
   const recentFilesRequestSeqRef = useRef(0);
@@ -2576,7 +2595,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
 
   // Publish review summary to the status-strip entry pill while this live session owns the view.
   useEffect(() => {
-    if (!isVisible) {
+    if (!isFocused) {
       return;
     }
     setReviewEntry({
@@ -2586,7 +2605,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
       artifacts: reviewSummary.artifacts,
     });
   }, [
-    isVisible,
+    isFocused,
     session.env_name,
     reviewSummary.failedTools,
     reviewSummary.changedFiles,
@@ -3084,15 +3103,22 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
     [attentionEvents],
   );
 
-  const pollIntervalMs = transcriptPollFailure?.runtimeId === session.runtime_id
-    ? FAILED_POLL_INTERVAL_MS
-    : isSending
+  const pollActivity = isSending
     || session.status === 'initializing'
     || session.status === 'processing'
-    ? ACTIVE_POLL_INTERVAL_MS
+    ? 'active'
     : isTerminalStatus(session.status)
-      ? TERMINAL_POLL_INTERVAL_MS
-      : IDLE_POLL_INTERVAL_MS;
+      ? 'terminal'
+      : 'idle';
+  const pollIntervalMs = transcriptPollFailure?.runtimeId === session.runtime_id
+    ? FAILED_POLL_INTERVAL_MS
+    : !isFocused
+      ? BACKGROUND_PANE_POLL_INTERVAL_MS[pollActivity]
+      : pollActivity === 'active'
+        ? ACTIVE_POLL_INTERVAL_MS
+        : pollActivity === 'terminal'
+          ? TERMINAL_POLL_INTERVAL_MS
+          : IDLE_POLL_INTERVAL_MS;
 
   useEffect(() => {
     if (!isVisible) {
@@ -3445,9 +3471,14 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
     || hasBackgroundTaskPanel;
   const canStopForeground = session.lifecycle?.active_command_id != null
     || (session.provider !== 'claude' && isProcessingTurn);
+  const canResumeTerminal = onResumeTerminal != null
+    && isTerminalStatus(session.status)
+    && session.lifecycle?.active_command_id == null;
+  // Ended and not resumable here: the composer turns into "new session".
+  const isTerminalLocked = isTerminalStatus(session.status) && !canResumeTerminal;
   const canSend = !isSending
     && !(session.provider !== 'claude' && isProcessingTurn)
-    && !isTerminalStatus(session.status)
+    && !isTerminalLocked
     && (composerHasDraft || sessionAnnotations.pendingAnnotations.length > 0);
   const canShowFileRestorePoints = session.provider === 'claude'
     && fileCheckpoints.length > 0;
@@ -4634,12 +4665,12 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
       ) : null}
 
       <ScrollArea viewportRef={containerRef} className="workspace-transcript-scroll flex-1 bg-background/30">
-        <div ref={contentRef} className="relative mx-auto max-w-[960px] px-8 py-8">
+        <div ref={contentRef} className={cn('relative mx-auto max-w-[960px]', compact ? 'px-5 py-5' : 'px-8 py-8')}>
           <WorkspaceTranscriptSelection
             rootRef={containerRef}
             contentRef={contentRef}
             scopeKey={`live:${session.runtime_id}`}
-            isActive={isVisible}
+            isActive={isFocused}
             canCreate={!isTerminalStatus(session.status)}
             canAdd={sessionAnnotations.canAddAnnotation}
             annotations={sessionAnnotations.annotations}
@@ -4702,9 +4733,12 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
         valueRevision={composerDraftRevision}
         recoveryDraftKey={recoveryDraftKey('live', session.runtime_id)}
         onValueChange={handleComposerTextChange}
-        onSubmit={handleSend}
-        placeholder={t('workspace.composePlaceholder')}
-        disabled={isTerminalStatus(session.status) && session.lifecycle?.active_command_id == null}
+        onSubmit={canResumeTerminal ? onResumeTerminal : handleSend}
+        placeholder={canResumeTerminal
+          ? t('workspace.splitResumePlaceholder')
+          : compact ? t('workspace.splitComposerPlaceholder') : t('workspace.composePlaceholder')}
+        compact={compact}
+        disabled={isTerminalLocked && session.lifecycle?.active_command_id == null}
         canSubmit={canSend}
         isSubmitting={false}
         submitLabel={t('workspace.composeSend')}
@@ -4712,7 +4746,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
         primaryActionLabel={
           !hasComposerInput && canStopForeground
               ? t('workspace.nativeStop')
-            : isTerminalStatus(session.status)
+            : isTerminalLocked
               ? t('workspace.newSession')
               : shouldGuideModel
                 ? t('workspace.composerGuideModel')
@@ -4721,7 +4755,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
         primaryActionIcon={
           !hasComposerInput && canStopForeground
               ? <ProcessingActionIcon stopping={isStopping} />
-            : isTerminalStatus(session.status)
+            : isTerminalLocked
               ? <SquarePen className="h-4 w-4" />
               : shouldGuideModel
                 ? <MessageSquareQuote className="h-4 w-4" />
@@ -4732,26 +4766,26 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
               ? isStopping
             : session.provider !== 'claude' && isProcessingTurn
               ? true
-            : isTerminalStatus(session.status)
+            : isTerminalLocked
               ? false
               : undefined
         }
         onPrimaryAction={
           !hasComposerInput && canStopForeground
               ? () => void handleStop()
-            : isTerminalStatus(session.status)
+            : isTerminalLocked
               ? onStartNew
               : undefined
         }
         escInterruptAvailable={canStopForeground}
         onEscInterrupt={() => void handleStop('composer_escape')}
         primaryActionVariant={
-          isTerminalStatus(session.status) && session.lifecycle?.active_command_id == null
+          isTerminalLocked && session.lifecycle?.active_command_id == null
             ? 'outline'
             : 'default'
         }
         primaryActionClassName={
-          isTerminalStatus(session.status) && session.lifecycle?.active_command_id == null
+          isTerminalLocked && session.lifecycle?.active_command_id == null
             ? 'shadow-none w-auto rounded-full px-3 gap-1.5'
             : undefined
         }

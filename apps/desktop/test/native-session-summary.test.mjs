@@ -48,5 +48,6 @@ test('workspace live view stops polling while the page is inactive', async () =>
     /isVisible=\{isActiveLiveEntry\}/,
     'live view visibility must include the page-active flag',
   );
-  assert.match(source, /isVisible=\{isActive && isActiveLiveEntry\}/);
+  assert.match(source, /isVisible=\{isActive && \(isActiveLiveEntry \|\| isSplitPane\)\}/);
+  assert.match(source, /isFocused=\{isActive && isActiveLiveEntry\}/);
 });

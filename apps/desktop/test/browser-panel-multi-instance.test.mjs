@@ -365,7 +365,7 @@ test('Workspace retains inactive Mode 2 panels and wires the status button to th
   assert.match(workspaceSource, /delete next\[sessionId\]/);
   assert.match(
     workspaceSource,
-    /onToggleBrowser=\{browserWorkspaceReady \? \(\) => toggleSidePanel\(skillsContext\.workingDir, workspaceReviewModel\?\.changedFiles\.length \?\? 0\) : undefined\}/,
+    /onToggleBrowser=\{browserWorkspaceReady && !isSplitView \? \(\) => toggleSidePanel\(skillsContext\.workingDir, workspaceReviewModel\?\.changedFiles\.length \?\? 0\) : undefined\}/,
   );
   assert.match(
     workspaceSource,

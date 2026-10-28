@@ -274,6 +274,8 @@ async function importHarness() {
             const hasComposerInput = composerHasDraft;
             const sessionAnnotations = { pendingAnnotations: [] };
             const isTerminalStatus = status => ['completed', 'failed', 'stopped'].includes(status);
+            // No onResumeTerminal in this harness: ended means locked.
+            const isTerminalLocked = isTerminalStatus(session.status);
             const isProcessingTurn = ${nativeExpressions.isProcessingTurn};
             const canStopForeground = ${nativeExpressions.canStopForeground};
             const canSend = ${nativeExpressions.canSend};

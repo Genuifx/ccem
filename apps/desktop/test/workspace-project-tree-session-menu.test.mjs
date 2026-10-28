@@ -14,7 +14,8 @@ test('ProjectTree keeps left-click session selection separate from the shadcn co
   assert.match(source, /ContextMenu/);
   assert.match(source, /ContextMenuTrigger asChild/);
   assert.match(source, /ContextMenuContent/);
-  assert.match(source, /onClick=\{\(\) => onSelect\(session\)\}/);
+  assert.match(source, /onSelect\(session\);/);
+  assert.match(source, /\(event\.metaKey \|\| event\.ctrlKey\) && onToggleSplit/);
   assert.match(source, /event\.key === 'Enter' \|\| event\.key === ' '/);
   assert.doesNotMatch(source, /onContextMenu\s*=/);
   assert.doesNotMatch(source, /DropdownMenu/);

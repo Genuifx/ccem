@@ -193,6 +193,8 @@ interface WorkspaceSessionComposerProps {
   onValueChange: (value: string) => void;
   onSubmit: (payload: ComposerSubmitPayload) => ComposerSubmitResult | Promise<ComposerSubmitResult>;
   placeholder: string;
+  /** Dense layout for split-view panes: short prompt area, tight chrome. */
+  compact?: boolean;
   disabled?: boolean;
   canSubmit: boolean;
   isSubmitting?: boolean;
@@ -918,6 +920,7 @@ export function WorkspaceSessionComposer({
   onValueChange,
   onSubmit,
   placeholder,
+  compact = false,
   disabled = false,
   canSubmit,
   isSubmitting = false,
@@ -1933,8 +1936,76 @@ export function WorkspaceSessionComposer({
     );
   }, { dependencies: [resolvedActionLabel, isSubmitting], scope: composerShellRef, revertOnUpdate: true });
 
+  // Compact (split-view panes) puts the prompt inline in the footer row,
+  // between the icon-only options and the send button.
+  const promptAreaNode = (<div className={cn('relative', compact ? 'min-h-[24px] min-w-0 flex-1 py-1' : 'min-h-[72px]')}>
+      <PromptArea
+        ref={promptAreaRef}
+        value={composerSegments}
+        onChange={handlePromptSegmentsChange}
+        triggers={promptAreaTriggers}
+        placeholder={placeholder}
+        disabled={disabled}
+        minHeight={compact ? 24 : 72}
+        maxHeight={compact ? 160 : 260}
+        autoGrow
+        markdown={false}
+        onSubmit={() => void handleComposerSubmit()}
+        onChipClick={handlePromptChipClick}
+        onChipAdd={handlePromptChipAdd}
+        onImagePaste={(files) => void handleImagePaste(files)}
+        onBeforeTextPaste={handleBeforeTextPaste}
+        onTriggerPanelChange={setTriggerPanelState}
+        triggerPanelPlacement="external"
+        onKeyDown={(event) => {
+          textareaProps?.onKeyDown?.(event as unknown as ReactKeyboardEvent<HTMLTextAreaElement>);
+          if (event.defaultPrevented) {
+            return;
+          }
+
+          const escInterruptDecision = decideComposerEscInterrupt({
+            key: event.key,
+            isArmed: escInterruptArmed,
+            available: escInterruptAvailable,
+            triggerPanelOpen: triggerPanelState != null,
+            isComposing: event.nativeEvent.isComposing,
+            keyCode: event.nativeEvent.keyCode,
+            repeat: event.nativeEvent.repeat,
+            defaultPrevented: event.defaultPrevented,
+          });
+          if (escInterruptDecision.kind === 'arm') {
+            event.preventDefault();
+            armEscInterrupt();
+            return;
+          }
+          if (escInterruptDecision.kind === 'confirm') {
+            event.preventDefault();
+            disarmEscInterrupt();
+            void onEscInterrupt?.();
+            return;
+          }
+          if (escInterruptDecision.kind === 'disarm') {
+            disarmEscInterrupt();
+          }
+
+          if (event.key === 'Tab' && event.shiftKey && planButtonVisible && onPlanModeEnabledChange) {
+            event.preventDefault();
+            onPlanModeEnabledChange(!planModeEnabled);
+          }
+
+          // Shift+~: Dynamic Routing opt-in for routing-capable composers
+          // (idempotent enable). Local to the focused composer input.
+          handleRouteShortcut(event);
+        }}
+        className="ccem-prompt-area"
+        aria-label={placeholder}
+        aria-keyshortcuts={routeShortcutAvailable ? 'Shift+Backquote' : undefined}
+      />
+    </div>
+  );
+
   return (
-    <div className="shrink-0 px-2 pb-3 pt-2 sm:px-4">
+    <div className={cn('shrink-0', compact ? 'px-3 pb-3 pt-1' : 'px-2 pb-3 pt-2 sm:px-4')}>
       <div ref={composerShellRef} className="relative mx-auto w-full max-w-5xl">
         {floatingAboveComposer ? (
           <div data-composer-attention-layout="overlay" className="workspace-attention-dock pointer-events-none absolute inset-x-0 bottom-[calc(100%-18px)] z-30 flex justify-center">
@@ -1990,6 +2061,7 @@ export function WorkspaceSessionComposer({
           data-composer-drop-active={isDragTarget || undefined}
           className={cn(
             'relative z-20 rounded-[20px] border border-border/40 bg-surface-raised px-5 py-3 shadow-[0_40px_120px_-70px_rgba(0,0,0,0.38)] transition-[border-color,box-shadow] duration-300',
+            compact && 'rounded-[14px] px-2 py-1.5 shadow-[0_1px_2px_hsl(var(--glass-shadow-base)/0.06)]',
             isDragTarget && 'border-primary/45 ring-4 ring-primary/10',
             planModeEnabled && 'border-primary/15',
           )}
@@ -2150,75 +2222,15 @@ export function WorkspaceSessionComposer({
               </div>
             </div>
           ) : null}
-          <div className="relative min-h-[72px]">
-            <PromptArea
-              ref={promptAreaRef}
-              value={composerSegments}
-              onChange={handlePromptSegmentsChange}
-              triggers={promptAreaTriggers}
-              placeholder={placeholder}
-              disabled={disabled}
-              minHeight={72}
-              maxHeight={260}
-              autoGrow
-              markdown={false}
-              onSubmit={() => void handleComposerSubmit()}
-              onChipClick={handlePromptChipClick}
-              onChipAdd={handlePromptChipAdd}
-              onImagePaste={(files) => void handleImagePaste(files)}
-              onBeforeTextPaste={handleBeforeTextPaste}
-              onTriggerPanelChange={setTriggerPanelState}
-              triggerPanelPlacement="external"
-              onKeyDown={(event) => {
-                textareaProps?.onKeyDown?.(event as unknown as ReactKeyboardEvent<HTMLTextAreaElement>);
-                if (event.defaultPrevented) {
-                  return;
-                }
-
-                const escInterruptDecision = decideComposerEscInterrupt({
-                  key: event.key,
-                  isArmed: escInterruptArmed,
-                  available: escInterruptAvailable,
-                  triggerPanelOpen: triggerPanelState != null,
-                  isComposing: event.nativeEvent.isComposing,
-                  keyCode: event.nativeEvent.keyCode,
-                  repeat: event.nativeEvent.repeat,
-                  defaultPrevented: event.defaultPrevented,
-                });
-                if (escInterruptDecision.kind === 'arm') {
-                  event.preventDefault();
-                  armEscInterrupt();
-                  return;
-                }
-                if (escInterruptDecision.kind === 'confirm') {
-                  event.preventDefault();
-                  disarmEscInterrupt();
-                  void onEscInterrupt?.();
-                  return;
-                }
-                if (escInterruptDecision.kind === 'disarm') {
-                  disarmEscInterrupt();
-                }
-
-                if (event.key === 'Tab' && event.shiftKey && planButtonVisible && onPlanModeEnabledChange) {
-                  event.preventDefault();
-                  onPlanModeEnabledChange(!planModeEnabled);
-                }
-
-                // Shift+~: Dynamic Routing opt-in for routing-capable composers
-                // (idempotent enable). Local to the focused composer input.
-                handleRouteShortcut(event);
-              }}
-              className="ccem-prompt-area"
-              aria-label={placeholder}
-              aria-keyshortcuts={routeShortcutAvailable ? 'Shift+Backquote' : undefined}
-            />
-          </div>
+          {compact ? null : promptAreaNode}
 
           <div
             ref={composerFooterRef}
-            data-compact={composerFooterCompact || undefined}
-            className="group/composer-footer mt-2 flex flex-wrap items-center gap-2.5 border-t border-border/40 pt-2"
+            data-compact={compact || composerFooterCompact || undefined}
+            className={cn(
+              'group/composer-footer flex items-center',
+              compact ? 'flex-nowrap items-end gap-1.5' : 'mt-2 flex-wrap gap-2.5 border-t border-border/40 pt-2',
+            )}
           >
             <ComposerQuickMenu
               codexInstalled={codexInstalled}
@@ -2236,7 +2248,9 @@ export function WorkspaceSessionComposer({
 
             {controls}
 
-            <div className="ml-auto flex items-center gap-2">
+            {compact ? promptAreaNode : null}
+
+            <div className={cn('flex shrink-0 items-center', compact ? 'gap-1' : 'ml-auto gap-2')}>
               {secondaryActions}
 
               <Button
@@ -2263,6 +2277,7 @@ export function WorkspaceSessionComposer({
                 }}
                 className={cn(
                   'h-9 w-9 rounded-full shadow-[0_14px_36px_-18px_rgba(0,0,0,0.42)]',
+                  compact && 'h-8 w-8',
                   primaryActionClassName,
                 )}
               >
