@@ -381,7 +381,7 @@ export const AnalyticsInsights = memo(function AnalyticsInsights({
             {t('analytics.tokenDistribution')}
           </h3>
           <div className="flex items-center gap-2">
-            <div className="flex items-center gap-1" role="radiogroup" aria-label="Time granularity">
+            <div className="inline-flex items-center gap-0.5 rounded-full border border-border-subtle bg-[hsl(var(--surface-sunken))] p-0.5" role="radiogroup" aria-label="Time granularity">
               {granularityOptions.map(({ key, label }) => (
                 <button
                   key={key}
@@ -397,12 +397,11 @@ export const AnalyticsInsights = memo(function AnalyticsInsights({
                     setGranularity(key);
                   }}
                   className={cn(
-                    'rounded-full px-3 py-1 text-xs transition-all duration-200',
+                    'rounded-full px-3 py-1 text-xs transition-colors duration-150',
                     granularity === key
-                      ? 'border-2 border-primary bg-[hsl(var(--surface))] font-medium text-foreground shadow-sm'
-                      : 'border border-border-subtle text-muted-foreground hover:text-foreground'
+                      ? 'bg-foreground font-medium text-background'
+                      : 'text-muted-foreground hover:text-foreground'
                   )}
-                  style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}
                 >
                   {label}
                 </button>

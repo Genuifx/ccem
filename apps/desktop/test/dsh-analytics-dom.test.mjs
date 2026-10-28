@@ -130,6 +130,18 @@ const externalStubPlugin = {
     builder.onLoad({ filter: /^store-stub$/, namespace: 'analytics-stubs' }, () => ({
       loader: 'js', contents: MOCK_STORE_CODE,
     }));
+    builder.onResolve({ filter: /^@\/components\/ui\/tooltip$/ }, () => ({
+      path: 'tooltip-stub', namespace: 'analytics-stubs',
+    }));
+    builder.onLoad({ filter: /^tooltip-stub$/, namespace: 'analytics-stubs' }, () => ({
+      loader: 'js',
+      contents: `
+        export function Tooltip({ children }) { return children; }
+        export function TooltipTrigger({ children }) { return children; }
+        export function TooltipContent() { return null; }
+        export function TooltipProvider({ children }) { return children; }
+      `,
+    }));
     builder.onResolve({ filter: /^sonner$/ }, () => ({
       path: 'sonner-stub', namespace: 'analytics-stubs',
     }));
@@ -356,7 +368,7 @@ test('both refresh buttons retry model details even when the summary timestamp i
     const chartRefresh = dom.window.document.querySelector('[data-testid="test-insights-refresh"]');
     assert.ok(chartRefresh);
     assert.equal(chartRefresh.dataset.refreshRevision, '0');
-    const headerRefresh = dom.window.document.querySelector('button[aria-label="Refresh"]');
+    const headerRefresh = dom.window.document.querySelector('button[aria-label="analytics.refresh"]');
     for (const [index, button] of [headerRefresh, chartRefresh].entries()) {
       await act(async () => { button.click(); await flush(); });
       assert.equal(chartRefresh.dataset.refreshRevision, String(index + 1));
@@ -558,11 +570,10 @@ test('dailyActivities useMemo depends on viewStats not usageStats', async () => 
 });
 
 // ── Blocker 4 regression: weekly cost card respects week.costIncomplete ─────
-test('weekly cost card uses weeklyCostIncomplete for label', async () => {
+test('weekly cost line marks partial pricing via weeklyCostIncomplete', async () => {
   const analyticsSource = await fs.readFile(
     path.join(desktopDir, 'src/pages/Analytics.tsx'), 'utf-8'
   );
-  assert.match(analyticsSource, /weeklyCostIncomplete/);
-  // The weekly cost MetricCell label should reference weeklyCostIncomplete
-  assert.match(analyticsSource, /weeklyCostIncomplete\s*\?\s*t\(['"]analytics\.costKnown['"]\)/);
+  // The weekly cost lives under the total cost tile and must flag partial pricing on its own
+  assert.match(analyticsSource, /weeklyCostIncomplete\s*&&[^\n]*t\(['"]analytics\.costPartial['"]\)/);
 });
