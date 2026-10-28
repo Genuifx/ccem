@@ -304,6 +304,12 @@ interface WorkspaceNativeSessionViewProps {
   onRefreshSkills?: () => Promise<InstalledSkill[]>;
   workspaceCommands?: WorkspaceCommand[];
   isVisible?: boolean;
+  /**
+   * Owns workspace-wide surfaces (side panel, file links, review popover,
+   * text annotations). Defaults to `isVisible`; in split view several panes
+   * are visible but only the focused one owns these.
+   */
+  isFocused?: boolean;
   onSessionUpdate: (session: NativeSessionSummary) => void;
   onStartNew: () => void;
   codexInstalled?: boolean;
@@ -1492,10 +1498,10 @@ export const WorkspaceNativeSessionView = memo(function WorkspaceNativeSessionVi
   // Workspace's contexts follow the selected owner. Keep those updates outside
   // hidden transcripts; memo alone cannot stop a context subscription. Revealing
   // a session supplies the current owner and callbacks in the same render.
-  const isVisible = props.isVisible !== false;
+  const isFocused = props.isFocused ?? props.isVisible !== false;
   return (
-    <WorkspaceSidePanelContext.Provider value={isVisible ? sidePanel : null}>
-      <WorkspaceFileLinkContext.Provider value={isVisible ? fileLinks : null}>
+    <WorkspaceSidePanelContext.Provider value={isFocused ? sidePanel : null}>
+      <WorkspaceFileLinkContext.Provider value={isFocused ? fileLinks : null}>
         <WorkspaceNativeSessionViewContent {...props} session={session} />
       </WorkspaceFileLinkContext.Provider>
     </WorkspaceSidePanelContext.Provider>
@@ -1512,6 +1518,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
   onRefreshSkills,
   workspaceCommands = [],
   isVisible = true,
+  isFocused = isVisible,
   onSessionUpdate,
   onStartNew,
   codexInstalled = false,
@@ -1640,9 +1647,9 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
   const reviewPanelOpen = useAppStore((state) => state.reviewPanelOpen);
   const setReviewPanelOpen = useAppStore((state) => state.setReviewPanelOpen);
   const setReviewEntry = useAppStore((state) => state.setReviewEntry);
-  const isReviewPopoverOpen = isVisible && reviewPanelOpen;
+  const isReviewPopoverOpen = isFocused && reviewPanelOpen;
   const sidePanel = useWorkspaceSidePanel();
-  const isReviewDetailOpen = isVisible && (isFileTab(sidePanel?.tab ?? null) || sidePanel?.tab === 'agents');
+  const isReviewDetailOpen = isFocused && (isFileTab(sidePanel?.tab ?? null) || sidePanel?.tab === 'agents');
   const [gitSnapshot, setGitSnapshot] = useState<WorkspaceGitSnapshot | null>(null);
   const [recentFiles, setRecentFiles] = useState<WorkspaceRecentFile[] | null>(null);
   const recentFilesRequestSeqRef = useRef(0);
@@ -2576,7 +2583,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
 
   // Publish review summary to the status-strip entry pill while this live session owns the view.
   useEffect(() => {
-    if (!isVisible) {
+    if (!isFocused) {
       return;
     }
     setReviewEntry({
@@ -2586,7 +2593,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
       artifacts: reviewSummary.artifacts,
     });
   }, [
-    isVisible,
+    isFocused,
     session.env_name,
     reviewSummary.failedTools,
     reviewSummary.changedFiles,
@@ -4639,7 +4646,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
             rootRef={containerRef}
             contentRef={contentRef}
             scopeKey={`live:${session.runtime_id}`}
-            isActive={isVisible}
+            isActive={isFocused}
             canCreate={!isTerminalStatus(session.status)}
             canAdd={sessionAnnotations.canAddAnnotation}
             annotations={sessionAnnotations.annotations}

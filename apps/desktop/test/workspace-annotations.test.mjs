@@ -405,7 +405,7 @@ test('live and history workspace paths wire transcript selections into successfu
     'plan review must keep internal XML out of the bubble while persisting annotations',
   );
   assert.match(liveSource, /onAdd=\{sessionAnnotations\.addAnnotation\}/);
-  assert.match(liveSource, /isActive=\{isVisible\}/);
+  assert.match(liveSource, /isActive=\{isFocused\}/);
   assert.match(liveSource, /annotations=\{sessionAnnotations\.annotations\}/);
   assert.match(liveSource, /onAnnotationsSent=\{sessionAnnotations\.markAllSent\}/);
   assert.match(historySource, /onAddAnnotation=\{selectedHistorySupportsInline \? historyAnnotations\.addAnnotation : undefined\}/);

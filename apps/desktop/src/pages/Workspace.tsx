@@ -20,7 +20,16 @@ import {
   FolderSearch,
   LoaderCircle,
   Terminal,
+  X,
 } from '@/lib/lucide-react';
+import {
+  MAX_SPLIT_PANES,
+  focusAfterClosingPane,
+  isSplitViewShown,
+  pruneSplitPanes,
+  splitGridLayout,
+  toggleSplitPane,
+} from '@/components/workspace/workspaceSplitView';
 import { toast } from 'sonner';
 import { shallow } from 'zustand/shallow';
 import { WorkspaceStatusStrip } from '@/components/workspace/WorkspaceStatusStrip';
@@ -576,6 +585,14 @@ export function Workspace({
   const liveSessionsByRuntimeIdRef = useRef<WorkspaceLiveSessionsByRuntimeId>(liveSessionsByRuntimeId);
   const nativeSessionRestoreRequestSeqRef = useRef(0);
   const [activeLiveRuntimeId, setActiveLiveRuntimeId] = useState<string | null>(null);
+  // Runtime ids shown together in split view. The layout survives opening a
+  // non-member session and comes back when a member is focused again.
+  const [splitRuntimeIds, setSplitRuntimeIds] = useState<string[]>([]);
+  // An ended session cannot join directly: Cmd+click opens it alone, and the
+  // runtime its first follow-up resumes into joins the split.
+  const pendingSplitRef = useRef<{ sessionKey: string; seedId: string | null } | null>(null);
+  const splitGridRef = useRef<HTMLDivElement | null>(null);
+  const [splitGridSize, setSplitGridSize] = useState({ width: 0, height: 0 });
   const composeViewRef = useRef<HTMLDivElement | null>(null);
   const [selectedHistoryNativeRuntimeId, setSelectedHistoryNativeRuntimeId] = useState<string | null>(null);
   const [hasAttemptedNativeSessionRestore, setHasAttemptedNativeSessionRestore] = useState(false);
@@ -1790,6 +1807,44 @@ export function Workspace({
     [liveSessionsByRuntimeId],
   );
 
+  useEffect(() => {
+    setSplitRuntimeIds((current) => pruneSplitPanes(
+      current,
+      new Set(Object.keys(liveSessionsByRuntimeId)),
+    ));
+  }, [liveSessionsByRuntimeId]);
+
+  const isSplitView = workspaceMode === 'live'
+    && isSplitViewShown(splitRuntimeIds, activeLiveRuntimeId);
+  const splitGrid = splitGridLayout(splitRuntimeIds.length, splitGridSize.width, splitGridSize.height);
+
+  useEffect(() => {
+    const element = splitGridRef.current;
+    if (!isSplitView || !element) return;
+    const measure = () => {
+      const width = element.clientWidth;
+      const height = element.clientHeight;
+      setSplitGridSize((current) => (
+        current.width === width && current.height === height ? current : { width, height }
+      ));
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [isSplitView]);
+
+  const splitSessionKeys = useMemo(() => {
+    const keys = new Set<string>();
+    for (const runtimeId of splitRuntimeIds) {
+      const entry = liveSessionsByRuntimeId[runtimeId];
+      if (!entry) continue;
+      keys.add(liveSessionSidebarKey(entry));
+      keys.add(liveSessionRuntimeSidebarKey(entry));
+    }
+    return keys;
+  }, [liveSessionsByRuntimeId, splitRuntimeIds]);
+
   // Live summaries refresh every couple of seconds during a turn. Reuse the
   // previous rows when nothing visible changed so the sidebar and its
   // decoration poll do not redo work for all sessions on every refresh.
@@ -2554,6 +2609,56 @@ export function Workspace({
     setWorkspaceMode('live');
   }, [setSelectedWorkingDir, upsertLiveSessionEntry]);
 
+  const handleToggleSplitSession = useCallback(async (session: HistorySessionItem) => {
+    const entry = await ensureLiveEntryForSession(session).catch((error) => {
+      console.error('Failed to resolve native session for split view:', error);
+      return null;
+    });
+    if (!entry || !canRestoreWorkspaceLiveSession(entry.session)) {
+      pendingSplitRef.current = {
+        sessionKey: toSessionKey(session),
+        seedId: workspaceMode === 'live' ? activeLiveRuntimeId : null,
+      };
+      toast.info(t('workspace.splitResumeFirst'));
+      void handleSelect(session);
+      return;
+    }
+    pendingSplitRef.current = null;
+    const runtimeId = entry.session.runtime_id;
+    const seedId = workspaceMode === 'live' ? activeLiveRuntimeId : null;
+    const result = toggleSplitPane(splitRuntimeIds, seedId, runtimeId);
+    if (result.kind === 'full') {
+      toast.info(t('workspace.splitFull', { count: MAX_SPLIT_PANES }));
+      return;
+    }
+    setSplitRuntimeIds(result.paneIds);
+    const nextActive = result.kind === 'added'
+      ? runtimeId
+      : focusAfterClosingPane(
+        splitRuntimeIds.length > 0 ? splitRuntimeIds : result.paneIds,
+        runtimeId,
+        activeLiveRuntimeId,
+      );
+    if (nextActive) {
+      setActiveLiveRuntimeId(nextActive);
+      setWorkspaceMode('live');
+    }
+  }, [activeLiveRuntimeId, ensureLiveEntryForSession, handleSelect, splitRuntimeIds, t, workspaceMode]);
+
+  useEffect(() => {
+    if (pendingSplitRef.current && pendingSplitRef.current.sessionKey !== selectedKey) {
+      pendingSplitRef.current = null;
+    }
+  }, [selectedKey]);
+
+  const handleCloseSplitPane = useCallback((runtimeId: string) => {
+    setActiveLiveRuntimeId((current) => focusAfterClosingPane(splitRuntimeIds, runtimeId, current));
+    setSplitRuntimeIds((current) => {
+      const remaining = current.filter((id) => id !== runtimeId);
+      return remaining.length >= 2 ? remaining : [];
+    });
+  }, [splitRuntimeIds]);
+
   const openCcemSessionLink = useCallback(async (link: string) => {
     const parsed = parseCcemSessionLink(link);
     if (!parsed) {
@@ -3293,6 +3398,14 @@ export function Workspace({
         initialAnnotations: payload?.annotations ?? null,
         seedMessages: messages,
       });
+      const pendingSplit = pendingSplitRef.current;
+      if (pendingSplit?.sessionKey === toSessionKey(selectedSession)) {
+        pendingSplitRef.current = null;
+        setSplitRuntimeIds((current) => {
+          const result = toggleSplitPane(current, pendingSplit.seedId, summary.runtime_id);
+          return result.kind === 'added' ? result.paneIds : current;
+        });
+      }
       setActiveLiveRuntimeId(summary.runtime_id);
       setWorkspaceMode('live');
       resetHistoryComposerText('');
@@ -3599,7 +3712,10 @@ export function Workspace({
   const handleWorkspaceSubmitShortcut = useCallback(() => {
     // Use the same rich-draft capture, admission guard and recovery journal as
     // the visible send button. Hidden composers and stop actions are excluded.
-    const button = Array.from(workspaceColumnRef.current?.querySelectorAll<HTMLButtonElement>(
+    // In split view several composers are visible; the focused pane wins.
+    const root = workspaceColumnRef.current?.querySelector<HTMLElement>('[data-ccem-split-pane-focused="true"]')
+      ?? workspaceColumnRef.current;
+    const button = Array.from(root?.querySelectorAll<HTMLButtonElement>(
       '[data-workspace-composer-submit]',
     ) ?? []).find((candidate) => candidate.getClientRects().length > 0);
     button?.click();
@@ -4004,6 +4120,12 @@ export function Workspace({
     [],
   );
 
+  const handleToggleSplitSessionRef = useRef(handleToggleSplitSession);
+  handleToggleSplitSessionRef.current = handleToggleSplitSession;
+  const handleProjectTreeToggleSplit = useCallback((session: HistorySessionItem) => {
+    void handleToggleSplitSessionRef.current(session);
+  }, []);
+
   const handleProjectTreeRefresh = useCallback(() => {
     void Promise.all([
       refreshWorkspaceData({
@@ -4217,6 +4339,8 @@ export function Workspace({
               isRefreshing={isRefreshing}
               selectedKey={selectedKey}
               onSelect={handleProjectTreeSelect}
+              splitSessionKeys={splitSessionKeys}
+              onToggleSplit={handleProjectTreeToggleSplit}
               onRefresh={handleProjectTreeRefresh}
               onSaveTitle={handleProjectTreeSaveTitle}
               onSaveAnnotation={handleProjectTreeSaveAnnotation}
@@ -4269,22 +4393,86 @@ export function Workspace({
 
               {liveSessionEntries.length > 0 ? (
                 <div
+                  ref={splitGridRef}
+                  data-ccem-split-view={isSplitView ? splitRuntimeIds.length : undefined}
+                  style={isSplitView ? {
+                    gridTemplateColumns: `repeat(${splitGrid.columns}, minmax(0, 1fr))`,
+                    gridTemplateRows: `repeat(${splitGrid.rows}, minmax(0, 1fr))`,
+                  } : undefined}
                   className={cn(
                     'relative min-h-0 flex-1 overflow-hidden',
-                    workspaceMode === 'live' && activeLiveEntry ? 'block' : 'hidden',
+                    workspaceMode === 'live' && activeLiveEntry ? (isSplitView ? 'grid gap-2 pt-1' : 'block') : 'hidden',
                   )}
                 >
                   {liveSessionEntries.map((entry) => {
+                    const runtimeId = entry.session.runtime_id;
                     const isActiveLiveEntry = workspaceMode === 'live'
-                      && activeLiveEntry?.session.runtime_id === entry.session.runtime_id;
+                      && activeLiveEntry?.session.runtime_id === runtimeId;
+                    const splitIndex = isSplitView ? splitRuntimeIds.indexOf(runtimeId) : -1;
+                    const isSplitPane = splitIndex >= 0;
+                    // Keep one stable element tree per entry so switching
+                    // between single and split layouts never remounts a view.
                     return (
                       <div
-                        key={entry.session.runtime_id}
+                        key={runtimeId}
+                        data-ccem-split-pane={isSplitPane ? runtimeId : undefined}
+                        data-ccem-split-pane-focused={isSplitPane && isActiveLiveEntry ? 'true' : undefined}
+                        style={isSplitPane ? { order: splitIndex } : undefined}
+                        onPointerDownCapture={isSplitPane && !isActiveLiveEntry
+                          ? () => setActiveLiveRuntimeId(runtimeId)
+                          : undefined}
+                        onFocusCapture={isSplitPane && !isActiveLiveEntry
+                          ? () => setActiveLiveRuntimeId(runtimeId)
+                          : undefined}
                         className={cn(
-                          'absolute inset-0 min-h-0',
-                          isActiveLiveEntry ? 'block' : 'hidden',
+                          'min-h-0',
+                          isSplitPane
+                            ? cn(
+                              'relative flex min-w-0 flex-col overflow-hidden rounded-xl border bg-background/40 transition-[border-color,box-shadow] duration-150',
+                              isActiveLiveEntry
+                                ? 'border-primary/35 shadow-[0_0_0_1px_hsl(var(--primary)/0.12)]'
+                                : 'border-[var(--glass-border-light)] opacity-[0.92] hover:opacity-100',
+                            )
+                            : cn('absolute inset-0', isActiveLiveEntry ? 'flex flex-col' : 'hidden'),
                         )}
                       >
+                        {isSplitPane ? (
+                          <div className="flex h-8 shrink-0 items-center gap-2 border-b border-[var(--glass-border-light)] pl-3 pr-1">
+                            <span
+                              className={cn(
+                                'h-1.5 w-1.5 shrink-0 rounded-full',
+                                isActiveLiveEntry ? 'bg-primary' : 'bg-muted-foreground/30',
+                              )}
+                              aria-label={isActiveLiveEntry ? t('workspace.splitFocusedPane') : undefined}
+                            />
+                            <span
+                              className={cn(
+                                'min-w-0 flex-1 truncate text-xs font-medium',
+                                isActiveLiveEntry ? 'text-foreground' : 'text-muted-foreground',
+                              )}
+                              title={entry.session.project_dir}
+                            >
+                              {toLiveHistorySessionItem(entry)?.display
+                                || entry.session.display_title
+                                || entry.session.project_dir}
+                            </span>
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              className="h-6 w-6 shrink-0 text-muted-foreground hover:text-foreground"
+                              aria-label={t('workspace.splitClosePane')}
+                              title={t('workspace.splitClosePane')}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                handleCloseSplitPane(runtimeId);
+                              }}
+                            >
+                              <X className="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
+                        ) : null}
+                        <div className="relative min-h-0 flex-1">
                         <WorkspaceNativeSessionView
                           session={entry.session}
                           initialPrompt={entry.initialPrompt}
@@ -4294,7 +4482,8 @@ export function Workspace({
                           installedSkills={workspaceInstalledSkills}
                           onRefreshSkills={refreshWorkspaceInstalledSkills}
                           workspaceCommands={workspaceCommands}
-                          isVisible={isActive && isActiveLiveEntry}
+                          isVisible={isActive && (isActiveLiveEntry || isSplitPane)}
+                          isFocused={isActive && isActiveLiveEntry}
                           onSessionUpdate={handleLiveSessionUpdate}
                           codexInstalled={codexInstalled}
                           opencodeInstalled={opencodeInstalled}
@@ -4310,6 +4499,7 @@ export function Workspace({
                               || entry.session.project_dir
                           }
                       />
+                        </div>
                       </div>
                     );
                   })}
