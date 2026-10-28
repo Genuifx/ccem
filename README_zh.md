@@ -6,7 +6,7 @@
 <p align="center"><strong>一个控制中心，管好 Claude Code、Codex、OpenCode 和它们背后的所有模型。</strong></p>
 
 <p align="center">
-  <a href="./README.md">English</a> | <a href="./README_zh.md">中文</a>
+  <a href="https://ccem.genuifx.com">官网</a> | <a href="./README.md">English</a> | <a href="./README_zh.md">中文</a>
 </p>
 
 <p align="center">

@@ -6,7 +6,7 @@
 <p align="center"><strong>One control center for Claude Code, Codex, OpenCode and every model behind them.</strong></p>
 
 <p align="center">
-  <a href="./README.md">English</a> | <a href="./README_zh.md">中文</a>
+  <a href="https://ccem.genuifx.com">Website</a> | <a href="./README.md">English</a> | <a href="./README_zh.md">中文</a>
 </p>
 
 <p align="center">
