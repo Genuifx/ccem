@@ -60,6 +60,8 @@ interface WorkspaceStatusStripProps {
   onOpenSearch: () => void;
   browserOpen?: boolean;
   onToggleBrowser?: () => void;
+  /** Split view has no single session to review: hide the review entry. */
+  hideReview?: boolean;
   /** Optional env context (e.g. the active history/live session env) to keep visible alongside the global current env. */
   envContext?: string;
   /** Active native session runtimeId (live mode); the Route chip is per-session. */
@@ -81,6 +83,7 @@ export function WorkspaceStatusStrip({
   onOpenSearch,
   browserOpen = false,
   onToggleBrowser,
+  hideReview = false,
   envContext,
   activeRuntimeId,
   onNavigateEnvironments,
@@ -320,8 +323,8 @@ export function WorkspaceStatusStrip({
         ) : null}
       </button>
 
-      {/* Review audit entry — always visible, far-right, context-aware */}
-      <button
+      {/* Review audit entry — far-right, context-aware; hidden in split view */}
+      {hideReview ? null : <button
         ref={workspaceReviewTriggerRef}
         type="button"
         data-ccem-workspace-review-trigger
@@ -362,7 +365,7 @@ export function WorkspaceStatusStrip({
             {reviewEntry.failedTools}
           </span>
         ) : null}
-      </button>
+      </button>}
 
       {onToggleBrowser ? (
         <button

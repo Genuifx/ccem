@@ -1834,6 +1834,13 @@ export function Workspace({
     return () => observer.disconnect();
   }, [isSplitView]);
 
+  // Split view hides the side panel and review entry; close whatever was open.
+  useEffect(() => {
+    if (!isSplitView) return;
+    if (sidePanelOpen) closeSidePanel();
+    setWorkspaceReviewOpen(false);
+  }, [closeSidePanel, isSplitView, setWorkspaceReviewOpen, sidePanelOpen]);
+
   const splitSessionKeys = useMemo(() => {
     const keys = new Set<string>();
     for (const runtimeId of splitRuntimeIds) {
@@ -4310,7 +4317,8 @@ export function Workspace({
             onNavigate={onNavigate}
             onOpenSearch={() => setIsGlobalSearchOpen(true)}
             browserOpen={sidePanelOpen}
-            onToggleBrowser={browserWorkspaceReady ? () => toggleSidePanel(skillsContext.workingDir, workspaceReviewModel?.changedFiles.length ?? 0) : undefined}
+            onToggleBrowser={browserWorkspaceReady && !isSplitView ? () => toggleSidePanel(skillsContext.workingDir, workspaceReviewModel?.changedFiles.length ?? 0) : undefined}
+            hideReview={isSplitView}
             envContext={statusStripEnvContext}
             activeRuntimeId={
               workspaceMode === 'live' && activeLiveEntry?.session.provider === 'claude'

@@ -349,6 +349,8 @@ const ACTIVE_POLL_INTERVAL_MS = 140;
 const IDLE_POLL_INTERVAL_MS = 700;
 const TERMINAL_POLL_INTERVAL_MS = 1100;
 const FAILED_POLL_INTERVAL_MS = 5000;
+// Visible but unfocused split-view panes: still live, at a fraction of the cost.
+const BACKGROUND_PANE_POLL_INTERVAL_MS = { active: 700, idle: 2000, terminal: 3000 } as const;
 const SUMMARY_REFRESH_COOLDOWN_MS = 2000;
 // Streaming flushes of the sessionStorage mirror are trailing-edge and at
 // most one per interval; idle/terminal/switch/unmount flush immediately. The
@@ -1500,10 +1502,11 @@ export const WorkspaceNativeSessionView = memo(function WorkspaceNativeSessionVi
   // Workspace's contexts follow the selected owner. Keep those updates outside
   // hidden transcripts; memo alone cannot stop a context subscription. Revealing
   // a session supplies the current owner and callbacks in the same render.
-  const isFocused = props.isFocused ?? props.isVisible !== false;
+  // Split-view panes (compact) never own the side panel: it is hidden there.
+  const ownsSidePanel = (props.isFocused ?? props.isVisible !== false) && !props.compact;
   return (
-    <WorkspaceSidePanelContext.Provider value={isFocused ? sidePanel : null}>
-      <WorkspaceFileLinkContext.Provider value={isFocused ? fileLinks : null}>
+    <WorkspaceSidePanelContext.Provider value={ownsSidePanel ? sidePanel : null}>
+      <WorkspaceFileLinkContext.Provider value={ownsSidePanel ? fileLinks : null}>
         <WorkspaceNativeSessionViewContent {...props} session={session} />
       </WorkspaceFileLinkContext.Provider>
     </WorkspaceSidePanelContext.Provider>
@@ -1650,9 +1653,9 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
   const reviewPanelOpen = useAppStore((state) => state.reviewPanelOpen);
   const setReviewPanelOpen = useAppStore((state) => state.setReviewPanelOpen);
   const setReviewEntry = useAppStore((state) => state.setReviewEntry);
-  const isReviewPopoverOpen = isFocused && reviewPanelOpen;
+  const isReviewPopoverOpen = isFocused && !compact && reviewPanelOpen;
   const sidePanel = useWorkspaceSidePanel();
-  const isReviewDetailOpen = isFocused && (isFileTab(sidePanel?.tab ?? null) || sidePanel?.tab === 'agents');
+  const isReviewDetailOpen = isFocused && !compact && (isFileTab(sidePanel?.tab ?? null) || sidePanel?.tab === 'agents');
   const [gitSnapshot, setGitSnapshot] = useState<WorkspaceGitSnapshot | null>(null);
   const [recentFiles, setRecentFiles] = useState<WorkspaceRecentFile[] | null>(null);
   const recentFilesRequestSeqRef = useRef(0);
@@ -3094,15 +3097,22 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
     [attentionEvents],
   );
 
-  const pollIntervalMs = transcriptPollFailure?.runtimeId === session.runtime_id
-    ? FAILED_POLL_INTERVAL_MS
-    : isSending
+  const pollActivity = isSending
     || session.status === 'initializing'
     || session.status === 'processing'
-    ? ACTIVE_POLL_INTERVAL_MS
+    ? 'active'
     : isTerminalStatus(session.status)
-      ? TERMINAL_POLL_INTERVAL_MS
-      : IDLE_POLL_INTERVAL_MS;
+      ? 'terminal'
+      : 'idle';
+  const pollIntervalMs = transcriptPollFailure?.runtimeId === session.runtime_id
+    ? FAILED_POLL_INTERVAL_MS
+    : !isFocused
+      ? BACKGROUND_PANE_POLL_INTERVAL_MS[pollActivity]
+      : pollActivity === 'active'
+        ? ACTIVE_POLL_INTERVAL_MS
+        : pollActivity === 'terminal'
+          ? TERMINAL_POLL_INTERVAL_MS
+          : IDLE_POLL_INTERVAL_MS;
 
   useEffect(() => {
     if (!isVisible) {
