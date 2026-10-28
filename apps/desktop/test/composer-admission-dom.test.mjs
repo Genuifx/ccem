@@ -200,6 +200,7 @@ async function importHarness() {
         const ProcessingActionIcon = () => <span>stop</span>;
         import { WorkspaceSessionComposer } from '@/components/workspace/WorkspaceSessionComposer';
         import { COMPOSER_DELIVERY_UNCERTAIN_TOAST_ID, nativeComposerFailureResult, nativeCreateFailure } from '@/components/workspace/composerSubmissionResult';
+        import { isClaudeRuntimeRequiredError } from '@/lib/claude-runtime';
         import { readRecoveryDraft, writeRecoveryDraft, recoveryDraftDiagnostics } from '@/lib/recoveryDrafts';
         export const seedRecovery = writeRecoveryDraft;
         export const recoveryCounts = recoveryDraftDiagnostics;
@@ -395,6 +396,7 @@ async function importHarness() {
             const resolveComposerDispatch = ({prompt}) => ({ prompt, permMode: 'dev', runtimePermMode: 'dev' });
             const setIsCreatingNativeSession = () => {};
             const setIsResumingHistorySession = () => {};
+            const setClaudeRuntimeRequired = value => { state.runtimeRequired = value; };
             const preflightCodexModelMigration = () => {};
             const requestCodexModelMigrationDecision = () => {};
             const acknowledgedCodexModelWarningsRef = { current: new Set() };
@@ -1619,6 +1621,27 @@ for (const scenario of [
 }
 
 for (const launch of ['compose', 'history']) {
+  for (const provider of ['claude', 'codex']) {
+    test(`actual ${provider} ${launch} opens runtime setup only for a certified Claude startup rejection`, async (t) => {
+      const { container, restore } = installDom();
+      const harness = await (importedHarnessPromise ??= importHarness());
+      window.__ccemRecoveryTest = true;
+      const key = `runtime-required-${provider}-${launch}`;
+      harness.seedRecovery(key, 'keep this task until runtime is ready', []);
+      const mounted = harness.mountFailure(container, false, null, null, { launch, provider, recoveryKey: key });
+      t.after(() => { mounted.unmount(); restore(); });
+      await mounted.submit();
+      const detail = 'CLAUDE_RUNTIME_REQUIRED: {"reason":"missing","preference":"auto"}';
+      await mounted.reject(`NATIVE_CREATE_REJECTED: ${detail}`);
+      assert.equal(mounted.state.result, false);
+      assert.equal(mounted.state.runtimeRequired === true, provider === 'claude');
+      assert.deepEqual(mounted.state.errors, provider === 'claude' ? [] : [detail]);
+      assert.equal(harness.recoveryDraft(key).text, 'keep this task until runtime is ready');
+      assert.equal(harness.recoveryCounts().uncertain, 0);
+      assert.equal(mounted.state.calls, 1, 'opening setup does not resend the prompt');
+    });
+  }
+
   for (const provider of ['claude', 'codex']) {
     test(`actual ${provider} ${launch} startup rejection shows the cause and keeps a retryable draft`, async (t) => {
       const { container, restore } = installDom();

@@ -9,6 +9,7 @@ import type { CronHermesNotification, CronHermesDelivery } from '@/lib/hermes-ip
  */
 
 import type { Environment, Session } from '@/store';
+import type { ClaudeRuntimeSource, ClaudeRuntimeStatus } from '@/lib/claude-runtime';
 import type {
   BrowserSurfaceAcquireRequest,
   BrowserSurfaceClosePopupRequest,
@@ -37,6 +38,10 @@ export interface TauriCommands {
   get_agent_profiles: [void, AgentProfileStatus[]];
   set_codex_isolation: [{ isolated: boolean }, AgentProfileStatus[]];
   login_agent_profile: [{ provider: 'claude' | 'codex' }, void];
+  get_claude_runtime_status: [{ refresh?: boolean } | void, ClaudeRuntimeStatus];
+  set_claude_runtime_source: [{ source: ClaudeRuntimeSource }, ClaudeRuntimeStatus];
+  install_claude_runtime: [void, ClaudeRuntimeStatus];
+  cancel_claude_runtime_install: [void, ClaudeRuntimeStatus];
   // 环境管理
   get_environments: [void, Record<string, Environment>];
   get_current_env: [void, string | null];

@@ -11,7 +11,6 @@ use crate::notifications::{self, NotificationContext};
 use crate::remote::{RemotePeerRef, RemotePlatform};
 use crate::secure_fs::write_private_atomic;
 use crate::session_provenance::bind_source_session_id;
-use crate::terminal::resolve_claude_path;
 use crate::workspace_decorations::AttentionSummary;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -278,10 +277,11 @@ impl RuntimeManager {
     pub fn create_session(
         self: &Arc<Self>,
         app: AppHandle,
-        options: ManagedSessionOptions,
+        mut options: ManagedSessionOptions,
     ) -> Result<ManagedSessionSummary, String> {
+        let claude_binary = crate::terminal::prepare_claude_runtime_env(&mut options.env_vars)?;
         let runtime_id = generate_runtime_id();
-        let build = build_claude_command(&options, &runtime_id)?;
+        let build = build_claude_command(&options, &runtime_id, &claude_binary)?;
         let mut command = build.command;
         let mut child = command
             .spawn()
@@ -1147,10 +1147,10 @@ fn dispatch_session_event(
 fn build_claude_command(
     options: &ManagedSessionOptions,
     runtime_id: &str,
+    claude_binary: &str,
 ) -> Result<BuildClaudeCommandResult, String> {
     crate::agent_home::ensure_agent_homes()?;
-    let claude_binary = resolve_claude_path().unwrap_or_else(|| "claude".to_string());
-    let mut command = Command::new(&claude_binary);
+    let mut command = Command::new(claude_binary);
     let permission_mode = official_permission_mode(&options.perm_mode);
     let permission_bridge = if permission_mode == "bypassPermissions" {
         None
@@ -2625,7 +2625,8 @@ mod tests {
             source: ManagedSessionSource::Desktop,
         };
 
-        let command = build_claude_command(&options, "runtime-test").expect("build command");
+        let command = build_claude_command(&options, "runtime-test", "/test/selected-claude").expect("build command");
+        assert_eq!(command.command.get_program(), "/test/selected-claude");
         let args = command
             .command
             .get_args()
@@ -2659,7 +2660,7 @@ mod tests {
             source: ManagedSessionSource::Desktop,
         };
 
-        let command = build_claude_command(&options, "runtime-env-test")
+        let command = build_claude_command(&options, "runtime-env-test", "/test/selected-claude")
             .expect("build Claude command")
             .command;
         let command_env = command
