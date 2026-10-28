@@ -513,7 +513,7 @@ test('composer footer compact threshold is wired through the shared footer row u
   // view) renders through this single footer row, so the compact contract has
   // one anchor.
   assert.match(component, /group\/composer-footer/);
-  assert.match(component, /data-compact=\{composerFooterCompact \|\| undefined\}/);
+  assert.match(component, /data-compact=\{compact \|\| composerFooterCompact \|\| undefined\}/);
   const controls = await fs.readFile(
     path.join(desktopDir, 'src', 'components', 'workspace', 'ComposerControls.tsx'),
     'utf8',
