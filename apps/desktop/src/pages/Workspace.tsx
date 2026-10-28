@@ -65,7 +65,7 @@ import { useNativeBrowserActivation } from '@/components/workspace/useNativeBrow
 import { ComposerControls } from '@/components/workspace/ComposerControls';
 import type { EffortLevel } from '@/components/workspace/ComposerControls';
 import type { PermissionModeName } from '@ccem/core/browser';
-import type { ComposerSubmitResult } from '@/components/workspace/composerSubmissionResult';
+import { nativeCreateFailure, type ComposerSubmitResult } from '@/components/workspace/composerSubmissionResult';
 import {
   buildComposerPromptPreview,
   buildComposerPromptText,
@@ -3088,17 +3088,10 @@ export function Workspace({
       return true;
     } catch (error) {
       console.error('Failed to create native workspace session:', error);
-      if (createAttempted) return createAccepted ? true : 'delivery_uncertain';
-      // An opted-in launch failure must surface the backend's specific error
-      // (e.g. ROUTER_* validation), not just the generic banner — the draft is
-      // intentionally KEPT so the user can adjust and retry.
-      if (routerLaunchDraft) {
-        const detail = error instanceof Error ? error.message : String(error);
-        toast.error(detail || t('workspace.nativeCreateFailed'));
-      } else {
-        toast.error(t('workspace.nativeCreateFailed'));
-      }
-      return false;
+      if (createAccepted) return true;
+      const failure = nativeCreateFailure(error);
+      toast.error(failure.detail || t('workspace.nativeCreateFailed'));
+      return createAttempted ? failure.result : false;
     } finally {
       setIsCreatingNativeSession(false);
     }
@@ -3307,14 +3300,10 @@ export function Workspace({
       return true;
     } catch (error) {
       console.error('Failed to continue workspace history session:', error);
-      if (createAttempted) return createAccepted ? true : 'delivery_uncertain';
-      if (routerLaunchDraft || resumeRouterFromRuntimeId) {
-        const detail = error instanceof Error ? error.message : String(error);
-        toast.error(detail || t('workspace.nativeCreateFailed'));
-      } else {
-        toast.error(t('workspace.nativeCreateFailed'));
-      }
-      return false;
+      if (createAccepted) return true;
+      const failure = nativeCreateFailure(error);
+      toast.error(failure.detail || t('workspace.nativeCreateFailed'));
+      return createAttempted ? failure.result : false;
     } finally {
       setIsResumingHistorySession(false);
     }
@@ -3474,7 +3463,7 @@ export function Workspace({
       setForkDialog(null);
     } catch (error) {
       console.error('Failed to fork session from turn:', error);
-      const detail = error instanceof Error ? error.message : String(error);
+      const { detail } = nativeCreateFailure(error);
       toast.error(detail || t('workspace.forkTurnCreateFailed'));
     } finally {
       setIsForkingTurn(false);

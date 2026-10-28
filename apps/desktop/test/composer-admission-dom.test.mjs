@@ -199,7 +199,7 @@ async function importHarness() {
         import { Button } from '@/components/ui/button';
         const ProcessingActionIcon = () => <span>stop</span>;
         import { WorkspaceSessionComposer } from '@/components/workspace/WorkspaceSessionComposer';
-        import { COMPOSER_DELIVERY_UNCERTAIN_TOAST_ID, nativeComposerFailureResult } from '@/components/workspace/composerSubmissionResult';
+        import { COMPOSER_DELIVERY_UNCERTAIN_TOAST_ID, nativeComposerFailureResult, nativeCreateFailure } from '@/components/workspace/composerSubmissionResult';
         import { readRecoveryDraft, writeRecoveryDraft, recoveryDraftDiagnostics } from '@/lib/recoveryDrafts';
         export const seedRecovery = writeRecoveryDraft;
         export const recoveryCounts = recoveryDraftDiagnostics;
@@ -378,7 +378,7 @@ async function importHarness() {
             const effectiveComposeDir = route.noWorkingDir ? null : '/tmp';
             const composeRouteDraftRef = { current: { optIn: false } };
             const historyRouteDraftRef = composeRouteDraftRef;
-            const composeProvider = 'claude';
+            const composeProvider = route.provider ?? 'claude';
             const currentEnv = 'fixture';
             const historyEnv = currentEnv;
             const permissionMode = 'dev';
@@ -388,7 +388,7 @@ async function importHarness() {
             const composeEffort = 'high';
             const historyEffort = composeEffort;
             const normalizeEffortForProvider = effort => effort;
-            const selectedSession = { source: 'claude', project: effectiveComposeDir, id: 'history-fixture' };
+            const selectedSession = { source: composeProvider, project: effectiveComposeDir, id: 'history-fixture' };
             const messages = [];
             const historyRouteResolutionStatusRef = { current: 'resolved' };
             const isHistoryRouteContinuationBlocked = () => false;
@@ -1597,7 +1597,7 @@ for (const scenario of [
     assert.equal(mounted.state.calls, 1);
     await mounted.reject(new Error('transport disconnected after request dispatch'));
     assert.equal(mounted.state.result, 'delivery_uncertain');
-    assert.deepEqual(mounted.state.errors, []);
+    assert.deepEqual(mounted.state.errors, scenario.launch ? ['transport disconnected after request dispatch'] : []);
     assert.deepEqual(globalThis.__acceptanceToasts, [{
       kind: 'warning', message: 'workspace.composerDeliveryUncertain', options: { id: 'composer-delivery-uncertain' },
     }]);
@@ -1619,6 +1619,47 @@ for (const scenario of [
 }
 
 for (const launch of ['compose', 'history']) {
+  for (const provider of ['claude', 'codex']) {
+    test(`actual ${provider} ${launch} startup rejection shows the cause and keeps a retryable draft`, async (t) => {
+      const { container, restore } = installDom();
+      t.after(restore);
+      const harness = await (importedHarnessPromise ??= importHarness());
+      window.__ccemRecoveryTest = true;
+      globalThis.__acceptanceToasts = [];
+      t.after(() => { delete globalThis.__acceptanceToasts; });
+      const key = `rejected-${provider}-${launch}`;
+      const image = { id: 'rejected-image', kind: 'image', source: 'paste', name: 'context.png',
+        placeholder: '[Image #1]', mediaType: 'image/png', base64Data: 'aGVsbG8=', byteSize: 5, objectUrl: null };
+      harness.seedRecovery(key, 'retryable context [Image #1]', [image]);
+      const route = { launch, provider, recoveryKey: key };
+      const mounted = harness.mountFailure(container, false, null, null, route);
+      await mounted.submit();
+      assert.equal(mounted.state.calls, 1);
+      assert.equal(mounted.state.payloads[0].provider, provider);
+      const detail = 'Working directory is unavailable: /deleted/project';
+      await mounted.reject(`NATIVE_CREATE_REJECTED: ${detail}`);
+      assert.equal(mounted.state.result, false);
+      assert.deepEqual(mounted.state.errors, [detail]);
+      assert.deepEqual(globalThis.__acceptanceToasts, []);
+      assert.match(mounted.text(), /retryable context/);
+      assert.equal(harness.recoveryCounts().uncertain, 0);
+      assert.equal(harness.recoveryDraft(key).text, 'retryable context [Image #1]');
+      assert.equal(harness.recoveryDraft(key).attachments.length, 1);
+      mounted.unmount();
+
+      const remounted = harness.mountFailure(container, false, null, null, route);
+      assert.match(remounted.text(), /retryable context/);
+      assert.equal(container.querySelectorAll('[data-composer-attachment-chip]').length, 1);
+      await remounted.submit();
+      assert.equal(remounted.state.calls, 1, 'explicit retry submits once after remount');
+      await remounted.reject(new Error('NATIVE_CREATE_REJECTED: Environment missing'));
+      assert.equal(remounted.state.result, false);
+      assert.deepEqual(remounted.state.errors, ['Environment missing']);
+      assert.equal(harness.recoveryCounts().uncertain, 0);
+      remounted.unmount();
+    });
+  }
+
   test(`actual ${launch} preflight failure keeps its draft definitely unsubmitted`, async (t) => {
     const { container, restore } = installDom();
     t.after(restore);

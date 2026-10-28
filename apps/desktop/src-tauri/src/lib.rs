@@ -1361,6 +1361,25 @@ fn prepare_workspace_initial_prompt(
     prompt
 }
 
+// Only use this before NativeRuntimeManager::create_session is called: errors
+// after runtime creation begins can no longer prove the prompt was not sent.
+fn native_create_rejection(error: String) -> String {
+    if error == codex_migration::PREFLIGHT_CHANGED_ERROR {
+        return error;
+    }
+    format!("NATIVE_CREATE_REJECTED: {error}")
+}
+
+fn validate_native_working_dir(working_dir: &str) -> Result<(), String> {
+    let metadata = std::fs::metadata(working_dir).map_err(|error| {
+        format!("Cannot open working directory '{working_dir}': {error}")
+    })?;
+    if !metadata.is_dir() {
+        return Err(format!("Working directory '{working_dir}' is not a directory"));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn create_native_session(
     app: tauri::AppHandle,
@@ -1384,18 +1403,19 @@ async fn create_native_session(
     codex_migration_proof_token: Option<String>,
     codex_isolated: Option<bool>,
 ) -> Result<NativeSessionSummary, String> {
-    let mutation_guard = environment_mutations.lock()?;
-    let provider = parse_native_provider(&provider)?;
+    let mutation_guard = environment_mutations.lock().map_err(native_create_rejection)?;
+    let provider = parse_native_provider(&provider).map_err(native_create_rejection)?;
     validate_router_create_selection(
         router_launch_draft.as_ref(),
         resume_router_from_runtime_id.as_deref(),
-    )?;
+    )
+    .map_err(native_create_rejection)?;
     if fork_from_message_id.is_some() {
         if provider != NativeProvider::Claude {
-            return Err(
+            return Err(native_create_rejection(
                 "FORK_PROVIDER_UNSUPPORTED: forking from a message is only available for Claude sessions"
                     .to_string(),
-            );
+            ));
         }
         if provider_session_id
             .as_deref()
@@ -1403,26 +1423,30 @@ async fn create_native_session(
             .unwrap_or("")
             .is_empty()
         {
-            return Err(
+            return Err(native_create_rejection(
                 "FORK_MISSING_PARENT: forking requires provider_session_id of the parent session"
                     .to_string(),
-            );
+            ));
         }
     }
     let fork_from_message_id = fork_from_message_id.filter(|value| !value.trim().is_empty());
     if provider != NativeProvider::Claude && router_launch_draft.is_some() {
-        return Err(
+        return Err(native_create_rejection(
             "ROUTER_PROVIDER_UNSUPPORTED: dynamic routing is only available for Claude sessions"
                 .to_string(),
-        );
+        ));
     }
     let effective_working_dir = resolve_headless_working_dir(working_dir);
+    validate_native_working_dir(&effective_working_dir).map_err(native_create_rejection)?;
     let codex_isolated = if provider == NativeProvider::Codex {
         Some(match provider_session_id.as_ref().and(codex_isolated) {
             Some(mode) => mode,
-            None => match native_state.codex_profile_for_resume(provider_session_id.as_deref(), &effective_working_dir)? {
+            None => match native_state
+                .codex_profile_for_resume(provider_session_id.as_deref(), &effective_working_dir)
+                .map_err(native_create_rejection)?
+            {
                 Some(mode) => mode,
-                None => agent_home::codex_isolation_preference()?,
+                None => agent_home::codex_isolation_preference().map_err(native_create_rejection)?,
             },
         })
     } else { None };
@@ -1432,7 +1456,8 @@ async fn create_native_session(
             &effective_working_dir,
             codex_migration_proof_token.as_deref(),
             codex_isolated,
-        )?
+        )
+        .map_err(native_create_rejection)?
     } else {
         None
     };
@@ -1446,7 +1471,8 @@ async fn create_native_session(
                 &effective_working_dir,
             )
         })
-        .transpose()?;
+        .transpose()
+        .map_err(native_create_rejection)?;
     let effective_perm_mode = resolve_effective_perm_mode(perm_mode);
     let effective_runtime_perm_mode = runtime_perm_mode
         .map(|mode| mode.trim().to_string())
@@ -1461,7 +1487,7 @@ async fn create_native_session(
                 .as_ref()
                 .map(|router| router.default_env.as_str())
                 .unwrap_or(&env_name);
-            let resolved = resolve_claude_env(effective_env_name)?;
+            let resolved = resolve_claude_env(effective_env_name).map_err(native_create_rejection)?;
             NativeSessionOptions {
                 model: None,
                 provider,
@@ -1493,7 +1519,7 @@ async fn create_native_session(
             }
         }
         NativeProvider::Codex => {
-            let resolved = resolve_codex_runtime(&env_name)?;
+            let resolved = resolve_codex_runtime(&env_name).map_err(native_create_rejection)?;
             let proxy_env_vars = system_proxy::resolve_codex_proxy_env();
             NativeSessionOptions {
                 model: None,
@@ -6711,7 +6737,8 @@ mod tests {
     use super::{
         build_remote_load_args, build_remote_load_stdin_payload,
         collect_environment_router_references, media_kind_for_extension, merge_git_numstat,
-        get_workspace_file_diff, parse_git_status, prepare_workspace_initial_prompt,
+        get_workspace_file_diff, native_create_rejection, parse_git_status,
+        prepare_workspace_initial_prompt, validate_native_working_dir,
         RemoteEnvConfig, WorkspaceDiffLineKind, WorkspaceGitChangedFile,
     };
     use crate::router::{
@@ -6848,6 +6875,44 @@ mod tests {
                 "router.defaultAllowedEnvs",
             ]
         );
+    }
+
+    #[test]
+    fn native_create_rejection_preserves_the_reason_and_migration_retry_signal() {
+        let missing_env = "Environment 'removed-env' does not exist";
+        assert_eq!(
+            native_create_rejection(missing_env.to_string()),
+            format!("NATIVE_CREATE_REJECTED: {missing_env}")
+        );
+        assert_eq!(
+            native_create_rejection(crate::codex_migration::PREFLIGHT_CHANGED_ERROR.to_string()),
+            crate::codex_migration::PREFLIGHT_CHANGED_ERROR
+        );
+    }
+
+    #[test]
+    fn native_create_accepts_an_existing_directory() {
+        let directory = tempfile::tempdir().expect("create working directory");
+        assert_eq!(
+            validate_native_working_dir(directory.path().to_str().unwrap()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn native_create_rejects_missing_or_non_directory_projects_before_launch() {
+        let directory = tempfile::tempdir().expect("create fixture directory");
+        let missing = directory.path().join("removed-project");
+        let file = directory.path().join("regular-file");
+        std::fs::write(&file, "fixture").expect("create regular file");
+        for project in [missing, file] {
+            let project = project.to_str().unwrap();
+            let error = validate_native_working_dir(project)
+                .map_err(native_create_rejection)
+                .expect_err("invalid project must be rejected before runtime creation");
+            assert!(error.starts_with("NATIVE_CREATE_REJECTED: "));
+            assert!(error.contains(project), "include the project that needs correction");
+        }
     }
 
     #[test]

@@ -302,8 +302,9 @@ test('source regression: opted-in submit carries the draft; opted-out omits it; 
   assert.ok(composeBlock.includes('resolveRouterLaunchDraft('), 'submit must resolve the seed');
   assert.ok(composeBlock.includes('routerLaunchDraft,'), 'create call must carry the draft');
   assert.ok(
-    composeBlock.includes('if (routerLaunchDraft) {'),
-    'opted-in failures must surface the backend error specifically',
+    composeBlock.includes('nativeCreateFailure(error)')
+      && composeBlock.includes("toast.error(failure.detail || t('workspace.nativeCreateFailed'))"),
+    'all startup failures, including opted-in routes, must surface the backend reason',
   );
 
   const codexGuard = source.indexOf("if (composeProvider !== 'claude') {\n      updateComposeRouteDraftState(createComposerRouteDraft());");
