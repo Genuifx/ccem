@@ -27,9 +27,15 @@ import {
   focusAfterClosingPane,
   isSplitViewShown,
   pruneSplitPanes,
+  isSplitHistoryPaneId,
   splitGridLayout,
+  toSplitHistoryPaneId,
   toggleSplitPane,
 } from '@/components/workspace/workspaceSplitView';
+import {
+  WorkspaceSplitHistoryPane,
+  type SplitHistoryResumeControls,
+} from '@/components/workspace/WorkspaceSplitHistoryPane';
 import { toast } from 'sonner';
 import { shallow } from 'zustand/shallow';
 import { WorkspaceStatusStrip } from '@/components/workspace/WorkspaceStatusStrip';
@@ -110,6 +116,7 @@ import {
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
 import { dispatchAppZoomCommand } from '@/hooks/useZoom';
 import { useLocale } from '@/locales';
+import { getHistorySessionDisplay } from '@/components/history/historySession';
 import { scheduleAfterFirstPaint } from '@/lib/idle';
 import { useNativeSurfaceOccluded } from '@/lib/nativeSurfaceOcclusion';
 import { createReentryGuard, type ReentryGuard } from '@/lib/asyncGuard';
@@ -588,9 +595,13 @@ export function Workspace({
   // Runtime ids shown together in split view. The layout survives opening a
   // non-member session and comes back when a member is focused again.
   const [splitRuntimeIds, setSplitRuntimeIds] = useState<string[]>([]);
-  // An ended session cannot join directly: Cmd+click opens it alone, and the
-  // runtime its first follow-up resumes into joins the split.
-  const pendingSplitRef = useRef<{ sessionKey: string; seedId: string | null } | null>(null);
+  const splitRuntimeIdsRef = useRef(splitRuntimeIds);
+  splitRuntimeIdsRef.current = splitRuntimeIds;
+  // Sessions without a native record sit in history panes (see
+  // WorkspaceSplitHistoryPane) under a `history:` pane id.
+  const [splitHistorySessions, setSplitHistorySessions] = useState<Record<string, HistorySessionItem>>({});
+  const splitHistorySessionsRef = useRef(splitHistorySessions);
+  splitHistorySessionsRef.current = splitHistorySessions;
   const splitGridRef = useRef<HTMLDivElement | null>(null);
   const [splitGridSize, setSplitGridSize] = useState({ width: 0, height: 0 });
   const composeViewRef = useRef<HTMLDivElement | null>(null);
@@ -1107,7 +1118,7 @@ export function Workspace({
       return;
     }
 
-    if (activeLiveRuntimeId) {
+    if (activeLiveRuntimeId && !isSplitHistoryPaneId(activeLiveRuntimeId)) {
       localStorage.setItem(ACTIVE_LIVE_RUNTIME_STORAGE_KEY, activeLiveRuntimeId);
       return;
     }
@@ -1810,9 +1821,9 @@ export function Workspace({
   useEffect(() => {
     setSplitRuntimeIds((current) => pruneSplitPanes(
       current,
-      new Set(Object.keys(liveSessionsByRuntimeId)),
+      new Set([...Object.keys(liveSessionsByRuntimeId), ...Object.keys(splitHistorySessions)]),
     ));
-  }, [liveSessionsByRuntimeId]);
+  }, [liveSessionsByRuntimeId, splitHistorySessions]);
 
   const isSplitView = workspaceMode === 'live'
     && isSplitViewShown(splitRuntimeIds, activeLiveRuntimeId);
@@ -1844,13 +1855,15 @@ export function Workspace({
   const splitSessionKeys = useMemo(() => {
     const keys = new Set<string>();
     for (const runtimeId of splitRuntimeIds) {
+      const historySession = splitHistorySessions[runtimeId];
+      if (historySession) keys.add(toSessionKey(historySession));
       const entry = liveSessionsByRuntimeId[runtimeId];
       if (!entry) continue;
       keys.add(liveSessionSidebarKey(entry));
       keys.add(liveSessionRuntimeSidebarKey(entry));
     }
     return keys;
-  }, [liveSessionsByRuntimeId, splitRuntimeIds]);
+  }, [liveSessionsByRuntimeId, splitHistorySessions, splitRuntimeIds]);
 
   // Live summaries refresh every couple of seconds during a turn. Reuse the
   // previous rows when nothing visible changed so the sidebar and its
@@ -2511,7 +2524,11 @@ export function Workspace({
         console.error('Failed to mark selected history session read:', error);
       });
       if (!selectionIsCurrent()) return;
-      if (liveEntry && canRestoreWorkspaceLiveSession(liveEntry.session)) {
+      if (liveEntry && (
+        canRestoreWorkspaceLiveSession(liveEntry.session)
+        // An ended split member stays in its pane (it resumes on send).
+        || splitRuntimeIdsRef.current.includes(liveEntry.session.runtime_id)
+      )) {
         updateHistoryRouteResolutionStatus('ready');
         updateIsLoadingMessages(false);
         setActiveLiveRuntimeId(liveEntry.session.runtime_id);
@@ -2616,55 +2633,255 @@ export function Workspace({
     setWorkspaceMode('live');
   }, [setSelectedWorkingDir, upsertLiveSessionEntry]);
 
+  // A session joins as a live pane when it has a native record: a restorable
+  // runtime, or an ended one whose composer resumes it. Otherwise it joins as
+  // a history pane (provider transcript), resumed by its first send.
+  const resolveSplitPaneForSession = useCallback(async (
+    session: HistorySessionItem,
+  ): Promise<string | null> => {
+    // In-memory first; then ONE native lookup (a full record scan) serves
+    // both the restorable and the ended case.
+    const existing = findLiveEntryForSession(session);
+    if (existing) return existing.session.runtime_id;
+    const record = await findNativeHistorySessionForSession(session).catch(() => null);
+    if (record) {
+      upsertLiveSessionEntry(record);
+      void hydrateLiveEntryFromHistory(record);
+      return record.runtime_id;
+    }
+    if (session.source !== 'claude' && session.source !== 'codex') return null;
+    const paneId = toSplitHistoryPaneId(toSessionKey(session));
+    setSplitHistorySessions((current) => ({ ...current, [paneId]: session }));
+    return paneId;
+  }, [
+    findLiveEntryForSession,
+    findNativeHistorySessionForSession,
+    hydrateLiveEntryFromHistory,
+    upsertLiveSessionEntry,
+  ]);
+
+  const focusSplitPane = useCallback((paneId: string) => {
+    setActiveLiveRuntimeId(paneId);
+    const historySession = splitHistorySessionsRef.current[paneId];
+    if (historySession) {
+      const key = toSessionKey(historySession);
+      selectedKeyRef.current = key;
+      setSelectedKey(key);
+    }
+  }, []);
+
   const handleToggleSplitSession = useCallback(async (session: HistorySessionItem) => {
-    const entry = await ensureLiveEntryForSession(session).catch((error) => {
-      console.error('Failed to resolve native session for split view:', error);
-      return null;
-    });
-    if (!entry || !canRestoreWorkspaceLiveSession(entry.session)) {
-      pendingSplitRef.current = {
-        sessionKey: toSessionKey(session),
-        seedId: workspaceMode === 'live' ? activeLiveRuntimeId : null,
-      };
-      toast.info(t('workspace.splitResumeFirst'));
-      void handleSelect(session);
+    const paneId = await resolveSplitPaneForSession(session);
+    if (!paneId) {
+      toast.info(t('workspace.historyContinueUnsupported'));
       return;
     }
-    pendingSplitRef.current = null;
-    const runtimeId = entry.session.runtime_id;
     const seedId = workspaceMode === 'live' ? activeLiveRuntimeId : null;
-    const result = toggleSplitPane(splitRuntimeIds, seedId, runtimeId);
+    const result = toggleSplitPane(splitRuntimeIds, seedId, paneId);
     if (result.kind === 'full') {
       toast.info(t('workspace.splitFull', { count: MAX_SPLIT_PANES }));
       return;
     }
     setSplitRuntimeIds(result.paneIds);
     const nextActive = result.kind === 'added'
-      ? runtimeId
+      ? paneId
       : focusAfterClosingPane(
         splitRuntimeIds.length > 0 ? splitRuntimeIds : result.paneIds,
-        runtimeId,
+        paneId,
         activeLiveRuntimeId,
       );
     if (nextActive) {
-      setActiveLiveRuntimeId(nextActive);
+      focusSplitPane(nextActive);
       setWorkspaceMode('live');
     }
-  }, [activeLiveRuntimeId, ensureLiveEntryForSession, handleSelect, splitRuntimeIds, t, workspaceMode]);
+  }, [activeLiveRuntimeId, focusSplitPane, resolveSplitPaneForSession, splitRuntimeIds, t, workspaceMode]);
 
-  useEffect(() => {
-    if (pendingSplitRef.current && pendingSplitRef.current.sessionKey !== selectedKey) {
-      pendingSplitRef.current = null;
-    }
-  }, [selectedKey]);
-
-  const handleCloseSplitPane = useCallback((runtimeId: string) => {
-    setActiveLiveRuntimeId((current) => focusAfterClosingPane(splitRuntimeIds, runtimeId, current));
+  const handleCloseSplitPane = useCallback((paneId: string) => {
+    const nextActive = focusAfterClosingPane(splitRuntimeIds, paneId, activeLiveRuntimeId);
+    if (nextActive && nextActive !== activeLiveRuntimeId) focusSplitPane(nextActive);
     setSplitRuntimeIds((current) => {
-      const remaining = current.filter((id) => id !== runtimeId);
+      const remaining = current.filter((id) => id !== paneId);
       return remaining.length >= 2 ? remaining : [];
     });
-  }, [splitRuntimeIds]);
+  }, [activeLiveRuntimeId, focusSplitPane, splitRuntimeIds]);
+
+  // First send in a pane without a running runtime: resume the provider
+  // session into a new runtime, then swap the pane over to it in place.
+  const resumeIntoSplitPane = useCallback(async (
+    paneId: string,
+    target: {
+      provider: 'claude' | 'codex';
+      providerSessionId: string;
+      envName: string;
+      permMode: string;
+      effort: string | null;
+      workingDir: string;
+      codexIsolated: boolean;
+      resumeRouterFromRuntimeId: string | null;
+      seedMessages: ConversationMessageData[];
+    },
+    payload: ComposerSubmitPayload,
+  ): Promise<ComposerSubmitResult> => {
+    const { provider } = target;
+    const attachments = payload.attachments ?? [];
+    const prompt = buildComposerPromptText(payload.text, attachments);
+    const images = extractComposerImagePayloads(attachments);
+    if (!prompt && images.length === 0) return false;
+    const previewPrompt = buildComposerPromptPreview(payload.displayText ?? payload.text, attachments);
+    const dispatch = resolveComposerDispatch({
+      provider,
+      prompt,
+      permissionMode: target.permMode,
+      planModeEnabled: false,
+    });
+    const codexIsolated = provider === 'codex' ? target.codexIsolated : null;
+    let createAttempted = false;
+    let createAccepted = false;
+    try {
+      const launch = await startAfterCodexModelMigrationGate({
+        provider,
+        envName: target.envName,
+        workingDir: target.workingDir,
+        codexIsolated,
+        preflight: preflightCodexModelMigration,
+        confirm: requestCodexModelMigrationDecision,
+        acknowledgedWarnings: acknowledgedCodexModelWarningsRef.current,
+        start: async (codexMigrationProofToken) => {
+          createAttempted = true;
+          const summary = await createNativeSession({
+            provider,
+            envName: target.envName,
+            permMode: dispatch.permMode,
+            runtimePermMode: dispatch.runtimePermMode,
+            workingDir: target.workingDir,
+            initialPrompt: dispatch.prompt,
+            initialDisplayPrompt: previewPrompt,
+            initialImages: images.length > 0 ? images : undefined,
+            initialAnnotations: payload.annotations,
+            providerSessionId: target.providerSessionId,
+            codexIsolated,
+            effort: normalizeEffortForProvider(target.effort, provider),
+            seedBoundaryMessageCount: target.seedMessages.length,
+            routerLaunchDraft: null,
+            resumeRouterFromRuntimeId: target.resumeRouterFromRuntimeId,
+            codexMigrationProofToken,
+          });
+          createAccepted = true;
+          return summary;
+        },
+      });
+      if (!launch.started) {
+        if (launch.reason === 'preflight_changed') {
+          toast.error(t('workspace.codexModelMigrationChanged'));
+        }
+        return false;
+      }
+      const summary = launch.value;
+      upsertLiveSessionEntry(summary, {
+        initialPrompt: previewPrompt,
+        initialImages: images.length > 0 ? images : null,
+        initialAnnotations: payload.annotations ?? null,
+        seedMessages: target.seedMessages,
+      });
+      setSplitRuntimeIds((current) => current.map((id) => (id === paneId ? summary.runtime_id : id)));
+      setActiveLiveRuntimeId((current) => (current === paneId ? summary.runtime_id : current));
+      scheduleWorkspaceRefresh(1200);
+      return true;
+    } catch (error) {
+      console.error('Failed to resume split pane session:', error);
+      if (createAttempted) return createAccepted ? true : 'delivery_uncertain';
+      toast.error(t('workspace.nativeCreateFailed'));
+      return false;
+    }
+  }, [
+    buildComposerPromptPreview,
+    buildComposerPromptText,
+    createNativeSession,
+    extractComposerImagePayloads,
+    preflightCodexModelMigration,
+    requestCodexModelMigrationDecision,
+    scheduleWorkspaceRefresh,
+    t,
+    upsertLiveSessionEntry,
+  ]);
+
+  // Ended native pane: keep its own env/permissions/effort/routing.
+  const handleResumeSplitPane = useCallback(async (
+    runtimeId: string,
+    payload: ComposerSubmitPayload,
+  ): Promise<ComposerSubmitResult> => {
+    const ended = liveSessionsByRuntimeIdRef.current[runtimeId]?.session;
+    if (!ended?.provider_session_id) {
+      toast.error(t('workspace.nativeCreateFailed'));
+      return false;
+    }
+    const seedMessages = await fetchConversationDetail({
+      id: ended.provider_session_id,
+      source: ended.provider,
+      codexIsolated: ended.codex_isolated ?? false,
+    }).then(
+      (detail) => detail.messages,
+      () => liveSessionsByRuntimeIdRef.current[runtimeId]?.seedMessages ?? [],
+    );
+    return resumeIntoSplitPane(runtimeId, {
+      provider: ended.provider,
+      providerSessionId: ended.provider_session_id,
+      envName: ended.env_name,
+      permMode: ended.perm_mode,
+      effort: ended.effort ?? null,
+      workingDir: ended.project_dir,
+      codexIsolated: ended.codex_isolated ?? false,
+      resumeRouterFromRuntimeId: ended.provider === 'claude'
+        && resolveHistoryRouteRestore(ended).kind === 'restored'
+        ? ended.runtime_id
+        : null,
+      seedMessages,
+    }, payload);
+  }, [resumeIntoSplitPane, t]);
+
+  // History pane: the pane's own env/permission/effort controls.
+  const handleResumeHistoryPane = useCallback(async (
+    paneId: string,
+    payload: ComposerSubmitPayload,
+    controls: SplitHistoryResumeControls,
+    seedMessages: ConversationMessageData[],
+  ): Promise<ComposerSubmitResult> => {
+    const session = splitHistorySessionsRef.current[paneId];
+    if (!session || (session.source !== 'claude' && session.source !== 'codex')) return false;
+    return resumeIntoSplitPane(paneId, {
+      provider: session.source,
+      providerSessionId: session.id,
+      envName: controls.envName,
+      permMode: controls.permMode,
+      effort: controls.effort,
+      workingDir: session.project,
+      codexIsolated: session.codexIsolated ?? false,
+      resumeRouterFromRuntimeId: null,
+      seedMessages,
+    }, payload);
+  }, [resumeIntoSplitPane]);
+
+  const handleResumeSplitPaneRef = useRef(handleResumeSplitPane);
+  handleResumeSplitPaneRef.current = handleResumeSplitPane;
+  const handleResumeHistoryPaneRef = useRef(handleResumeHistoryPane);
+  handleResumeHistoryPaneRef.current = handleResumeHistoryPane;
+  // Stable per-pane callbacks so memoized pane views do not re-render.
+  const resumeSplitPaneHandlers = useMemo(() => Object.fromEntries(
+    splitRuntimeIds.map((id) => [
+      id,
+      (payload: ComposerSubmitPayload) => handleResumeSplitPaneRef.current(id, payload),
+    ]),
+  ), [splitRuntimeIds]);
+  const resumeHistoryPaneHandlers = useMemo(() => Object.fromEntries(
+    splitRuntimeIds.map((id) => [
+      id,
+      (
+        payload: ComposerSubmitPayload,
+        controls: SplitHistoryResumeControls,
+        seedMessages: ConversationMessageData[],
+      ) => handleResumeHistoryPaneRef.current(id, payload, controls, seedMessages),
+    ]),
+  ), [splitRuntimeIds]);
 
   const openCcemSessionLink = useCallback(async (link: string) => {
     const parsed = parseCcemSessionLink(link);
@@ -3405,14 +3622,6 @@ export function Workspace({
         initialAnnotations: payload?.annotations ?? null,
         seedMessages: messages,
       });
-      const pendingSplit = pendingSplitRef.current;
-      if (pendingSplit?.sessionKey === toSessionKey(selectedSession)) {
-        pendingSplitRef.current = null;
-        setSplitRuntimeIds((current) => {
-          const result = toggleSplitPane(current, pendingSplit.seedId, summary.runtime_id);
-          return result.kind === 'added' ? result.paneIds : current;
-        });
-      }
       setActiveLiveRuntimeId(summary.runtime_id);
       setWorkspaceMode('live');
       resetHistoryComposerText('');
@@ -3847,6 +4056,32 @@ export function Workspace({
     return () => window.removeEventListener('keydown', handler);
   }, [handleWorkspaceEscapeShortcut, isActive, isActiveLiveSessionVisible]);
 
+  const renderSplitPaneHeader = (paneId: string, title: string, hint: string, isFocusedPane: boolean) => (
+    <div className="workspace-split-pane-header flex h-9 shrink-0 items-center gap-2 pl-3.5 pr-1.5">
+      <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium" title={hint}>
+        {title}
+      </span>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className={cn(
+          'h-6 w-6 shrink-0 rounded-md text-muted-foreground transition-opacity duration-150 hover:text-foreground',
+          'opacity-0 focus-visible:opacity-100 group-hover/split-pane:opacity-100',
+          isFocusedPane && 'opacity-100',
+        )}
+        aria-label={t('workspace.splitClosePane')}
+        title={t('workspace.splitClosePane')}
+        onClick={(event) => {
+          event.stopPropagation();
+          handleCloseSplitPane(paneId);
+        }}
+      >
+        <X className="h-3.5 w-3.5" />
+      </Button>
+    </div>
+  );
+
   const renderComposeView = () => (
     <div ref={composeViewRef} className="flex h-full min-h-0 flex-col items-center px-4 sm:px-6 lg:px-8">
       <div className="flex flex-1 flex-col items-center justify-end">
@@ -4123,8 +4358,17 @@ export function Workspace({
     handleSelectRef.current = handleSelect;
   }, [handleSelect]);
   const handleProjectTreeSelect = useCallback(
-    (...args: Parameters<typeof handleSelect>) => handleSelectRef.current(...args),
-    [],
+    (...args: Parameters<typeof handleSelect>) => {
+      // A session shown in a history pane is focused there, not reopened alone.
+      const historyPaneId = toSplitHistoryPaneId(toSessionKey(args[0]));
+      if (splitRuntimeIdsRef.current.includes(historyPaneId)) {
+        focusSplitPane(historyPaneId);
+        setWorkspaceMode('live');
+        return Promise.resolve();
+      }
+      return handleSelectRef.current(...args);
+    },
+    [focusSplitPane],
   );
 
   const handleToggleSplitSessionRef = useRef(handleToggleSplitSession);
@@ -4395,11 +4639,11 @@ export function Workspace({
 
               {workspaceMode === 'history' && selectedSession
                 ? renderHistoryView()
-                : workspaceMode === 'compose' || (workspaceMode === 'live' && !activeLiveEntry)
+                : workspaceMode === 'compose' || (workspaceMode === 'live' && !activeLiveEntry && !isSplitView)
                   ? renderComposeView()
                   : null}
 
-              {liveSessionEntries.length > 0 ? (
+              {liveSessionEntries.length > 0 || isSplitView ? (
                 <div
                   ref={splitGridRef}
                   data-ccem-split-view={isSplitView ? splitRuntimeIds.length : undefined}
@@ -4409,7 +4653,7 @@ export function Workspace({
                   } : undefined}
                   className={cn(
                     'relative min-h-0 flex-1 overflow-hidden',
-                    workspaceMode === 'live' && activeLiveEntry ? (isSplitView ? 'workspace-split-grid grid' : 'block') : 'hidden',
+                    isSplitView ? 'workspace-split-grid grid' : workspaceMode === 'live' && activeLiveEntry ? 'block' : 'hidden',
                   )}
                 >
                   {liveSessionEntries.map((entry) => {
@@ -4439,36 +4683,16 @@ export function Workspace({
                             : cn('absolute inset-0', isActiveLiveEntry ? 'flex flex-col' : 'hidden'),
                         )}
                       >
-                        {isSplitPane ? (
-                          <div className="workspace-split-pane-header flex h-9 shrink-0 items-center gap-2 pl-3.5 pr-1.5">
-                            <span
-                              className="min-w-0 flex-1 truncate text-[12.5px] font-medium"
-                              title={entry.session.project_dir}
-                            >
-                              {toLiveHistorySessionItem(entry)?.display
-                                || entry.session.display_title
-                                || entry.session.project_dir}
-                            </span>
-                            <Button
-                              type="button"
-                              variant="ghost"
-                              size="icon"
-                              className={cn(
-                                'h-6 w-6 shrink-0 rounded-md text-muted-foreground transition-opacity duration-150 hover:text-foreground',
-                                'opacity-0 focus-visible:opacity-100 group-hover/split-pane:opacity-100',
-                                isActiveLiveEntry && 'opacity-100',
-                              )}
-                              aria-label={t('workspace.splitClosePane')}
-                              title={t('workspace.splitClosePane')}
-                              onClick={(event) => {
-                                event.stopPropagation();
-                                handleCloseSplitPane(runtimeId);
-                              }}
-                            >
-                              <X className="h-3.5 w-3.5" />
-                            </Button>
-                          </div>
-                        ) : null}
+                        {isSplitPane
+                          ? renderSplitPaneHeader(
+                            runtimeId,
+                            toLiveHistorySessionItem(entry)?.display
+                              || entry.session.display_title
+                              || entry.session.project_dir,
+                            entry.session.project_dir,
+                            isActiveLiveEntry,
+                          )
+                          : null}
                         <div className="relative min-h-0 flex-1">
                         <WorkspaceNativeSessionView
                           session={entry.session}
@@ -4482,6 +4706,7 @@ export function Workspace({
                           isVisible={isActive && (isActiveLiveEntry || isSplitPane)}
                           isFocused={isActive && isActiveLiveEntry}
                           compact={isSplitPane}
+                          onResumeTerminal={isSplitPane ? resumeSplitPaneHandlers[runtimeId] : undefined}
                           onSessionUpdate={handleLiveSessionUpdate}
                           codexInstalled={codexInstalled}
                           opencodeInstalled={opencodeInstalled}
@@ -4501,6 +4726,35 @@ export function Workspace({
                       </div>
                     );
                   })}
+                  {isSplitView ? splitRuntimeIds.map((paneId, index) => {
+                    const historySession = isSplitHistoryPaneId(paneId) ? splitHistorySessions[paneId] : null;
+                    if (!historySession) return null;
+                    const isFocusedPane = activeLiveRuntimeId === paneId;
+                    return (
+                      <div
+                        key={paneId}
+                        data-ccem-split-pane={paneId}
+                        data-ccem-split-pane-focused={isFocusedPane ? 'true' : undefined}
+                        style={{ order: index }}
+                        onPointerDownCapture={isFocusedPane ? undefined : () => focusSplitPane(paneId)}
+                        onFocusCapture={isFocusedPane ? undefined : () => focusSplitPane(paneId)}
+                        className="workspace-split-pane group/split-pane relative flex min-h-0 min-w-0 flex-col overflow-hidden"
+                      >
+                        {renderSplitPaneHeader(
+                          paneId,
+                          getHistorySessionDisplay(historySession, t('history.untitledSession')),
+                          historySession.project,
+                          isFocusedPane,
+                        )}
+                        <div className="relative min-h-0 flex-1">
+                          <WorkspaceSplitHistoryPane
+                            session={historySession}
+                            onResume={resumeHistoryPaneHandlers[paneId]}
+                          />
+                        </div>
+                      </div>
+                    );
+                  }) : null}
                 </div>
               ) : null}
             </div>

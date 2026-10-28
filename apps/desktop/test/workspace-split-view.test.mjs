@@ -96,3 +96,12 @@ test('grid picks the layout whose tighter pane dimension is roomiest', () => {
   assert.deepEqual(split.splitGridLayout(4, 1800, 700), { columns: 4, rows: 1 });
   assert.notDeepEqual(split.splitGridLayout(4, 1000, 800), { columns: 3, rows: 2 });
 });
+
+test('history pane ids are namespaced apart from runtime ids', () => {
+  const id = split.toSplitHistoryPaneId('codex:01a14fa2');
+  assert.equal(id, 'history:codex:01a14fa2');
+  assert.equal(split.isSplitHistoryPaneId(id), true);
+  assert.equal(split.isSplitHistoryPaneId('native-0c48d584'), false);
+  // History and live panes share one group and one toggle.
+  assert.deepEqual(split.toggleSplitPane([], 'native-a', id), { kind: 'added', paneIds: ['native-a', id] });
+});

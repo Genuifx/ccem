@@ -4,6 +4,17 @@
 
 export const MAX_SPLIT_PANES = 4;
 
+const HISTORY_PANE_PREFIX = 'history:';
+
+/** Pane id for a session shown from provider history (no native runtime). */
+export function toSplitHistoryPaneId(sessionKey: string): string {
+  return `${HISTORY_PANE_PREFIX}${sessionKey}`;
+}
+
+export function isSplitHistoryPaneId(paneId: string): boolean {
+  return paneId.startsWith(HISTORY_PANE_PREFIX);
+}
+
 export type SplitToggleResult =
   | { kind: 'added'; paneIds: string[] }
   | { kind: 'removed'; paneIds: string[] }

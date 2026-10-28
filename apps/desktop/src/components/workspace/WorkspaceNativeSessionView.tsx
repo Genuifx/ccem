@@ -312,6 +312,11 @@ interface WorkspaceNativeSessionViewProps {
   isFocused?: boolean;
   /** Split-view pane: tighter transcript gutters and a compact composer. */
   compact?: boolean;
+  /**
+   * When set, an ended session keeps a working composer: sending resumes the
+   * provider session into a new runtime (split-view panes).
+   */
+  onResumeTerminal?: (payload: ComposerSubmitPayload) => Promise<ComposerSubmitResult>;
   onSessionUpdate: (session: NativeSessionSummary) => void;
   onStartNew: () => void;
   codexInstalled?: boolean;
@@ -1525,6 +1530,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
   isVisible = true,
   isFocused = isVisible,
   compact = false,
+  onResumeTerminal,
   onSessionUpdate,
   onStartNew,
   codexInstalled = false,
@@ -3465,9 +3471,14 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
     || hasBackgroundTaskPanel;
   const canStopForeground = session.lifecycle?.active_command_id != null
     || (session.provider !== 'claude' && isProcessingTurn);
+  const canResumeTerminal = onResumeTerminal != null
+    && isTerminalStatus(session.status)
+    && session.lifecycle?.active_command_id == null;
+  // Ended and not resumable here: the composer turns into "new session".
+  const isTerminalLocked = isTerminalStatus(session.status) && !canResumeTerminal;
   const canSend = !isSending
     && !(session.provider !== 'claude' && isProcessingTurn)
-    && !isTerminalStatus(session.status)
+    && !isTerminalLocked
     && (composerHasDraft || sessionAnnotations.pendingAnnotations.length > 0);
   const canShowFileRestorePoints = session.provider === 'claude'
     && fileCheckpoints.length > 0;
@@ -4722,10 +4733,12 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
         valueRevision={composerDraftRevision}
         recoveryDraftKey={recoveryDraftKey('live', session.runtime_id)}
         onValueChange={handleComposerTextChange}
-        onSubmit={handleSend}
-        placeholder={compact ? t('workspace.splitComposerPlaceholder') : t('workspace.composePlaceholder')}
+        onSubmit={canResumeTerminal ? onResumeTerminal : handleSend}
+        placeholder={canResumeTerminal
+          ? t('workspace.splitResumePlaceholder')
+          : compact ? t('workspace.splitComposerPlaceholder') : t('workspace.composePlaceholder')}
         compact={compact}
-        disabled={isTerminalStatus(session.status) && session.lifecycle?.active_command_id == null}
+        disabled={isTerminalLocked && session.lifecycle?.active_command_id == null}
         canSubmit={canSend}
         isSubmitting={false}
         submitLabel={t('workspace.composeSend')}
@@ -4733,7 +4746,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
         primaryActionLabel={
           !hasComposerInput && canStopForeground
               ? t('workspace.nativeStop')
-            : isTerminalStatus(session.status)
+            : isTerminalLocked
               ? t('workspace.newSession')
               : shouldGuideModel
                 ? t('workspace.composerGuideModel')
@@ -4742,7 +4755,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
         primaryActionIcon={
           !hasComposerInput && canStopForeground
               ? <ProcessingActionIcon stopping={isStopping} />
-            : isTerminalStatus(session.status)
+            : isTerminalLocked
               ? <SquarePen className="h-4 w-4" />
               : shouldGuideModel
                 ? <MessageSquareQuote className="h-4 w-4" />
@@ -4753,26 +4766,26 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
               ? isStopping
             : session.provider !== 'claude' && isProcessingTurn
               ? true
-            : isTerminalStatus(session.status)
+            : isTerminalLocked
               ? false
               : undefined
         }
         onPrimaryAction={
           !hasComposerInput && canStopForeground
               ? () => void handleStop()
-            : isTerminalStatus(session.status)
+            : isTerminalLocked
               ? onStartNew
               : undefined
         }
         escInterruptAvailable={canStopForeground}
         onEscInterrupt={() => void handleStop('composer_escape')}
         primaryActionVariant={
-          isTerminalStatus(session.status) && session.lifecycle?.active_command_id == null
+          isTerminalLocked && session.lifecycle?.active_command_id == null
             ? 'outline'
             : 'default'
         }
         primaryActionClassName={
-          isTerminalStatus(session.status) && session.lifecycle?.active_command_id == null
+          isTerminalLocked && session.lifecycle?.active_command_id == null
             ? 'shadow-none w-auto rounded-full px-3 gap-1.5'
             : undefined
         }
