@@ -669,32 +669,32 @@ fn migration_lock_recovers_only_an_exited_process() {
 #[cfg(unix)]
 #[test]
 fn snapshot_skips_source_symlinks_and_rejects_destination_symlinks() {
-    use std::os::unix::fs::symlink;
+    use crate::test_support::{symlink_dir, symlink_file};
     let (_temp, home, base) = fixture();
     write(&home.join(".claude/projects/p/real.jsonl"), "transcript");
     write(
         &home.join(".claude/.credentials.json"),
         "fixture credential",
     );
-    symlink(
+    symlink_file(
         home.join(".claude/.credentials.json"),
         home.join(".claude/projects/p/linked.jsonl"),
     )
     .unwrap();
-    symlink(home.join(".claude"), home.join(".claude/projects/p/loop")).unwrap();
+    symlink_dir(home.join(".claude"), home.join(".claude/projects/p/loop")).unwrap();
     ensure_agent_homes_at(&home, &base).unwrap();
     assert!(base.join("claude/projects/p/real.jsonl").exists());
     assert!(!base.join("claude/projects/p/linked.jsonl").exists());
     assert!(!base.join("claude/projects/p/loop").exists());
 
     let linked_base = home.join("linked-agents");
-    symlink(&base, &linked_base).unwrap();
+    symlink_dir(&base, &linked_base).unwrap();
     assert!(ensure_agent_homes_at(&home, &linked_base)
         .unwrap_err()
         .contains("symlink"));
     let second_base = home.join("second-agents");
     fs::create_dir_all(&second_base).unwrap();
-    symlink(home.join(".claude"), second_base.join("claude")).unwrap();
+    symlink_dir(home.join(".claude"), second_base.join("claude")).unwrap();
     assert!(ensure_agent_homes_at(&home, &second_base)
         .unwrap_err()
         .contains("symlink"));
