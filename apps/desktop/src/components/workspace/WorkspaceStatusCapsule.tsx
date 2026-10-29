@@ -79,7 +79,7 @@ export function WorkspaceStatusCapsule({
           className={cn(
             'group relative inline-flex shrink-0 cursor-pointer items-center whitespace-nowrap rounded-full status-chip-glass',
             'hover:scale-[1.02] active:scale-[0.98]',
-            compact ? 'h-8 gap-1 px-2' : 'gap-1.5 px-2.5 py-1 sm:gap-2 sm:px-3.5 sm:py-1.5',
+            compact ? 'h-8 gap-1 px-2' : 'h-8 gap-2 px-3.5',
             open && 'ring-1 ring-inset ring-primary/40',
           )}
         >
@@ -95,14 +95,14 @@ export function WorkspaceStatusCapsule({
               />
             )}
           </span>
-          <span className={cn('text-[12px] font-medium text-foreground', !compact && 'sm:text-[13px]')}>
+          <span className={cn('font-medium text-foreground', compact ? 'text-[12px]' : 'text-[13px]')}>
             {runningLabel}
           </span>
           {showStreak && !compact && (
             <>
               <span className="h-3 w-px bg-foreground/15" aria-hidden="true" />
               <Flame className="h-3.5 w-3.5" style={{ color: STREAK_COLOR }} />
-              <span className="text-[12px] font-medium tabular-nums text-foreground sm:text-[13px]">
+              <span className="text-[13px] font-medium tabular-nums text-foreground">
                 {continuousUsageDays}
               </span>
             </>

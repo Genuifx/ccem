@@ -456,13 +456,13 @@ export function WorkspaceRouteChip({
         onClick={onNavigateEnvironments}
         className={cn(
           'group relative inline-flex shrink-0 items-center whitespace-nowrap rounded-full',
-          compact ? 'h-8 gap-1 px-2' : 'gap-1.5 px-2.5 py-1 sm:gap-2 sm:px-3.5 sm:py-1.5',
+          compact ? 'h-8 gap-1 px-2' : 'h-8 gap-2 px-3.5',
           'status-chip-glass opacity-70 hover:opacity-100',
           onNavigateEnvironments ? 'cursor-pointer' : 'cursor-default',
         )}
       >
         <Route className="h-3.5 w-3.5 text-muted-foreground" />
-        <span className="text-[12px] font-medium text-muted-foreground sm:text-[13px]">
+        <span className={cn('font-medium text-muted-foreground', compact ? 'text-[12px]' : 'text-[13px]')}>
           {t('router.direct')}
         </span>
       </button>
@@ -480,13 +480,13 @@ export function WorkspaceRouteChip({
           title={t('router.title')}
           className={cn(
             'group relative inline-flex shrink-0 items-center whitespace-nowrap rounded-full cursor-pointer',
-            compact ? 'h-8 gap-1 px-2' : 'gap-1.5 px-2.5 py-1 sm:gap-2 sm:px-3.5 sm:py-1.5',
+            compact ? 'h-8 gap-1 px-2' : 'h-8 gap-2 px-3.5',
             'status-chip-glass hover:scale-[1.02] active:scale-[0.98]',
             sessionDegraded && 'ring-1 ring-inset ring-warning/40',
           )}
         >
           <Route className={cn('h-3.5 w-3.5', sessionDegraded ? 'text-warning' : 'text-primary/80')} />
-          <span className="max-w-[8rem] truncate text-[12px] font-medium text-foreground sm:max-w-[10rem] sm:text-[13px]">
+          <span className={cn('truncate font-medium text-foreground', compact ? 'max-w-[6rem] text-[12px]' : 'max-w-[10rem] text-[13px]')}>
             {sessionDegraded ? t('router.degraded') : labelText}
           </span>
         </button>

@@ -1,4 +1,4 @@
-import { useCallback } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Check,
   Settings2,
@@ -73,6 +73,28 @@ interface WorkspaceStatusStripProps {
   onToggleSidebar?: () => void;
   /** Shown only while the list is collapsed, so starting a session never needs the list. */
   onNewSession?: () => void;
+}
+
+// Density follows the strip's own content width (sidebar / side panel / window all
+// change it), not the viewport: below SEARCH_ICON_ONLY_WIDTH the search field
+// folds to an icon; below COMPACT_WIDTH the capsules tighten too.
+const SEARCH_ICON_ONLY_WIDTH = 720;
+const COMPACT_WIDTH = 520;
+const SEARCH_SHORTCUT_WIDTH = 860;
+
+function useElementWidth<T extends HTMLElement>() {
+  const ref = useRef<T>(null);
+  const [width, setWidth] = useState<number | null>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const observer = new ResizeObserver(([entry]) => {
+      setWidth(Math.round(entry.contentRect.width));
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, []);
+  return [ref, width] as const;
 }
 
 const SIDEBAR_ICON_BUTTON_CLASS =
@@ -170,14 +192,24 @@ export function WorkspaceStatusStrip({
   );
 
   const displayEnvironment = environments.find((env) => env.name === displayEnv);
+  const [stripRef, stripWidth] = useElementWidth<HTMLDivElement>();
+  // Before the first measurement assume a roomy strip (the common case).
+  const width = stripWidth ?? Number.POSITIVE_INFINITY;
+  const compact = browserOpen || width < COMPACT_WIDTH;
+  const searchIconOnly = browserOpen || width < SEARCH_ICON_ONLY_WIDTH;
+  const showSearchShortcut = width >= SEARCH_SHORTCUT_WIDTH;
 
   return (
     <div
+      ref={stripRef}
       data-tauri-drag-region
-      data-ccem-workspace-status-compact={browserOpen ? 'browser' : 'default'}
+      data-ccem-workspace-status-compact={browserOpen ? 'browser' : compact ? 'narrow' : searchIconOnly ? 'search-icon' : 'default'}
       className={cn(
         'workspace-status-strip flex shrink-0 items-center min-w-0 overflow-x-auto scroll-glass-root [scrollbar-width:none] [&::-webkit-scrollbar]:hidden',
-        browserOpen ? 'h-10 gap-1 pr-1' : 'h-11 gap-1.5 sm:h-12 sm:gap-2.5',
+        // Fixed h-12 in every mode: the row's center must stay on the macOS
+        // traffic lights (trafficLightPosition y=28); only the gaps tighten.
+        'h-12',
+        browserOpen ? 'gap-1 pr-1' : compact ? 'gap-1.5' : 'gap-2.5',
       )}
     >
       {onToggleSidebar ? (
@@ -219,7 +251,7 @@ export function WorkspaceStatusStrip({
         </div>
       ) : null}
 
-      <WorkspaceStatusCapsule onNavigate={onNavigate} compact={browserOpen} />
+      <WorkspaceStatusCapsule onNavigate={onNavigate} compact={compact} />
 
       {/* Environment quick-switch capsule — icon language matches composer env picker */}
       <DropdownMenu>
@@ -228,8 +260,8 @@ export function WorkspaceStatusStrip({
             type="button"
             title={displayEnv || '—'}
             className={cn(
-              'group relative inline-flex shrink-0 items-center whitespace-nowrap rounded-full',
-              browserOpen ? 'h-8 gap-1 px-2' : 'gap-1.5 px-2.5 py-1 sm:gap-2 sm:px-3.5 sm:py-1.5',
+              'group relative inline-flex min-w-0 items-center whitespace-nowrap rounded-full',
+              compact ? 'h-8 gap-1 px-2' : 'h-8 gap-2 px-3.5',
               'status-chip-glass',
               'hover:scale-[1.02] active:scale-[0.98]',
               'cursor-pointer'
@@ -239,8 +271,8 @@ export function WorkspaceStatusStrip({
               <EnvironmentLobeIcon environment={displayEnvironment} size={14} />
             </span>
             <span className={cn(
-              'max-w-[8.5rem] truncate whitespace-nowrap text-[12px] font-medium text-foreground transition-colors',
-              !browserOpen && 'sm:max-w-[10rem] sm:text-[13px]',
+              'min-w-0 truncate whitespace-nowrap font-medium text-foreground transition-colors',
+              compact ? 'max-w-[7rem] text-[12px]' : 'max-w-[10rem] text-[13px]',
             )}>
               {displayEnv || '—'}
             </span>
@@ -290,7 +322,7 @@ export function WorkspaceStatusStrip({
       <WorkspaceRouteChip
         runtimeId={activeRuntimeId ?? null}
         onNavigateEnvironments={onNavigateEnvironments}
-        compact={browserOpen}
+        compact={compact}
       />
 
       {/* Global search trigger — spotlight-style field, distinct from status chips */}
@@ -299,26 +331,29 @@ export function WorkspaceStatusStrip({
         data-ccem-workspace-search-trigger="true"
         title={t('workspace.globalSearchPlaceholder')}
         onClick={onOpenSearch}
+        aria-label={t('workspace.globalSearchPlaceholder')}
         className={cn(
           'group ml-auto inline-flex shrink-0 items-center rounded-full',
-          browserOpen
+          searchIconOnly
             ? 'h-8 w-8 min-h-[2rem] min-w-[2rem] flex-none justify-center px-0'
-            : 'h-7 min-w-[120px] gap-1.5 px-2.5 sm:h-8 sm:min-w-[160px] sm:gap-2 sm:px-3 lg:min-w-[220px]',
+            : cn('h-8 gap-2 px-3', showSearchShortcut ? 'w-[220px]' : 'w-[160px]'),
           'border border-[hsl(var(--glass-border-light))]/40 bg-muted/25',
           'transition-colors duration-150',
           'hover:border-[hsl(var(--glass-border-light))]/70 hover:bg-muted/40'
         )}
       >
         <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-        {!browserOpen ? (
+        {!searchIconOnly ? (
           <>
-            <span className="hidden flex-1 truncate text-left text-[12px] text-muted-foreground/70 sm:inline">
+            <span className="flex-1 truncate text-left text-[12px] text-muted-foreground/70">
               {t('workspace.globalSearchPlaceholder')}
             </span>
-            <kbd className="hidden shrink-0 items-center gap-0.5 rounded border border-border/30 bg-background/60 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground/60 md:inline-flex">
-              <Command className="h-2.5 w-2.5" />
-              K
-            </kbd>
+            {showSearchShortcut ? (
+              <kbd className="inline-flex shrink-0 items-center gap-0.5 rounded border border-border/30 bg-background/60 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground/60">
+                <Command className="h-2.5 w-2.5" />
+                K
+              </kbd>
+            ) : null}
           </>
         ) : null}
       </button>
