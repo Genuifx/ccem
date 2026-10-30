@@ -51,6 +51,22 @@ export function pruneSplitPanes(
   return next.length >= 2 ? next : [];
 }
 
+/**
+ * Keep the previous key set when its contents are unchanged. The keys are
+ * derived from live summaries that refresh on every poll; a fresh Set each
+ * time would defeat the sidebar's memo and re-render every row.
+ */
+export function retainStableKeySet(
+  previous: ReadonlySet<string>,
+  next: ReadonlySet<string>,
+): ReadonlySet<string> {
+  if (previous.size !== next.size) return next;
+  for (const key of next) {
+    if (!previous.has(key)) return next;
+  }
+  return previous;
+}
+
 /** The split is on screen only while the focused session is one of its panes. */
 export function isSplitViewShown(
   paneIds: readonly string[],

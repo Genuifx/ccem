@@ -105,3 +105,19 @@ test('history pane ids are namespaced apart from runtime ids', () => {
   // History and live panes share one group and one toggle.
   assert.deepEqual(split.toggleSplitPane([], 'native-a', id), { kind: 'added', paneIds: ['native-a', id] });
 });
+
+test('split key set keeps its identity while the keys are unchanged', () => {
+  const previous = new Set(['a', 'b']);
+  assert.equal(split.retainStableKeySet(previous, new Set(['b', 'a'])), previous);
+  const empty = new Set();
+  assert.equal(split.retainStableKeySet(empty, new Set()), empty);
+});
+
+test('split key set takes the new identity when keys change', () => {
+  const previous = new Set(['a', 'b']);
+  const added = new Set(['a', 'b', 'c']);
+  const swapped = new Set(['a', 'c']);
+  assert.equal(split.retainStableKeySet(previous, added), added);
+  assert.equal(split.retainStableKeySet(previous, swapped), swapped);
+  assert.equal(split.retainStableKeySet(added, previous), previous);
+});
