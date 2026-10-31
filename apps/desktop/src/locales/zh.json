@@ -828,7 +828,6 @@
     "contextCost": "预估费用",
     "usagePanelTitle": "会话用量",
     "usagePanelTotals": "累计消耗",
-    "usagePanelRefresh": "刷新会话用量",
     "usagePanelCacheWrite": "缓存写入",
     "usagePanelCacheHitRate": "{percent}% 命中",
     "usagePanelModels": "模型明细",

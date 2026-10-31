@@ -828,7 +828,6 @@
     "contextCost": "Estimated cost",
     "usagePanelTitle": "Session usage",
     "usagePanelTotals": "Session totals",
-    "usagePanelRefresh": "Refresh session usage",
     "usagePanelCacheWrite": "Cache write",
     "usagePanelCacheHitRate": "{percent}% hit",
     "usagePanelModels": "Models",

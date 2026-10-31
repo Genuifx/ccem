@@ -1,5 +1,4 @@
 import { useState } from 'react';
-import { RotateCw } from '@/lib/lucide-react';
 import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';
 import type { SessionContextSnapshot, SessionUsageModelEntry, SessionUsageState } from './workspaceUsage';
@@ -7,8 +6,6 @@ import { formatTokenCount } from './workspaceUsage';
 
 interface SessionUsagePopoverContentProps {
   usage: SessionUsageState;
-  provider?: string;
-  onRefresh?: () => void;
   /** Fired when the user switches the 用量/组成 segment. The host engages its
    * pinned reading mode: the view swap resizes the panel, which can drop a
    * resting pointer outside the hover surface and auto-close an unpinned
@@ -263,8 +260,6 @@ function buildModelRows(modelUsage: SessionUsageModelEntry[]) {
 
 export function SessionUsagePopoverContent({
   usage,
-  provider,
-  onRefresh,
   onEngage,
 }: SessionUsagePopoverContentProps) {
   const { t } = useLocale();
@@ -328,24 +323,10 @@ export function SessionUsagePopoverContent({
 
   return (
     <div className="[&>*+*]:border-t [&>*+*]:border-border/35 [&>*:nth-child(2)]:border-t-0">
-      <div className="flex items-center justify-between gap-2 px-4 pb-2.5 pt-3">
+      <div className="px-4 pb-2.5 pt-3">
         <span className="text-[13px] font-semibold tracking-[-0.01em] text-foreground">
           {t('workspace.usagePanelTitle')}
         </span>
-        {provider === 'claude' && onRefresh && (
-          <button
-            type="button"
-            onClick={onRefresh}
-            aria-label={t('workspace.usagePanelRefresh')}
-            className={cn(
-              'inline-flex h-6 w-6 items-center justify-center rounded-full',
-              'text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground',
-              'active:scale-[0.97] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30',
-            )}
-          >
-            <RotateCw className="h-3.5 w-3.5" />
-          </button>
-        )}
       </div>
 
       {hasContext && (

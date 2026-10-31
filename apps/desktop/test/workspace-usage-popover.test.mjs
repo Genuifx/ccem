@@ -56,10 +56,10 @@ async function importSessionUsagePopoverRenderer() {
         import { SessionUsagePopoverContent } from '@/components/workspace/SessionUsagePopover';
         import { ContextCompositionView } from '@/components/workspace/SessionUsagePopover';
 
-        export function render(usage, provider, onRefresh) {
+        export function render(usage, extraProps = {}) {
           return renderToStaticMarkup(
             React.createElement(LocaleProvider, null,
-              React.createElement(SessionUsagePopoverContent, { usage, provider, onRefresh })
+              React.createElement(SessionUsagePopoverContent, { usage, ...extraProps })
             )
           );
         }
@@ -285,6 +285,18 @@ test('usage panel renders the usage/composition view toggle when context exists'
 
   assert.match(html, /aria-pressed="true"[^>]*>用量</);
   assert.match(html, /aria-pressed="false"[^>]*>组成</);
+});
+
+test('usage panel header carries only the title, no manual refresh icon', async () => {
+  // Opening the panel already refreshes the SDK snapshot; a header refresh
+  // icon read as a "restore point" rewind control next to the composer.
+  const { render } = await importSessionUsagePopoverRenderer();
+  // Pass the props the old header button keyed on, so a reintroduced
+  // refresh control would render here.
+  const html = render(fixtureUsage(), { provider: 'claude', onRefresh: () => {} });
+
+  assert.match(html, /会话用量<\/span><\/div>/);
+  assert.doesNotMatch(html, /刷新会话用量/);
 });
 
 test('usage panel hides the view toggle without context data', async () => {

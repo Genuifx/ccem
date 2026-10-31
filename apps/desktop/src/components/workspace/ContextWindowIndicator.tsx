@@ -11,7 +11,6 @@ import { SessionUsagePopoverContent } from './SessionUsagePopover';
 
 interface ContextWindowIndicatorProps {
   usage: SessionUsageState;
-  provider?: string;
   onRefreshUsage?: () => void;
 }
 
@@ -32,8 +31,9 @@ function getRingColor(percentage: number): string {
  * intermittently missing.
  *
  * Hovering the ring opens the full session usage panel; the pointer can move
- * onto the panel (refresh button) without closing it. There is deliberately no
- * separate hover tooltip — the panel itself is the hover surface, so the old
+ * onto the panel without closing it. Opening the panel (hover or click)
+ * refreshes the SDK usage snapshot, so the panel carries no manual refresh
+ * button. There is deliberately no separate hover tooltip — the panel itself is the hover surface, so the old
  * hover-tooltip/click-popover double layer is gone.
  *
  * Clicking the ring PINS the panel open (REQ-0035): the panel view switch
@@ -48,7 +48,6 @@ export const ContextWindowIndicator = memo(ContextWindowIndicatorView);
 
 function ContextWindowIndicatorView({
   usage,
-  provider,
   onRefreshUsage,
 }: ContextWindowIndicatorProps) {
   const { t } = useLocale();
@@ -158,8 +157,6 @@ function ContextWindowIndicatorView({
       >
         <SessionUsagePopoverContent
           usage={usage}
-          provider={provider}
-          onRefresh={onRefreshUsage}
           onEngage={engagePin}
         />
       </HoverCardContent>

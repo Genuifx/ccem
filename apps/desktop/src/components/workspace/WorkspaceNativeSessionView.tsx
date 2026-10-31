@@ -4883,7 +4883,6 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
             ) : null}
             <ContextWindowIndicator
               usage={sessionUsage}
-              provider={session.provider}
               onRefreshUsage={refreshSessionUsage}
             />
             {canShowFileRestorePoints ? (
