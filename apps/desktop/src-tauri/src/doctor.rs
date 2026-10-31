@@ -36,13 +36,18 @@ struct DoctorSystem {
     low_power_mode: Option<bool>,
     agent_processes: Option<u64>,
     agent_rss_bytes: Option<u64>,
-    /// `ps` %CPU (100 = one core) of this app and its child processes.
+    /// %CPU (100 = one core) of this app and its child processes.
     app_cpu_percent: Option<f64>,
-    /// Sum over all processes; compare with the core count for saturation.
+    /// Whole-machine %CPU in the same units: (100 - idle) * cores from the
+    /// `top` sample, which includes kernel time and so exceeds the
+    /// per-process sum. Compare with the core count for saturation.
     total_cpu_percent: Option<f64>,
     /// Busiest processes by executable name (no arguments), so contention
     /// from WebContent, agents or unrelated apps is visible.
     top_cpu_processes: Option<Vec<DoctorCpuProcess>>,
+    /// How the CPU numbers were measured: "instant" (top's 1s interval
+    /// sample) or "lifetime-average" (ps fallback — averages since launch).
+    cpu_sample: Option<&'static str>,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
@@ -55,9 +60,10 @@ struct DoctorCpuProcess {
 
 #[derive(Debug, Default, PartialEq)]
 struct CpuSummary {
-    app_cpu_percent: f64,
-    total_cpu_percent: f64,
-    top: Vec<DoctorCpuProcess>,
+    sample: Option<&'static str>,
+    app_cpu_percent: Option<f64>,
+    total_cpu_percent: Option<f64>,
+    top: Option<Vec<DoctorCpuProcess>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -175,12 +181,26 @@ fn collect_system_load() -> DoctorSystem {
     let (agent_processes, agent_rss_bytes) = command_stdout("/bin/ps", &["-axo", "rss=,comm="])
         .map(|text| summarize_agent_processes(&text))
         .unzip();
-    let cpu = command_stdout("/bin/ps", &["-axo", "pid=,ppid=,pcpu=,rss=,comm="])
-        .map(|text| summarize_cpu(&text, std::process::id()));
+    // `ps pcpu` averages over a process's whole lifetime, so a daemon that
+    // burned CPU an hour ago still ranks high. `top -l 2 -s 1` measures its
+    // second sample over the interval; ps runs after top so the process
+    // tree, names and RSS are at least as fresh as that sample.
+    let top_output = command_stdout(
+        "/usr/bin/top",
+        &["-l", "2", "-s", "1", "-o", "cpu", "-stats", "pid,cpu"],
+    );
+    let ps_output = command_stdout("/bin/ps", &["-axo", "pid=,ppid=,pcpu=,rss=,comm="]);
+    let cpu = summarize_cpu(
+        ps_output.as_deref(),
+        top_output.as_deref(),
+        sysctl("hw.ncpu").and_then(|value| value.parse::<u64>().ok()),
+        std::process::id(),
+    );
     DoctorSystem {
-        app_cpu_percent: cpu.as_ref().map(|cpu| cpu.app_cpu_percent),
-        total_cpu_percent: cpu.as_ref().map(|cpu| cpu.total_cpu_percent),
-        top_cpu_processes: cpu.map(|cpu| cpu.top),
+        app_cpu_percent: cpu.app_cpu_percent,
+        total_cpu_percent: cpu.total_cpu_percent,
+        top_cpu_processes: cpu.top,
+        cpu_sample: cpu.sample,
         model: sysctl("hw.model"),
         memory_bytes: sysctl("hw.memsize").and_then(|value| value.parse().ok()),
         load_average: sysctl("vm.loadavg"),
@@ -213,12 +233,104 @@ fn summarize_agent_processes(ps_output: &str) -> (u64, u64) {
         })
 }
 
-/// Parses `ps -axo pid=,ppid=,pcpu=,rss=,comm=` output. Executable paths may
-/// contain spaces, so `comm` is everything after the fourth field.
-fn summarize_cpu(ps_output: &str, app_pid: u32) -> CpuSummary {
+/// CPU attribution for the report. Instantaneous values come from the second
+/// `top -l 2` sample (measured over the interval — the first sample, like
+/// `ps pcpu`, averages since process start); `ps` supplies the process tree,
+/// executable names and RSS. All values are %CPU with 100 = one core. Without
+/// `top` the numbers fall back to ps lifetime averages and are labeled so.
+fn summarize_cpu(
+    ps_output: Option<&str>,
+    top_output: Option<&str>,
+    core_count: Option<u64>,
+    app_pid: u32,
+) -> CpuSummary {
     const TOP_LIMIT: usize = 8;
     let round = |value: f64| (value * 10.0).round() / 10.0;
-    let rows: Vec<(u32, u32, f64, u64, &str)> = ps_output
+    let rows = parse_ps_rows(ps_output.unwrap_or(""));
+    let instant = top_output.and_then(parse_top_sample);
+
+    if rows.is_empty() && instant.is_none() {
+        return CpuSummary::default();
+    }
+    let sample: &'static str = if instant.is_some() { "instant" } else { "lifetime-average" };
+
+    let mut app_pids = std::collections::HashSet::from([app_pid]);
+    loop {
+        let before = app_pids.len();
+        for (pid, ppid, ..) in &rows {
+            if app_pids.contains(ppid) {
+                app_pids.insert(*pid);
+            }
+        }
+        if app_pids.len() == before {
+            break;
+        }
+    }
+
+    if let Some((top_rows, machine_percent)) = &instant {
+        // Processes that exited before the sample contribute 0 rather than a
+        // stale lifetime average; ones that started after ps ran have no name
+        // and drop out of the top list (their CPU still counts in the total).
+        let app = top_rows
+            .iter()
+            .filter(|(pid, _)| app_pids.contains(pid))
+            .map(|(_, cpu)| cpu)
+            .sum::<f64>();
+        let mut top: Vec<DoctorCpuProcess> = top_rows
+            .iter()
+            .filter_map(|(pid, cpu)| {
+                let (_, _, _, rss, comm) = rows.iter().find(|(p, ..)| p == pid)?;
+                Some(DoctorCpuProcess {
+                    name: comm.rsplit('/').next().unwrap_or_default().to_string(),
+                    cpu_percent: *cpu,
+                    rss_bytes: *rss,
+                })
+            })
+            .collect();
+        top.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent));
+        top.truncate(TOP_LIMIT);
+        // The header idle is machine-wide (% of all cores, kernel included);
+        // scale it back to "100 = one core" units to match every other value.
+        let total = core_count
+            .map(|cores| machine_percent * cores as f64)
+            .unwrap_or_else(|| top_rows.iter().map(|(_, cpu)| cpu).sum::<f64>());
+        let tree_known = !rows.is_empty();
+        return CpuSummary {
+            sample: Some(sample),
+            app_cpu_percent: tree_known.then_some(round(app)),
+            total_cpu_percent: Some(round(total)),
+            top: tree_known.then_some(top),
+        };
+    }
+
+    let mut top: Vec<DoctorCpuProcess> = rows
+        .iter()
+        .map(|(_, _, cpu, rss, comm)| DoctorCpuProcess {
+            name: comm.rsplit('/').next().unwrap_or_default().to_string(),
+            cpu_percent: *cpu,
+            rss_bytes: *rss,
+        })
+        .collect();
+    top.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent));
+    top.truncate(TOP_LIMIT);
+
+    CpuSummary {
+        sample: Some(sample),
+        app_cpu_percent: Some(round(
+            rows.iter()
+                .filter(|(pid, ..)| app_pids.contains(pid))
+                .map(|(_, _, cpu, ..)| cpu)
+                .sum(),
+        )),
+        total_cpu_percent: Some(round(rows.iter().map(|(_, _, cpu, ..)| cpu).sum())),
+        top: Some(top),
+    }
+}
+
+/// Parses `ps -axo pid=,ppid=,pcpu=,rss=,comm=` output. Executable paths may
+/// contain spaces, so `comm` is everything after the fourth field.
+fn parse_ps_rows(ps_output: &str) -> Vec<(u32, u32, f64, u64, &str)> {
+    ps_output
         .lines()
         .filter_map(|line| {
             let mut rest = line.trim_start();
@@ -236,42 +348,46 @@ fn summarize_cpu(ps_output: &str, app_pid: u32) -> CpuSummary {
                 rest.trim(),
             ))
         })
-        .collect();
+        .collect()
+}
 
-    let mut app_pids = std::collections::HashSet::from([app_pid]);
-    loop {
-        let before = app_pids.len();
-        for (pid, ppid, ..) in &rows {
-            if app_pids.contains(ppid) {
-                app_pids.insert(*pid);
-            }
-        }
-        if app_pids.len() == before {
-            break;
+/// Parses the second `top -l 2 -stats pid,cpu` sample: the last `PID` header
+/// starts its table (the first sample is a lifetime average like ps). Returns
+/// the rows and the machine-wide total from the last `CPU usage:` header line
+/// above it — 100 - idle, in % of all cores — which avoids the per-row
+/// rounding error of summing a thousand processes.
+fn parse_top_sample(top_output: &str) -> Option<(Vec<(u32, f64)>, f64)> {
+    let mut header = None;
+    for (idx, line) in top_output.lines().enumerate() {
+        if line.trim_start().starts_with("PID") {
+            header = Some(idx);
         }
     }
-
-    let mut top: Vec<DoctorCpuProcess> = rows
-        .iter()
-        .map(|(_, _, cpu, rss, comm)| DoctorCpuProcess {
-            name: comm.rsplit('/').next().unwrap_or_default().to_string(),
-            cpu_percent: *cpu,
-            rss_bytes: *rss,
+    let header = header?;
+    let rows: Vec<(u32, f64)> = top_output
+        .lines()
+        .skip(header + 1)
+        .filter_map(|line| {
+            let mut fields = line.trim_start().split_whitespace();
+            let pid = fields.next()?.parse().ok()?;
+            let cpu = fields.next()?.parse().ok()?;
+            Some((pid, cpu))
         })
         .collect();
-    top.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent));
-    top.truncate(TOP_LIMIT);
-
-    CpuSummary {
-        app_cpu_percent: round(
-            rows.iter()
-                .filter(|(pid, ..)| app_pids.contains(pid))
-                .map(|(_, _, cpu, ..)| cpu)
-                .sum(),
-        ),
-        total_cpu_percent: round(rows.iter().map(|(_, _, cpu, ..)| cpu).sum()),
-        top,
+    if rows.is_empty() {
+        return None;
     }
+    let machine_percent = top_output
+        .lines()
+        .take(header)
+        .filter(|line| line.trim_start().starts_with("CPU usage:"))
+        .filter_map(|line| {
+            let idle = line.rsplit_once(',')?.1.trim();
+            Some(100.0 - idle.strip_suffix("% idle")?.parse::<f64>().ok()?)
+        })
+        .last();
+    let total = machine_percent.unwrap_or_else(|| rows.iter().map(|(_, cpu)| cpu).sum::<f64>());
+    Some((rows, total))
 }
 
 fn collect_command_statuses(user_path: &str) -> Vec<DoctorCommandStatus> {
@@ -638,19 +754,74 @@ mod tests {
                   520   510   5.5   1024 /bin/zsh\n\
                   600     1  80.0   8192 /System/Library/Frameworks/WebKit.framework/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent\n\
                   garbage line\n";
-        let summary = summarize_cpu(ps, 500);
-        assert_eq!(summary.app_cpu_percent, 48.0);
-        assert_eq!(summary.total_cpu_percent, 129.0);
-        assert_eq!(summary.top.len(), 5);
+        // Without top the numbers are ps lifetime averages, labeled as such.
+        let summary = summarize_cpu(Some(ps), None, None, 500);
+        assert_eq!(summary.sample, Some("lifetime-average"));
+        assert_eq!(summary.app_cpu_percent, Some(48.0));
+        assert_eq!(summary.total_cpu_percent, Some(129.0));
+        let top = summary.top.unwrap();
+        assert_eq!(top.len(), 5);
         assert_eq!(
-            summary.top[0],
+            top[0],
             DoctorCpuProcess {
                 name: "com.apple.WebKit.WebContent".to_string(),
                 cpu_percent: 80.0,
                 rss_bytes: 8192 * 1024,
             }
         );
-        assert_eq!(summary.top[2].name, "ccem-desktop");
+        assert_eq!(top[2].name, "ccem-desktop");
+    }
+
+    #[test]
+    fn cpu_summary_prefers_the_second_top_sample_over_ps_averages() {
+        // ps carries lifetime averages that must not rank: claude shows 95.0
+        // there but is idling at 77.5 in the interval sample, WebKit burned
+        // 80.0 historically but is absent from the sample entirely.
+        let ps = "    1     0   1.0    100 /sbin/launchd\n\
+                  500     1  12.5   2048 /Applications/CCEM Desktop.app/Contents/MacOS/ccem-desktop\n\
+                  510   500  95.0   4096 /usr/local/bin/claude\n\
+                  600     1  80.0   8192 /System/Library/Frameworks/WebKit.framework/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent\n";
+        // Shaped after real `top -l 2 -stats pid,cpu` output (trailing spaces
+        // included); the first sample's values must be ignored.
+        let top = "Processes: 400 total, 2 running, 398 sleeping, 1500 threads \n\
+                   2026/10/31 18:18:58\n\
+                   Load Avg: 1.5, 1.2, 1.1 \n\
+                   CPU usage: 5.0% user, 5.0% sys, 90.0% idle \n\
+                   \n\
+                   PID    %CPU\n\
+                   500    90.0\n\
+                   510    3.0\n\
+                   \n\
+                   Processes: 400 total, 2 running, 398 sleeping, 1500 threads \n\
+                   2026/10/31 18:19:00\n\
+                   Load Avg: 1.5, 1.2, 1.1 \n\
+                   CPU usage: 29.15% user, 12.8% sys, 58.76% idle \n\
+                   \n\
+                   PID    %CPU\n\
+                   510    77.5\n\
+                   500    41.4\n\
+                   1      0.0\n";
+        let summary = summarize_cpu(Some(ps), Some(top), Some(10), 500);
+        assert_eq!(summary.sample, Some("instant"));
+        // App tree {500, 510} from the interval sample, not the first
+        // sample's 90.0 and not ps's 12.5/95.0.
+        assert_eq!(summary.app_cpu_percent, Some(118.9));
+        // (100 - 58.76) * 10 cores from the header, not the row sum 118.9.
+        assert_eq!(summary.total_cpu_percent, Some(412.4));
+        let top = summary.top.unwrap();
+        assert_eq!(top.len(), 3);
+        assert_eq!(
+            top[0],
+            DoctorCpuProcess {
+                name: "claude".to_string(),
+                cpu_percent: 77.5,
+                rss_bytes: 4096 * 1024,
+            }
+        );
+        assert_eq!(top[1].name, "ccem-desktop");
+        assert_eq!(top[1].cpu_percent, 41.4);
+        // WebKit (ps lifetime 80.0, missing from the sample) does not rank.
+        assert!(top.iter().all(|entry| entry.name != "com.apple.WebKit.WebContent"));
     }
 
     #[test]
@@ -658,10 +829,16 @@ mod tests {
         let ps: String = (1..=12)
             .map(|pid| format!("{pid} 0 {pid}.0 10 /bin/p{pid}\n"))
             .collect();
-        let summary = summarize_cpu(&ps, 999);
-        assert_eq!(summary.app_cpu_percent, 0.0);
-        assert_eq!(summary.top.len(), 8);
-        assert_eq!(summary.top[0].name, "p12");
-        assert_eq!(summary.top[7].name, "p5");
+        let summary = summarize_cpu(Some(&ps), None, None, 999);
+        assert_eq!(summary.app_cpu_percent, Some(0.0));
+        let top = summary.top.unwrap();
+        assert_eq!(top.len(), 8);
+        assert_eq!(top[0].name, "p12");
+        assert_eq!(top[7].name, "p5");
+    }
+
+    #[test]
+    fn parse_top_sample_rejects_output_without_a_table() {
+        assert_eq!(parse_top_sample("Processes: 1\ngarbage\n"), None);
     }
 }
