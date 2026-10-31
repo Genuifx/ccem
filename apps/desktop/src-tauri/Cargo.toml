@@ -21,7 +21,9 @@ helper_name = "ccem-cef-helper"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "=2.11.5", features = ["tray-icon", "unstable"] }
+# `devtools` keeps release webviews inspectable (Safari > Develop) so a pinned
+# WebContent process can be profiled with real JS stacks instead of `sample`.
+tauri = { version = "=2.11.5", features = ["tray-icon", "unstable", "devtools"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
