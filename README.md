@@ -148,7 +148,7 @@ Each preset fills in the base URL and maps Claude Code's **Opus / Sonnet / Haiku
 |---|---|---|---|---|
 | GLM (Zhipu) | `https://open.bigmodel.cn/api/anthropic` | glm-5.3[1m] | glm-5.3[1m] | glm-5.3-flash |
 | KIMI (Moonshot) | `https://api.moonshot.cn/anthropic` | kimi-k3[1m] | kimi-k3[1m] | kimi-k2.7-code |
-| Kimi Code Plan | `https://api.kimi.com/coding/` | k3[1m] | k3[1m] | k3[1m] |
+| Kimi Code Plan | `https://api.kimi.com/coding/` | k3.1-pro[1m] | k3.1-pro[1m] | k3.1-pro[1m] |
 | MiniMax | `https://api.minimax.cn/anthropic` | MiniMax-M3.1-Flash[1m] | MiniMax-M3.1-Flash[1m] | MiniMax-M3.1-Flash[1m] |
 | DeepSeek | `https://api.deepseek.com/anthropic` | deepseek-flash[1m] | deepseek-flash[1m] | deepseek-flash |
 | Bailian (Aliyun) | `https://dashscope.aliyuncs.com/apps/anthropic` | qwen3.7-max | qwen3.7-max | qwen3.6-flash |
