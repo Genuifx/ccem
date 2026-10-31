@@ -963,13 +963,13 @@ export function CronTasks({
   }, [cronTasks, getCronRunDetail]);
 
   useEffect(() => {
-    if (!drawerRun?.hermesNotification || !['waiting', 'pending', 'sending', 'unavailable'].includes(drawerRun.hermesNotification.status)) return;
+    if (!drawerRun || (drawerRun.status !== 'running' && !['waiting', 'pending', 'sending', 'unavailable'].includes(drawerRun.hermesNotification?.status ?? ''))) return;
     let active = true;
     const timer = window.setInterval(() => {
       getCronRunDetail(drawerRun.taskId, drawerRun.id).then((run) => { if (active) setDrawerRun(run); }).catch(() => {});
     }, 2500);
     return () => { active = false; window.clearInterval(timer); };
-  }, [drawerRun?.id, drawerRun?.hermesNotification?.status, getCronRunDetail]);
+  }, [drawerRun?.id, drawerRun?.status, drawerRun?.hermesNotification?.status, getCronRunDetail]);
 
   const openRunSession = useCallback((task: CronTask | null | undefined, run: CronTaskRun) => {
     const link = buildCronRunSessionLink({
@@ -1017,8 +1017,9 @@ export function CronTasks({
     const setup = async () => {
       try {
         for (const evt of ['cron-task-started', 'cron-task-completed', 'cron-task-failed']) {
-          const fn = await listen(evt, () => {
+          const fn = await listen<CronTaskRun>(evt, ({ payload }) => {
             if (!mounted) return;
+            setDrawerRun((current) => current?.id === payload.id && current.taskId === payload.taskId ? payload : current);
             void loadCronTasks();
             for (const task of useAppStore.getState().cronTasks) {
               void loadCronTaskRuns(task.id);

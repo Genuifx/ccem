@@ -1,4 +1,6 @@
 pub(crate) mod hermes_notifications;
+mod process;
+mod recovery;
 use crate::config;
 use crate::session_provenance::{
     register_launch, spawn_claude_source_binding, SessionProvenanceUpsert, DEFAULT_CONFIG_SOURCE,
@@ -9,11 +11,13 @@ use crate::unified_runtime::UnifiedSessionManager;
 use crate::wecom::{read_wecom_settings, WecomBridgeManager, WecomTaskBindingTargetType};
 use chrono::{DateTime, Utc};
 pub use hermes_notifications::{CronDeliveryScope, CronHermesDelivery, CronHermesNotification};
+use process::{kill_cron_process_tree, OutputCollector, OUTPUT_DRAIN_GRACE};
+use recovery::{lock_run_mutations, runner_is_gone, RunLease};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
-use std::io::{BufRead, Read};
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -101,6 +105,8 @@ pub struct CronTaskRun {
     #[serde(rename = "durationMs")]
     pub duration_ms: Option<u64>,
     pub status: String, // "running" | "success" | "failed" | "timeout"
+    #[serde(rename = "runnerLease", default)]
+    pub runner_lease: bool,
     #[serde(rename = "runtimeId", default)]
     pub runtime_id: Option<String>,
     #[serde(rename = "hermesNotification", default)]
@@ -205,13 +211,8 @@ fn write_runs(task_id: &str, runs: &[CronTaskRun]) -> Result<(), String> {
 }
 
 const MAX_RUNS_PER_TASK: usize = 50;
-// Completion, provenance and UI enrichment all perform read/modify/write.
-static RUN_MUTATIONS: Mutex<()> = Mutex::new(());
-
 fn append_run(task_id: &str, run: CronTaskRun) -> Result<(), String> {
-    let _guard = RUN_MUTATIONS
-        .lock()
-        .map_err(|_| "cron_runs_lock_poisoned")?;
+    let _guard = lock_run_mutations(&get_runs_dir())?;
     let mut runs = read_runs(task_id)?;
     runs.push(run);
     // Keep only the most recent MAX_RUNS_PER_TASK entries
@@ -227,9 +228,7 @@ fn update_run(
     run_id: &str,
     updater: impl FnOnce(&mut CronTaskRun),
 ) -> Result<(), String> {
-    let _guard = RUN_MUTATIONS
-        .lock()
-        .map_err(|_| "cron_runs_lock_poisoned")?;
+    let _guard = lock_run_mutations(&get_runs_dir())?;
     let mut runs = read_runs(task_id)?;
     let run = runs
         .iter_mut()
@@ -237,6 +236,116 @@ fn update_run(
         .ok_or_else(|| format!("Run not found: {run_id}"))?;
     updater(run);
     write_runs(task_id, &runs)
+}
+
+/// Close run records still marked "running" that no live runner thread owns.
+/// Ownership checks also cover records orphaned by an app exit, crash or reboot.
+/// Without it such records would stay "running" forever, leaving downstream
+/// monitors (e.g. the daily release gate watcher) unable to determine the
+/// run outcome.
+fn close_orphaned_running_runs(
+    runs: Vec<CronTaskRun>,
+    now_rfc3339: &str,
+    is_live: impl Fn(&str) -> bool,
+) -> (Vec<CronTaskRun>, usize) {
+    let mut closed = 0;
+    let runs = runs
+        .into_iter()
+        .map(|mut run| {
+            if run.status != "running" || is_live(&run.id) {
+                return run;
+            }
+            closed += 1;
+            run.duration_ms = DateTime::parse_from_rfc3339(&run.started_at)
+                .ok()
+                .zip(DateTime::parse_from_rfc3339(now_rfc3339).ok())
+                .map(|(started, now)| (now - started).num_milliseconds().max(0) as u64);
+            run.status = "failed".to_string();
+            if let Some(delivery) = run.hermes_notification.as_mut() {
+                if delivery.status == "waiting" { delivery.status = "pending".into(); }
+            }
+            run.finished_at = Some(now_rfc3339.to_string());
+            if !run.stderr.trim().is_empty() {
+                run.stderr.push('\n');
+            }
+            run.stderr.push_str(
+                "Interrupted: the CCEM runner for this cron run exited without a result; closed as failed by the orphan-run sweep.",
+            );
+            run
+        })
+        .collect();
+    (runs, closed)
+}
+
+/// Sweep every cron-runs file and close records with a released runner lease.
+/// Live leases in any app instance are preserved. Runs once when cron execution starts
+/// in this process (closing records orphaned by a previous process) and on
+/// every scheduler tick afterwards (closing records whose runner thread died
+/// mid-run, e.g. after a panic, without waiting for an app restart).
+fn sweep_orphaned_cron_runs() -> Vec<CronTaskRun> {
+    let mut recovered = Vec::new();
+    let Ok(entries) = fs::read_dir(get_runs_dir()) else {
+        return recovered;
+    };
+    let tasks = read_tasks().unwrap_or_default();
+    let now = Utc::now().to_rfc3339();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(task_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Ok(_guard) = lock_run_mutations(&get_runs_dir()) else {
+            continue;
+        };
+        let Ok(runs) = read_runs(task_id) else {
+            continue;
+        };
+        let dead_ids: HashSet<String> = runs
+            .iter()
+            .filter(|run| {
+                if run.status != "running" {
+                    return false;
+                }
+                if run.runner_lease {
+                    return runner_is_gone(&get_runs_dir(), &run.id);
+                }
+                // Legacy records have no ownership proof. Only recover after their
+                // configured deadline plus the bounded output-drain grace.
+                let Some(task) = tasks.iter().find(|task| task.id == task_id) else {
+                    return false;
+                };
+                DateTime::parse_from_rfc3339(&run.started_at)
+                    .ok()
+                    .is_some_and(|started| {
+                        (Utc::now() - started.with_timezone(&Utc)).num_seconds()
+                            > i64::try_from(task.timeout_secs.saturating_add(10))
+                                .unwrap_or(i64::MAX)
+                    })
+            })
+            .map(|run| run.id.clone())
+            .collect();
+        let (runs, closed) = close_orphaned_running_runs(runs, &now, |id| !dead_ids.contains(id));
+        if closed == 0 {
+            continue;
+        }
+        match write_runs(task_id, &runs) {
+            Ok(()) => {
+                recovered.extend(
+                    runs.iter()
+                        .filter(|run| dead_ids.contains(&run.id))
+                        .cloned(),
+                );
+                eprintln!("[cron] closed {closed} orphaned running run(s) for task {task_id}");
+            }
+            Err(error) => {
+                eprintln!("[cron] failed to reconcile runs for task {task_id}: {error}")
+            }
+        }
+    }
+    recovered
 }
 
 fn normalize_optional_session_id(value: Option<&str>) -> Option<String> {
@@ -862,28 +971,26 @@ fn build_cron_claude_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
+    // Run the command in its own process group so a timeout kill can take
+    // down the whole tree (agent CLI plus MCP servers and tool subprocesses)
+    // instead of only the direct child. Mirrors the native_runtime contract.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
     config::clear_managed_claude_env(&mut command);
     let mut env_vars = env_vars.clone();
     crate::agent_profile::apply_env("claude", &mut env_vars);
     for (key, value) in env_vars {
-        if value.is_empty() { command.env_remove(key); }
-        else { command.env(key, value); }
+        if value.is_empty() {
+            command.env_remove(key);
+        } else {
+            command.env(key, value);
+        }
     }
     command
-}
-
-fn spawn_output_collector<T>(stream: Option<T>) -> thread::JoinHandle<String>
-where
-    T: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let mut buffer = String::new();
-        let Some(mut stream) = stream else {
-            return buffer;
-        };
-        let _ = stream.read_to_string(&mut buffer);
-        buffer
-    })
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
@@ -1026,6 +1133,7 @@ fn execute_task(
         stderr: String::new(),
         duration_ms: None,
         status: "running".to_string(),
+        runner_lease: true,
         hermes_notification: None,
         runtime_id: None,
         runtime_kind: Some("headless".to_string()),
@@ -1040,7 +1148,27 @@ fn execute_task(
             target,
             status: "waiting".into(),
         });
-    let _ = append_run(&task.id, run.clone());
+    // Acquire ownership before persistence so a concurrent sweep cannot
+    // observe a running record without its OS-held lease.
+    let lease = RunLease::acquire(&get_runs_dir(), &run_id);
+    if let Err(error) = &lease {
+        run.status = "failed".into();
+        run.runner_lease = false;
+        run.finished_at = Some(Utc::now().to_rfc3339());
+        run.stderr = format!("Failed to establish cron runner ownership: {error}");
+        if let Some(delivery) = run.hermes_notification.as_mut() {
+            delivery.status = "pending".into();
+        }
+    }
+    if let Err(error) = append_run(&task.id, run.clone()) {
+        eprintln!("[cron] refusing to launch without a persisted run: {error}");
+        return;
+    }
+    if lease.is_err() {
+        let _ = app.emit("cron-task-failed", &run);
+        return;
+    }
+    let _lease = lease.unwrap();
     let _ = app.emit("cron-task-started", &run);
 
     let env_vars = build_env_vars(&task.env_name);
@@ -1061,11 +1189,12 @@ fn execute_task(
         build_cron_claude_command(&task, &working_dir, &env_vars, &expanded_path, &tool_policy);
 
     let launch = crate::agent_home::ensure_agent_homes()
-        .map_err(std::io::Error::other).and_then(|_| cmd.spawn());
+        .map_err(std::io::Error::other)
+        .and_then(|_| cmd.spawn());
     let (status_str, exit_code, stdout, stderr) = match launch {
         Ok(mut child) => {
-            let stdout_reader = spawn_output_collector(child.stdout.take());
-            let stderr_reader = spawn_output_collector(child.stderr.take());
+            let stdout_collector = OutputCollector::spawn(child.stdout.take());
+            let stderr_collector = OutputCollector::spawn(child.stderr.take());
             let timeout = Duration::from_secs(task.timeout_secs);
             let poll_interval = Duration::from_millis(500);
 
@@ -1074,8 +1203,7 @@ fn execute_task(
                     Ok(Some(exit_status)) => break Ok(exit_status.code()),
                     Ok(None) => {
                         if start.elapsed() >= timeout {
-                            let _ = child.kill();
-                            let _ = child.wait();
+                            kill_cron_process_tree(&mut child);
                             break Err(format!(
                                 "Task timed out after {} seconds",
                                 task.timeout_secs
@@ -1084,40 +1212,56 @@ fn execute_task(
                         thread::sleep(poll_interval);
                     }
                     Err(error) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        kill_cron_process_tree(&mut child);
                         break Err(format!("Error waiting for process: {}", error));
                     }
                 }
             };
 
-            let stdout = stdout_reader.join().unwrap_or_default();
-            let mut stderr = stderr_reader.join().unwrap_or_default();
+            let status_str = match &outcome {
+                Ok(Some(0)) => "success",
+                Ok(_) => "failed",
+                Err(message) if message.starts_with("Task timed out after ") => "timeout",
+                Err(_) => "failed",
+            }
+            .to_string();
 
-            match outcome {
-                Ok(code) => {
-                    let status = if code == Some(0) {
-                        "success".to_string()
-                    } else {
-                        "failed".to_string()
-                    };
-                    (status, code, stdout, stderr)
-                }
-                Err(message) if message.starts_with("Task timed out after ") => {
-                    if !stderr.trim().is_empty() {
-                        stderr.push('\n');
+            // Persist the terminal status (plus a best-effort output snapshot)
+            // before draining the pipes. On 2026-10-24 this write-back was
+            // delayed 23-79 minutes past the deadline because orphaned
+            // descendants kept the output pipes open, so the persisted run
+            // lingered as "running" and the daily release gate monitor could
+            // not determine the day's gate status.
+            if status_str != "success" {
+                let _ = update_run(&task.id, &run_id, |r| {
+                    r.status = status_str.clone();
+                    if let Some(delivery) = r.hermes_notification.as_mut() {
+                        delivery.status = "pending".into();
                     }
-                    stderr.push_str(&message);
-                    ("timeout".to_string(), None, stdout, stderr)
-                }
+                    r.exit_code = outcome.as_ref().ok().copied().flatten();
+                    r.finished_at = Some(Utc::now().to_rfc3339());
+                    r.duration_ms = Some(start.elapsed().as_millis() as u64);
+                    r.stdout = stdout_collector.snapshot();
+                    r.stderr = stderr_collector.snapshot();
+                    if let Err(message) = &outcome {
+                        r.stderr.push_str(&format!("\n{message}"));
+                    }
+                });
+            }
+
+            let stdout = stdout_collector.finish(OUTPUT_DRAIN_GRACE);
+            let mut stderr = stderr_collector.finish(OUTPUT_DRAIN_GRACE);
+            let exit_code = match outcome {
+                Ok(code) => code,
                 Err(message) => {
                     if !stderr.trim().is_empty() {
                         stderr.push('\n');
                     }
                     stderr.push_str(&message);
-                    ("failed".to_string(), None, stdout, stderr)
+                    None
                 }
-            }
+            };
+            (status_str, exit_code, stdout, stderr)
         }
         Err(error) => (
             "failed".to_string(),
@@ -1159,6 +1303,7 @@ fn execute_task(
             stderr: String::new(),
             duration_ms: None,
             status: "running".to_string(),
+            runner_lease: true,
             hermes_notification: None,
             runtime_id: None,
             runtime_kind: Some("headless".to_string()),
@@ -1220,14 +1365,28 @@ impl Default for CronScheduler {
     }
 }
 
+fn emit_recovered_runs(app: &AppHandle) {
+    for run in sweep_orphaned_cron_runs() {
+        let _ = app.emit("cron-task-failed", &run);
+    }
+}
+
 pub fn start_cron_scheduler(
     app: AppHandle,
     scheduler: Arc<CronScheduler>,
     unified_runtime_manager: Arc<UnifiedSessionManager>,
 ) {
+    // Runs orphaned by a previous process must never persist as "running";
+    // close them before this process can start new runs of its own.
+    emit_recovered_runs(&app);
     thread::spawn(move || {
         loop {
             thread::sleep(Duration::from_secs(30));
+
+            // Close records whose runner thread is gone. The startup sweep
+            // above covers previous processes; this tick sweep covers
+            // in-process supervisor loss (e.g. a runner thread that died).
+            emit_recovered_runs(&app);
 
             let tasks = match read_tasks() {
                 Ok(t) => t,
@@ -1531,9 +1690,7 @@ pub fn toggle_cron_task(id: String) -> Result<CronTask, String> {
 
 #[tauri::command]
 pub fn get_cron_task_runs(app: AppHandle, task_id: String) -> Result<Vec<CronTaskRun>, String> {
-    let guard = RUN_MUTATIONS
-        .lock()
-        .map_err(|_| "cron_runs_lock_poisoned")?;
+    let guard = lock_run_mutations(&get_runs_dir())?;
     let mut runs = read_runs(&task_id)?;
     let mut dirty = false;
     for run in &mut runs {
@@ -1570,9 +1727,7 @@ pub fn get_cron_run_detail(
     task_id: String,
     run_id: String,
 ) -> Result<CronTaskRun, String> {
-    let guard = RUN_MUTATIONS
-        .lock()
-        .map_err(|_| "cron_runs_lock_poisoned")?;
+    let guard = lock_run_mutations(&get_runs_dir())?;
     let mut runs = read_runs(&task_id)?;
     let Some(index) = runs.iter().position(|r| r.id == run_id) else {
         return Err(format!("Run not found: {}", run_id));
@@ -1622,7 +1777,10 @@ fn get_user_path() -> String {
 pub fn generate_cron_task_stream(app: AppHandle, query: String) {
     thread::spawn(move || {
         if let Err(error) = crate::agent_home::ensure_agent_homes() {
-            let _ = app.emit("cron-ai-stream", &serde_json::json!({"type":"error","error":error}).to_string());
+            let _ = app.emit(
+                "cron-ai-stream",
+                &serde_json::json!({"type":"error","error":error}).to_string(),
+            );
             let _ = app.emit("cron-ai-done", ());
             return;
         }
@@ -1692,11 +1850,12 @@ pub fn generate_cron_task_stream(app: AppHandle, query: String) {
 mod tests {
     use super::{
         build_cron_claude_command, build_cron_launch_provenance, build_cron_user_path,
-        cron_matches, enrich_run_with_provenance, expand_cron_working_dir, next_runs,
-        normalize_execution_profile, normalize_optional_session_id, normalize_wecom_peer_id,
-        parse_cron_field, resolve_cron_env_name, resolve_cron_wecom_notification_target,
-        resolve_execution_profile, resolve_task_tool_policy, validate_cron_expression, CronTask,
-        CronTaskRun, CronWecomNotification, ResolvedToolPolicy,
+        close_orphaned_running_runs, cron_matches, enrich_run_with_provenance,
+        expand_cron_working_dir, next_runs, normalize_execution_profile,
+        normalize_optional_session_id, normalize_wecom_peer_id, parse_cron_field, read_runs,
+        resolve_cron_env_name, resolve_cron_wecom_notification_target, resolve_execution_profile,
+        resolve_task_tool_policy, sweep_orphaned_cron_runs, validate_cron_expression, write_runs,
+        CronTask, CronTaskRun, CronWecomNotification, ResolvedToolPolicy,
     };
     use crate::wecom::WecomTaskBindingTargetType;
     use std::collections::HashMap;
@@ -1962,6 +2121,7 @@ mod tests {
             stderr: String::new(),
             duration_ms: None,
             status: "success".to_string(),
+            runner_lease: false,
             hermes_notification: None,
             runtime_id: None,
             runtime_kind: Some("headless".to_string()),
@@ -2223,5 +2383,185 @@ mod tests {
             normalize_wecom_peer_id(Some(&WecomTaskBindingTargetType::User), "single:iveswen"),
             "single:iveswen"
         );
+    }
+
+    fn sample_run(id: &str, status: &str, started_at: &str) -> CronTaskRun {
+        CronTaskRun {
+            id: id.to_string(),
+            task_id: "task-1".to_string(),
+            started_at: started_at.to_string(),
+            finished_at: None,
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            duration_ms: None,
+            status: status.to_string(),
+            runner_lease: false,
+            hermes_notification: None,
+            runtime_id: None,
+            runtime_kind: Some("headless".to_string()),
+            provider_session_id: None,
+            working_dir: None,
+        }
+    }
+
+    #[test]
+    fn close_orphaned_running_runs_closes_only_running_records() {
+        let running = sample_run("run-1", "running", "2026-10-24T23:00:00+00:00");
+        let mut completed = sample_run("run-2", "success", "2026-10-23T23:00:00+00:00");
+        completed.finished_at = Some("2026-10-24T00:10:00+00:00".to_string());
+        completed.exit_code = Some(0);
+        let timed_out = sample_run("run-3", "timeout", "2026-10-22T23:00:00+00:00");
+
+        let (runs, closed) = close_orphaned_running_runs(
+            vec![running, completed.clone(), timed_out.clone()],
+            "2026-10-25T01:00:00+00:00",
+            |_| false,
+        );
+
+        assert_eq!(closed, 1);
+        assert_eq!(runs[0].status, "failed");
+        assert_eq!(
+            runs[0].finished_at.as_deref(),
+            Some("2026-10-25T01:00:00+00:00")
+        );
+        assert_eq!(runs[0].duration_ms, Some(7_200_000));
+        assert!(runs[0].stderr.contains("Interrupted"));
+        // Terminal records from earlier sessions stay untouched.
+        assert_eq!(runs[1].status, "success");
+        assert_eq!(runs[1].stdout, completed.stdout);
+        assert_eq!(runs[1].stderr, completed.stderr);
+        assert_eq!(runs[2].status, "timeout");
+        assert_eq!(runs[2].stderr, timed_out.stderr);
+    }
+
+    #[test]
+    fn close_orphaned_running_runs_tolerates_unparsable_timestamps() {
+        let running = sample_run("run-1", "running", "not-a-timestamp");
+
+        let (runs, closed) =
+            close_orphaned_running_runs(vec![running], "2026-10-25T01:00:00+00:00", |_| false);
+
+        assert_eq!(closed, 1);
+        assert_eq!(runs[0].status, "failed");
+        assert_eq!(runs[0].duration_ms, None);
+        assert_eq!(
+            runs[0].finished_at.as_deref(),
+            Some("2026-10-25T01:00:00+00:00")
+        );
+    }
+
+    // A live runner thread must keep its record "running": the periodic
+    // sweep exists to recover orphans, not to cut healthy runs short.
+    #[test]
+    fn close_orphaned_running_runs_skips_live_runs() {
+        let live = sample_run("run-live", "running", "2026-10-24T23:00:00+00:00");
+        let orphaned = sample_run("run-orphan", "running", "2026-10-24T23:00:00+00:00");
+
+        let (runs, closed) = close_orphaned_running_runs(
+            vec![live.clone(), orphaned],
+            "2026-10-25T01:00:00+00:00",
+            |id| id == "run-live",
+        );
+
+        assert_eq!(closed, 1);
+        assert_eq!(runs[0].status, "running");
+        assert_eq!(runs[0].finished_at, live.finished_at);
+        assert_eq!(runs[1].status, "failed");
+        assert!(runs[1].stderr.contains("Interrupted"));
+    }
+
+    #[test]
+    fn recovered_run_makes_waiting_hermes_result_pending() {
+        let mut run = sample_run("notify-run", "running", "2026-10-24T23:00:00+00:00");
+        run.hermes_notification = Some(super::CronHermesDelivery {
+            target: super::CronHermesNotification {
+                route_id: "test-route".into(),
+                generation: 1,
+                subscription_id: "test-sub".into(),
+            },
+            status: "waiting".into(),
+        });
+        let (runs, closed) =
+            close_orphaned_running_runs(vec![run], "2026-10-25T01:00:00+00:00", |_| false);
+        assert_eq!(closed, 1);
+        assert!(super::hermes_notifications::is_terminal(&runs[0]));
+        assert_eq!(
+            runs[0].hermes_notification.as_ref().unwrap().status,
+            "pending"
+        );
+    }
+
+    // Integration smoke for the sweep's real file walk: seeds an actual
+    // cron-runs file, registers a live run, sweeps, and reads the records
+    // back from disk. Ignored by default because get_ccem_dir() resolves to
+    // $HOME/.ccem: it must only run with HOME pointed at a sandbox that
+    // contains the marker file below, so it can never touch a real ~/.ccem.
+    // Run it via the compiled test binary:
+    //   cargo test --locked --lib --no-run
+    //   HOME=<sandbox-with-marker> target/debug/deps/<test-bin> \
+    //     sweep_orphaned_cron_runs_smoke --ignored
+    #[test]
+    #[ignore = "requires HOME sandboxed to a dir containing .ccem-sweep-smoke-sandbox"]
+    fn sweep_orphaned_cron_runs_smoke_closes_real_files() {
+        let home = std::env::var("HOME").expect("HOME set");
+        let marker = PathBuf::from(&home).join(".ccem-sweep-smoke-sandbox");
+        assert!(
+            marker.exists(),
+            "refusing to run: {home} is not the sweep smoke sandbox"
+        );
+
+        let task_id = "sweep-smoke-task";
+        let runs_dir = crate::config::get_ccem_dir().join("cron-runs");
+        let _ = std::fs::remove_dir_all(&runs_dir);
+
+        let mut orphan = sample_run("run-orphan", "running", "2026-10-24T23:00:00+00:00");
+        let mut done = sample_run("run-done", "success", "2026-10-24T00:00:00+00:00");
+        done.finished_at = Some("2026-10-24T00:05:00+00:00".to_string());
+        done.exit_code = Some(0);
+        let mut live = sample_run("run-live", "running", "2026-10-24T23:30:00+00:00");
+        orphan.runner_lease = true;
+        live.runner_lease = true;
+        let lease = super::RunLease::acquire(&runs_dir, "run-orphan").unwrap();
+        drop(lease);
+        let mut legacy = sample_run("run-legacy-overdue", "running", "2026-10-24T23:00:00+00:00");
+        legacy.task_id = task_id.into();
+        let recent = sample_run(
+            "run-legacy-recent",
+            "running",
+            &chrono::Utc::now().to_rfc3339(),
+        );
+        let task: CronTask = serde_json::from_value(serde_json::json!({
+            "id": task_id, "name": "sweep smoke", "cronExpression": "0 0 * * *",
+            "prompt": "fixture", "workingDir": home, "enabled": false,
+            "timeoutSecs": 300, "createdAt": "2026-10-24T23:00:00+00:00",
+            "updatedAt": "2026-10-24T23:00:00+00:00"
+        }))
+        .unwrap();
+        super::write_tasks(&[task]).unwrap();
+        write_runs(task_id, &[orphan, done, live, legacy, recent]).expect("seed runs");
+
+        // A live runner thread owns run-live while the sweep runs.
+        let _guard = super::RunLease::acquire(&runs_dir, "run-live").expect("register live guard");
+        sweep_orphaned_cron_runs();
+
+        let runs = read_runs(task_id).expect("read back runs");
+        let by_id = |id: &str| {
+            runs.iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("missing {id}"))
+        };
+        assert_eq!(by_id("run-orphan").status, "failed");
+        assert!(by_id("run-orphan").finished_at.is_some());
+        assert!(by_id("run-orphan").stderr.contains("Interrupted"));
+        assert_eq!(by_id("run-done").status, "success");
+        assert_eq!(by_id("run-live").status, "running");
+        assert!(by_id("run-live").finished_at.is_none());
+        assert_eq!(by_id("run-legacy-overdue").status, "failed");
+        assert_eq!(by_id("run-legacy-recent").status, "running");
+        drop(_guard);
+        let recovered = sweep_orphaned_cron_runs();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].id, "run-live");
     }
 }
