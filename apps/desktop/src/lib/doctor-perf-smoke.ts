@@ -56,6 +56,7 @@ interface PerfSummaryEntryLike {
 
 interface PerfSummaryLike {
   longtask?: PerfSummaryEntryLike;
+  'frame-drop'?: PerfSummaryEntryLike;
 }
 
 interface HistorySessionLike {
@@ -181,8 +182,28 @@ function skippedRun(
   };
 }
 
-function frontendLongTaskRun(summary?: PerfSummaryLike): DoctorPerfSmokeRun {
+function frontendLongTaskRun(
+  summary?: PerfSummaryLike,
+  longTaskSupported = true,
+): DoctorPerfSmokeRun {
   const budgetMs = budgetByName.frontendLongTask;
+  if (!longTaskSupported) {
+    // WebKit has no longtask entries: "0" would read as a pass. Show the
+    // rAF gaps instead, which still expose a busy main thread.
+    const frames = summary?.['frame-drop'];
+    return {
+      name: 'frontendLongTask',
+      label: RUN_LABELS.frontendLongTask,
+      status: 'skip',
+      budgetMs,
+      observed: {
+        reason: 'longtask-unsupported',
+        frameDropCount: frames?.count ?? 0,
+        frameDropP95Ms: frames?.p95Ms,
+        frameDropMaxMs: frames?.maxMs,
+      },
+    };
+  }
   const longtask = summary?.longtask;
   const maxMs = longtask?.maxMs;
   const durationMs = typeof maxMs === 'number' && Number.isFinite(maxMs)
@@ -228,6 +249,8 @@ function buildReport(runs: DoctorPerfSmokeRun[], totalDurationMs: number): Docto
 export async function runDoctorPerfSmoke(options: {
   invoke: InvokeLike;
   perfSummary?: PerfSummaryLike;
+  /** From perf-log; false on WebKit, where long tasks are not observable. */
+  longTaskSupported?: boolean;
 }): Promise<DoctorPerfSmokeReport> {
   const startedAt = nowMs();
   const runs: DoctorPerfSmokeRun[] = [];
@@ -311,7 +334,7 @@ export async function runDoctorPerfSmoke(options: {
     runs.push(skippedRun('conversationDetail', 'No recent session detail target available'));
   }
 
-  runs.push(frontendLongTaskRun(options.perfSummary));
+  runs.push(frontendLongTaskRun(options.perfSummary, options.longTaskSupported));
 
   return buildReport(runs, nowMs() - startedAt);
 }

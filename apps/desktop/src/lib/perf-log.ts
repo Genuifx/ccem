@@ -36,23 +36,46 @@ export interface PerfEvent {
 }
 
 const BUFFER_CAPACITY = 500;
+// A janky session drops frames continuously; in the shared buffer they would
+// evict every IPC, mark and error. Keep them apart: the summary covers the
+// whole frame window, the event list only its most recent tail.
+const FRAME_DROP_CAPACITY = 600;
+const FRAME_DROP_EXPORT_LIMIT = 60;
 const LONG_FRAME_THRESHOLD_MS = 80; // 12.5fps — anything noticeably janky
 const LONG_IPC_THRESHOLD_MS = 250;
 
-const buffer: PerfEvent[] = [];
-let bufferCursor = 0;
+interface Ring {
+  items: PerfEvent[];
+  cursor: number;
+  capacity: number;
+}
+
+const createRing = (capacity: number): Ring => ({ items: [], cursor: 0, capacity });
+const buffer = createRing(BUFFER_CAPACITY);
+const frameDrops = createRing(FRAME_DROP_CAPACITY);
 let installed = false;
 let ipcPatched = false;
 let frameSamplerStop: (() => void) | null = null;
 const observers: PerformanceObserver[] = [];
 
-function pushEvent(event: PerfEvent) {
-  if (buffer.length < BUFFER_CAPACITY) {
-    buffer.push(event);
+function pushRing(ring: Ring, event: PerfEvent) {
+  if (ring.items.length < ring.capacity) {
+    ring.items.push(event);
   } else {
-    buffer[bufferCursor] = event;
-    bufferCursor = (bufferCursor + 1) % BUFFER_CAPACITY;
+    ring.items[ring.cursor] = event;
+    ring.cursor = (ring.cursor + 1) % ring.capacity;
   }
+}
+
+function readRing(ring: Ring): PerfEvent[] {
+  if (ring.items.length < ring.capacity) {
+    return ring.items.slice();
+  }
+  return ring.items.slice(ring.cursor).concat(ring.items.slice(0, ring.cursor));
+}
+
+function pushEvent(event: PerfEvent) {
+  pushRing(event.type === 'frame-drop' ? frameDrops : buffer, event);
 }
 
 function nowMs(): number {
@@ -69,18 +92,30 @@ function record(event: Omit<PerfEvent, 't' | 'iso'>) {
   });
 }
 
-/** Get a snapshot of buffered events in chronological order. */
+/**
+ * Buffered events in chronological order. Frame drops are limited to the most
+ * recent FRAME_DROP_EXPORT_LIMIT; getPerfSummary() covers all retained ones.
+ */
 export function getPerfEvents(): PerfEvent[] {
-  if (buffer.length < BUFFER_CAPACITY) {
-    return buffer.slice();
-  }
-  return buffer.slice(bufferCursor).concat(buffer.slice(0, bufferCursor));
+  return readRing(buffer)
+    .concat(readRing(frameDrops).slice(-FRAME_DROP_EXPORT_LIMIT))
+    .sort((a, b) => a.t - b.t);
 }
 
 /** Clear all buffered events. */
 export function clearPerfLog() {
-  buffer.length = 0;
-  bufferCursor = 0;
+  for (const ring of [buffer, frameDrops]) {
+    ring.items.length = 0;
+    ring.cursor = 0;
+  }
+}
+
+/** Safari/WebKit cannot observe long tasks; a zero count there means "unknown". */
+export function isLongTaskObservationSupported(): boolean {
+  const types = typeof PerformanceObserver !== 'undefined'
+    ? (PerformanceObserver as unknown as { supportedEntryTypes?: string[] }).supportedEntryTypes
+    : undefined;
+  return Array.isArray(types) && types.includes('longtask');
 }
 
 /** Manual instrumentation hook for callers (e.g. page transitions). */
@@ -114,7 +149,7 @@ function percentile(sorted: number[], p: number): number {
 
 /** Aggregate summary suitable for showing in the Settings page. */
 export function getPerfSummary(): PerfSummary {
-  const events = getPerfEvents();
+  const events = readRing(buffer).concat(readRing(frameDrops));
   const grouped = new Map<PerfEventType, number[]>();
   const counts = new Map<PerfEventType, number>();
 
@@ -153,6 +188,8 @@ export interface DiagnosticsEnvelope {
   url: string;
   performanceMode?: string;
   hardwareConcurrency?: number;
+  /** False on WebKit: long-task counts are then unknown, not zero. */
+  longTaskSupported?: boolean;
   deviceMemory?: number;
   /** Throttled frames look identical to slow ones; these tell them apart. */
   display?: {
@@ -188,6 +225,7 @@ export function buildDiagnosticsEnvelope(): DiagnosticsEnvelope {
     url: typeof location !== 'undefined' ? location.href : '',
     performanceMode: doc?.documentElement.dataset.performanceMode,
     hardwareConcurrency: nav?.hardwareConcurrency,
+    longTaskSupported: isLongTaskObservationSupported(),
     deviceMemory: (nav as { deviceMemory?: number } | undefined)?.deviceMemory,
     display: typeof window !== 'undefined' && doc ? {
       visibilityState: doc.visibilityState,

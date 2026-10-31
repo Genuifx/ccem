@@ -36,6 +36,28 @@ struct DoctorSystem {
     low_power_mode: Option<bool>,
     agent_processes: Option<u64>,
     agent_rss_bytes: Option<u64>,
+    /// `ps` %CPU (100 = one core) of this app and its child processes.
+    app_cpu_percent: Option<f64>,
+    /// Sum over all processes; compare with the core count for saturation.
+    total_cpu_percent: Option<f64>,
+    /// Busiest processes by executable name (no arguments), so contention
+    /// from WebContent, agents or unrelated apps is visible.
+    top_cpu_processes: Option<Vec<DoctorCpuProcess>>,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DoctorCpuProcess {
+    name: String,
+    cpu_percent: f64,
+    rss_bytes: u64,
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct CpuSummary {
+    app_cpu_percent: f64,
+    total_cpu_percent: f64,
+    top: Vec<DoctorCpuProcess>,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,7 +175,12 @@ fn collect_system_load() -> DoctorSystem {
     let (agent_processes, agent_rss_bytes) = command_stdout("/bin/ps", &["-axo", "rss=,comm="])
         .map(|text| summarize_agent_processes(&text))
         .unzip();
+    let cpu = command_stdout("/bin/ps", &["-axo", "pid=,ppid=,pcpu=,rss=,comm="])
+        .map(|text| summarize_cpu(&text, std::process::id()));
     DoctorSystem {
+        app_cpu_percent: cpu.as_ref().map(|cpu| cpu.app_cpu_percent),
+        total_cpu_percent: cpu.as_ref().map(|cpu| cpu.total_cpu_percent),
+        top_cpu_processes: cpu.map(|cpu| cpu.top),
         model: sysctl("hw.model"),
         memory_bytes: sysctl("hw.memsize").and_then(|value| value.parse().ok()),
         load_average: sysctl("vm.loadavg"),
@@ -184,6 +211,67 @@ fn summarize_agent_processes(ps_output: &str) -> (u64, u64) {
         .fold((0, 0), |(count, rss), (rss_kb, _)| {
             (count + 1, rss + rss_kb.trim().parse::<u64>().unwrap_or(0) * 1024)
         })
+}
+
+/// Parses `ps -axo pid=,ppid=,pcpu=,rss=,comm=` output. Executable paths may
+/// contain spaces, so `comm` is everything after the fourth field.
+fn summarize_cpu(ps_output: &str, app_pid: u32) -> CpuSummary {
+    const TOP_LIMIT: usize = 8;
+    let round = |value: f64| (value * 10.0).round() / 10.0;
+    let rows: Vec<(u32, u32, f64, u64, &str)> = ps_output
+        .lines()
+        .filter_map(|line| {
+            let mut rest = line.trim_start();
+            let mut fields = [""; 4];
+            for field in &mut fields {
+                let (value, tail) = rest.split_once(char::is_whitespace)?;
+                *field = value;
+                rest = tail.trim_start();
+            }
+            Some((
+                fields[0].parse().ok()?,
+                fields[1].parse().ok()?,
+                fields[2].parse().ok()?,
+                fields[3].parse::<u64>().ok()? * 1024,
+                rest.trim(),
+            ))
+        })
+        .collect();
+
+    let mut app_pids = std::collections::HashSet::from([app_pid]);
+    loop {
+        let before = app_pids.len();
+        for (pid, ppid, ..) in &rows {
+            if app_pids.contains(ppid) {
+                app_pids.insert(*pid);
+            }
+        }
+        if app_pids.len() == before {
+            break;
+        }
+    }
+
+    let mut top: Vec<DoctorCpuProcess> = rows
+        .iter()
+        .map(|(_, _, cpu, rss, comm)| DoctorCpuProcess {
+            name: comm.rsplit('/').next().unwrap_or_default().to_string(),
+            cpu_percent: *cpu,
+            rss_bytes: *rss,
+        })
+        .collect();
+    top.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent));
+    top.truncate(TOP_LIMIT);
+
+    CpuSummary {
+        app_cpu_percent: round(
+            rows.iter()
+                .filter(|(pid, ..)| app_pids.contains(pid))
+                .map(|(_, _, cpu, ..)| cpu)
+                .sum(),
+        ),
+        total_cpu_percent: round(rows.iter().map(|(_, _, cpu, ..)| cpu).sum()),
+        top,
+    }
 }
 
 fn collect_command_statuses(user_path: &str) -> Vec<DoctorCommandStatus> {
@@ -540,5 +628,40 @@ mod tests {
                   1024 /usr/local/bin/codex\n\
                   999 /bin/zsh\n";
         assert_eq!(summarize_agent_processes(ps), (3, (420192 + 75840 + 1024) * 1024));
+    }
+
+    #[test]
+    fn cpu_summary_attributes_the_app_tree_and_ranks_busiest_processes() {
+        let ps = "    1     0   1.0    100 /sbin/launchd\n\
+                  500     1  12.5   2048 /Applications/CCEM Desktop.app/Contents/MacOS/ccem-desktop\n\
+                  510   500  30.0   4096 /usr/local/bin/claude\n\
+                  520   510   5.5   1024 /bin/zsh\n\
+                  600     1  80.0   8192 /System/Library/Frameworks/WebKit.framework/XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent\n\
+                  garbage line\n";
+        let summary = summarize_cpu(ps, 500);
+        assert_eq!(summary.app_cpu_percent, 48.0);
+        assert_eq!(summary.total_cpu_percent, 129.0);
+        assert_eq!(summary.top.len(), 5);
+        assert_eq!(
+            summary.top[0],
+            DoctorCpuProcess {
+                name: "com.apple.WebKit.WebContent".to_string(),
+                cpu_percent: 80.0,
+                rss_bytes: 8192 * 1024,
+            }
+        );
+        assert_eq!(summary.top[2].name, "ccem-desktop");
+    }
+
+    #[test]
+    fn cpu_summary_keeps_only_the_busiest_processes() {
+        let ps: String = (1..=12)
+            .map(|pid| format!("{pid} 0 {pid}.0 10 /bin/p{pid}\n"))
+            .collect();
+        let summary = summarize_cpu(&ps, 999);
+        assert_eq!(summary.app_cpu_percent, 0.0);
+        assert_eq!(summary.top.len(), 8);
+        assert_eq!(summary.top[0].name, "p12");
+        assert_eq!(summary.top[7].name, "p5");
     }
 }

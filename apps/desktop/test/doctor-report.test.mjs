@@ -95,6 +95,73 @@ test('perf logger does not crash when Tauri invoke is read-only', async () => {
   assert.ok(events.some((event) => event.name === 'perf-log:installed'));
 });
 
+test('continuous frame drops do not evict marks from the doctor report', async (t) => {
+  const perfLog = await importPerfLog();
+  perfLog._resetPerfLogForTests();
+  let clock = 1_000;
+  const originalPerformance = globalThis.performance;
+  Object.defineProperty(globalThis, 'performance', {
+    value: { now: () => clock },
+    configurable: true,
+  });
+  t.after(() => {
+    perfLog._resetPerfLogForTests();
+    Object.defineProperty(globalThis, 'performance', { value: originalPerformance, configurable: true });
+  });
+  let frame = null;
+  const fakeWindow = {
+    addEventListener: () => undefined,
+    requestAnimationFrame: (callback) => { frame = callback; return 1; },
+    cancelAnimationFrame: () => undefined,
+    setTimeout: () => 1,
+  };
+  perfLog.initPerfLog(fakeWindow, { patchTauri: false });
+  perfLog.recordPerfMark('early-mark');
+
+  // One janky minute: a 120ms frame every time, far beyond the event buffer.
+  for (let i = 0; i < 1_000; i += 1) {
+    clock += 120;
+    frame();
+  }
+  perfLog.recordPerfMark('late-mark');
+
+  const report = JSON.parse(perfLog.exportDoctorReportAsJson());
+  const names = report.frontend.events.map((event) => event.name);
+  assert.ok(names.includes('early-mark'), 'marks before the jank must survive');
+  assert.ok(names.includes('late-mark'));
+  const exportedFrames = report.frontend.events.filter((event) => event.type === 'frame-drop');
+  assert.equal(exportedFrames.length, 60);
+  assert.equal(report.frontend.summary['frame-drop'].count, 600);
+  assert.equal(report.frontend.summary['frame-drop'].p95Ms, 120);
+  const times = report.frontend.events.map((event) => event.t);
+  assert.deepEqual(times, [...times].sort((a, b) => a - b), 'events stay chronological');
+  assert.equal(typeof report.frontend.longTaskSupported, 'boolean');
+});
+
+test('doctor perf smoke skips the long-task budget where WebKit cannot observe it', async () => {
+  const perfSmoke = await importDoctorPerfSmoke();
+  const invoke = async (command) => {
+    if (command === 'get_workspace_overview_snapshot') return { sessions: [], projectNodes: [] };
+    if (command === 'get_workspace_session_decorations') return [];
+    if (command === 'search_conversation_history') return [];
+    throw new Error(`unexpected command ${command}`);
+  };
+  const report = await perfSmoke.runDoctorPerfSmoke({
+    invoke,
+    perfSummary: { longtask: undefined, 'frame-drop': { count: 487, p95Ms: 212, maxMs: 684 } },
+    longTaskSupported: false,
+  });
+  const run = report.runs.find((candidate) => candidate.name === 'frontendLongTask');
+
+  assert.equal(run.status, 'skip');
+  assert.deepEqual(run.observed, {
+    reason: 'longtask-unsupported',
+    frameDropCount: 487,
+    frameDropP95Ms: 212,
+    frameDropMaxMs: 684,
+  });
+});
+
 test('doctor perf smoke runs live budget checks and is embedded in exports', async () => {
   const perfLog = await importPerfLog();
   const perfSmoke = await importDoctorPerfSmoke();
