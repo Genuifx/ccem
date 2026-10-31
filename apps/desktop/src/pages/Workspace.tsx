@@ -28,6 +28,7 @@ import {
   isSplitViewShown,
   pruneSplitPanes,
   isSplitHistoryPaneId,
+  retainStableKeySet,
   splitGridLayout,
   toSplitHistoryPaneId,
   toggleSplitPane,
@@ -1852,6 +1853,9 @@ export function Workspace({
     setWorkspaceReviewOpen(false);
   }, [closeSidePanel, isSplitView, setWorkspaceReviewOpen, sidePanelOpen]);
 
+  // liveSessionsByRuntimeId changes on every live summary refresh; keep the
+  // Set identity while its keys are unchanged so ProjectTree stays memoized.
+  const splitSessionKeysRef = useRef<ReadonlySet<string>>(new Set());
   const splitSessionKeys = useMemo(() => {
     const keys = new Set<string>();
     for (const runtimeId of splitRuntimeIds) {
@@ -1862,7 +1866,9 @@ export function Workspace({
       keys.add(liveSessionSidebarKey(entry));
       keys.add(liveSessionRuntimeSidebarKey(entry));
     }
-    return keys;
+    const next = retainStableKeySet(splitSessionKeysRef.current, keys);
+    splitSessionKeysRef.current = next;
+    return next;
   }, [liveSessionsByRuntimeId, splitHistorySessions, splitRuntimeIds]);
 
   // Live summaries refresh every couple of seconds during a turn. Reuse the

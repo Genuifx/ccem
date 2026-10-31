@@ -21,6 +21,7 @@ import {
   exportDoctorReportAsJson,
   getPerfSummary,
   clearPerfLog,
+  isLongTaskObservationSupported,
   recordPerfMark,
   type PerfSummary,
 } from '@/lib/perf-log';
@@ -1183,6 +1184,7 @@ function DiagnosticsPanel({ active }: { active: boolean }) {
       const report = await runDoctorPerfSmoke({
         invoke,
         perfSummary: getPerfSummary(),
+        longTaskSupported: isLongTaskObservationSupported(),
       });
       setPerfSmoke(report);
       setSummary(getPerfSummary());
@@ -1214,8 +1216,11 @@ function DiagnosticsPanel({ active }: { active: boolean }) {
     return `${Math.round(value)}ms`;
   };
 
+  // WebKit cannot observe long tasks; a permanent "0" there reads as healthy.
   const rows: { type: keyof PerfSummary; label: string }[] = [
-    { type: 'longtask', label: t('settings.diagnosticsLongtask') },
+    ...(isLongTaskObservationSupported()
+      ? [{ type: 'longtask' as const, label: t('settings.diagnosticsLongtask') }]
+      : []),
     { type: 'ipc', label: t('settings.diagnosticsIpcSlow') },
     { type: 'ipc-error', label: t('settings.diagnosticsIpcError') },
     { type: 'frame-drop', label: t('settings.diagnosticsFrameDrop') },

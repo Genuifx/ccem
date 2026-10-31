@@ -443,6 +443,11 @@ test('live session streaming keeps unrelated workspace UI out of each transcript
   assert.match(workspace, /retainStableHistorySessions\(\s*sidebarSessionsRef\.current/);
   assert.match(workspace, /retainStableLiveSessionTreeState\(\s*liveSessionTreeStateRef\.current/);
   assert.match(workspace, /onSelect=\{handleProjectTreeSelect\}/, 'the sidebar needs a stable select handler');
+  assert.match(
+    workspace,
+    /retainStableKeySet\(splitSessionKeysRef\.current, keys\)/,
+    'split keys derive from live summaries; a fresh Set per poll re-renders every sidebar row',
+  );
   assert.match(controls, /export const ComposerControls = memo\(/);
   assert.match(contextIndicator, /export const ContextWindowIndicator = memo\(/);
 });
