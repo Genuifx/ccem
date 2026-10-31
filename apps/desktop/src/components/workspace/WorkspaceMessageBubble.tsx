@@ -11,6 +11,7 @@ import {
   Circle,
   ClipboardList,
   Copy,
+  Undo2,
   FileImage,
   FileText,
   GitBranch,
@@ -66,6 +67,12 @@ interface WorkspaceMessageBubbleProps {
    * stable callback: the bubble memo comparator ignores prop identity.
    */
   onForkTurn?: (message: ConversationMessageData) => void;
+  /**
+   * Offer "rewind files to before this message" on user bubbles that carry a
+   * file checkpoint. Must be a stable callback; its presence (not identity)
+   * is the availability signal, so the memo comparator tracks it.
+   */
+  onRewindFiles?: (message: ConversationMessageData) => void;
   /**
    * The transcript list renders the inter-message spacing on its measured
    * wrapper (so the windowing spacer math includes the margin). When set, the
@@ -1191,6 +1198,7 @@ const MessageMetaBar = memo(function MessageMetaBar({
   visible,
   t,
   onForkTurn,
+  onRewindFiles,
   turnMetrics,
 }: {
   message: ConversationMessageData;
@@ -1198,6 +1206,7 @@ const MessageMetaBar = memo(function MessageMetaBar({
   visible: boolean;
   t: (key: string) => string;
   onForkTurn?: (message: ConversationMessageData) => void;
+  onRewindFiles?: (message: ConversationMessageData) => void;
   turnMetrics?: ConversationMessageData['turnMetrics'];
 }) {
   const [copied, setCopied] = useState(false);
@@ -1209,6 +1218,10 @@ const MessageMetaBar = memo(function MessageMetaBar({
   const handleForkTurn = useCallback(() => {
     onForkTurn?.(message);
   }, [message, onForkTurn]);
+
+  const handleRewindFiles = useCallback(() => {
+    onRewindFiles?.(message);
+  }, [message, onRewindFiles]);
 
   const copyText = useMemo(() => getMessageCopyText(message, t).trim(), [message, t]);
 
@@ -1288,6 +1301,23 @@ const MessageMetaBar = memo(function MessageMetaBar({
         {copied ? t('workspace.copied') : t('workspace.copyMessage')}
       </TooltipContent>
     </Tooltip>
+      {isUser && onRewindFiles ? (
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              aria-label={t('workspace.nativeRewindToMessage')}
+              onClick={handleRewindFiles}
+              className="inline-flex h-5 w-5 items-center justify-center rounded text-foreground/50 transition-colors hover:bg-foreground/10"
+            >
+              <Undo2 className="h-3.5 w-3.5" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent>
+            {t('workspace.nativeRewindToMessage')}
+          </TooltipContent>
+        </Tooltip>
+      ) : null}
       {!isUser ? (
         <Tooltip>
           <TooltipTrigger asChild>
@@ -1351,6 +1381,7 @@ const MessageMetaBar = memo(function MessageMetaBar({
   && prev.isUser === next.isUser
   && prev.visible === next.visible
   && prev.turnMetrics === next.turnMetrics
+  && prev.onRewindFiles === next.onRewindFiles
   && prev.t === next.t
 ));
 
@@ -1873,7 +1904,7 @@ function renderContentBlocks(
   return { content: result, images: imageBlocks, summaries };
 }
 
-function WorkspaceMessageBubbleComponent({ message, turnMetrics, prevRole, onForkTurn, suppressSpacing = false }: WorkspaceMessageBubbleProps) {
+function WorkspaceMessageBubbleComponent({ message, turnMetrics, prevRole, onForkTurn, onRewindFiles, suppressSpacing = false }: WorkspaceMessageBubbleProps) {
   const { t } = useLocale();
   const [isActionHovering, setIsActionHovering] = useState(false);
   const [isActionFocusWithin, setIsActionFocusWithin] = useState(false);
@@ -2022,7 +2053,13 @@ function WorkspaceMessageBubbleComponent({ message, turnMetrics, prevRole, onFor
               ) : null}
               {hasImages ? <WorkspaceImageStrip blocks={imageBlocks} isUser t={t} /> : null}
             </div>
-            <MessageMetaBar message={message} isUser visible={showMessageActions} t={t} />
+            <MessageMetaBar
+              message={message}
+              isUser
+              visible={showMessageActions}
+              t={t}
+              onRewindFiles={onRewindFiles}
+            />
           </div>
       ) : null}
 
@@ -2074,4 +2111,5 @@ export const WorkspaceMessageBubble = memo(
     && prevProps.message === nextProps.message
     && prevProps.turnMetrics === nextProps.turnMetrics
     && prevProps.suppressSpacing === nextProps.suppressSpacing
+    && prevProps.onRewindFiles === nextProps.onRewindFiles
 );

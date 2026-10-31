@@ -89,7 +89,7 @@ test('legacy renderer queue remains readable for one-time backend migration', as
   const runtimeReset = sliceBetween(
     source,
     'activeCacheRuntimeRef.current = session.runtime_id;',
-    'setSelectedFileCheckpoint(null);',
+    'setReviewPanelOpen(false);',
   );
   assert.doesNotMatch(runtimeReset, /setQueuedMessages\(\[\]\)/);
 });

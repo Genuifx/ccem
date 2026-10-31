@@ -224,7 +224,7 @@ test('workspace message actions are revealed by explicit transcript content hove
   assert.match(component, /absolute bottom-0 z-10/);
   assert.match(
     component,
-    /<MessageMetaBar message=\{message\} isUser visible=\{showMessageActions\} t=\{t\} \/>/,
+    /<MessageMetaBar\s+message=\{message\}\s+isUser\s+visible=\{showMessageActions\}\s+t=\{t\}/,
   );
   assert.match(
     component,

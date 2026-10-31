@@ -298,6 +298,13 @@ interface WorkspaceTranscriptListProps {
    * callback: bubbles are memoized on message identity only.
    */
   onForkTurn?: (message: ConversationMessageData) => void;
+  /** User message ids that carry a Claude file checkpoint. */
+  rewindableMessageIds?: ReadonlySet<string>;
+  /**
+   * Rewind-files-to-before-this-message action for user bubbles listed in
+   * `rewindableMessageIds`. Must be a stable callback.
+   */
+  onRewindFiles?: (message: ConversationMessageData) => void;
   /** Session todo list, rendered at the very tail (below the pending row). */
   todos?: WorkspaceTodos | null;
   /** Post-turn suggestions, rendered below the todo list once the turn is idle. */
@@ -312,6 +319,8 @@ export function WorkspaceTranscriptList({
   enableTopWindowing = false,
   viewportRef,
   onForkTurn,
+  rewindableMessageIds,
+  onRewindFiles,
   todos,
   nextSteps,
   nextStepActions,
@@ -860,6 +869,7 @@ export function WorkspaceTranscriptList({
               turnMetrics={item.turnMetrics}
               prevRole={prevRole}
               onForkTurn={onForkTurn}
+              onRewindFiles={message.uuid && rewindableMessageIds?.has(message.uuid) ? onRewindFiles : undefined}
               suppressSpacing={!selfMargined}
             />
           </div>

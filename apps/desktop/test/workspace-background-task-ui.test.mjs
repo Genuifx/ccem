@@ -40,9 +40,9 @@ test('Workspace keeps foreground composition independent and guards task-destruc
     'WorkspaceNativeSessionView.tsx',
   );
 
-  const canSendBlock = workspace.match(/const canSend =[\s\S]*?;\n  const canShowFileRestorePoints/)?.[0] ?? '';
+  const canSendBlock = workspace.match(/const canSend =[\s\S]*?;\n/)?.[0] ?? '';
   assert.doesNotMatch(canSendBlock, /activeBackgroundTaskCount/);
-  assert.match(workspace, /activeBackgroundTaskCount === 0/);
+  assert.match(workspace, /if \(activeBackgroundTaskCount > 0\)/);
   assert.match(workspace, /data-ccem-background-task-risk-dialog/);
   assert.match(workspace, /performEnvChange\(action\.envName\)/);
   assert.match(workspace, /performEffortChange\(action\.effort, force\)/);
@@ -76,7 +76,7 @@ test('Workspace environment changes are force-only while effort changes may stil
     /const performEnvChange = useCallback[\s\S]*?const handlePermModeChange/,
   )?.[0] ?? '';
   const riskActionBlock = workspace.match(
-    /const applyPendingBackgroundTaskRiskAction = useCallback[\s\S]*?const handleRestoreFileCheckpoint/,
+    /const applyPendingBackgroundTaskRiskAction = useCallback[\s\S]*?\n  \}, \[/,
   )?.[0] ?? '';
   const riskDialogBlock = workspace.match(
     /data-ccem-background-task-risk-dialog[\s\S]*?<\/Dialog>/,

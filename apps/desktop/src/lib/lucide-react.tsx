@@ -122,6 +122,7 @@ import {
   Robot01Icon,
   Rocket01Icon,
   RotateLeft01Icon,
+  Undo02Icon,
   RotateRight01Icon,
   Route01Icon,
   Router01Icon,
@@ -332,6 +333,7 @@ export const Radio = createIcon(RadioIcon, 'Radio');
 export const RefreshCw = createIcon(RefreshIcon, 'RefreshCw');
 export const Rocket = createIcon(Rocket01Icon, 'Rocket');
 export const RotateCcw = createIcon(RotateLeft01Icon, 'RotateCcw');
+export const Undo2 = createIcon(Undo02Icon, 'Undo2');
 export const RotateCw = createIcon(RotateRight01Icon, 'RotateCw');
 export const Route = createIcon(Route01Icon, 'Route');
 export const Router = createIcon(Router01Icon, 'Router');

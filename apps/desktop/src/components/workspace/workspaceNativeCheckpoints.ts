@@ -85,3 +85,47 @@ export function deriveNativeFileCheckpoints(
   // turnIndex grows with Map insertion order, so reversing yields newest first.
   return Array.from(checkpoints.values()).reverse();
 }
+
+/** Events that can change `mapCheckpointsToUserPromptMessages`. */
+export function isUserPromptCheckpointEvent(event: SessionEventRecord): boolean {
+  return event.payload.type === 'user_prompt' || isFileCheckpointEvent(event);
+}
+
+/**
+ * Keys each Claude file checkpoint by the transcript user message it belongs
+ * to (`user-prompt-<seq>`, the id the event transcript gives a `user_prompt`).
+ * The SDK echoes a user message — and the helper emits its checkpoint — after
+ * the matching `user_prompt` event, so a checkpoint attaches to the nearest
+ * preceding prompt that has none yet. SDK-only user messages (no preceding
+ * unclaimed prompt) get no transcript anchor.
+ */
+export function mapCheckpointsToUserPromptMessages(
+  events: SessionEventRecord[],
+): Map<string, NativeFileCheckpoint> {
+  const checkpointById = new Map(
+    deriveNativeFileCheckpoints(events).map((checkpoint) => [checkpoint.checkpointId, checkpoint]),
+  );
+  const byMessageId = new Map<string, NativeFileCheckpoint>();
+  const claimed = new Set<string>();
+  let unclaimedPromptSeq: number | null = null;
+
+  for (const event of events) {
+    const payload = event.payload;
+    if (payload.type === 'user_prompt') {
+      unclaimedPromptSeq = event.seq;
+      continue;
+    }
+    if (payload.type !== 'checkpoint_created' || unclaimedPromptSeq === null) {
+      continue;
+    }
+    const checkpoint = checkpointById.get(payload.checkpoint_id);
+    if (!checkpoint || claimed.has(checkpoint.checkpointId)) {
+      continue;
+    }
+    claimed.add(checkpoint.checkpointId);
+    byMessageId.set(`user-prompt-${unclaimedPromptSeq}`, checkpoint);
+    unclaimedPromptSeq = null;
+  }
+
+  return byMessageId;
+}
