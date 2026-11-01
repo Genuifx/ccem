@@ -921,7 +921,8 @@ export function mergeWorkspaceReplayEvents(
   }
   return Array.from(eventsBySequence.values()).sort((left, right) => {
     if (left.runtime_id !== right.runtime_id) {
-      return left.runtime_id.localeCompare(right.runtime_id);
+      // Ordinal: runtime ids are ASCII, and ICU collation is far slower.
+      return left.runtime_id < right.runtime_id ? -1 : 1;
     }
     return left.seq - right.seq;
   });

@@ -522,6 +522,7 @@ function reviewFilesFromFold(
   gitSnapshot?: WorkspaceGitSnapshot | null,
   workingDir?: string | null,
   recentFiles?: WorkspaceRecentFile[] | null,
+  { sorted = true }: { sorted?: boolean } = {},
 ): ReviewChangedFile[] {
   const files = new Map<string, ReviewChangedFile>();
   for (const file of gitSnapshot?.files ?? []) {
@@ -589,7 +590,8 @@ function reviewFilesFromFold(
     });
   }
 
-  return Array.from(files.values()).sort((left, right) => left.path.localeCompare(right.path));
+  const changedFiles = Array.from(files.values());
+  return sorted ? changedFiles.sort((left, right) => left.path.localeCompare(right.path)) : changedFiles;
 }
 
 export function buildWorkspaceReviewSummaryFromFold(
@@ -598,11 +600,13 @@ export function buildWorkspaceReviewSummaryFromFold(
   workingDir?: string | null,
   recentFiles?: WorkspaceRecentFile[] | null,
 ): WorkspaceReviewSummary {
-  const changedFiles = reviewFilesFromFold(fold, gitSnapshot, workingDir, recentFiles);
+  // Counts only: the status pill refreshes on every events/git change, and a
+  // repo with ~13k untracked files made this sort dominate each commit.
+  const changedFiles = reviewFilesFromFold(fold, gitSnapshot, workingDir, recentFiles, { sorted: false });
   return {
     failedTools: Array.from(fold?.tools.values() ?? []).filter((tool) => tool.success === false).length,
     changedFiles: changedFiles.length,
-    artifacts: buildArtifacts(changedFiles).length,
+    artifacts: changedFiles.reduce((count, file) => count + (artifactKind(file.path) ? 1 : 0), 0),
   };
 }
 

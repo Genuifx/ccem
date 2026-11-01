@@ -533,7 +533,8 @@ function mergeReadableFallbackEvents(
   return Array.from(merged.values()).sort((left, right) => (
     left.runtime_id === right.runtime_id
       ? left.seq - right.seq
-      : left.runtime_id.localeCompare(right.runtime_id)
+      // Ordinal: runtime ids are ASCII, and ICU collation is far slower.
+      : left.runtime_id < right.runtime_id ? -1 : 1
   ));
 }
 

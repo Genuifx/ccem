@@ -213,6 +213,28 @@ test('builds lightweight review summary without message or todo scans', async ()
   });
 });
 
+test('unsorted summary counts match the sorted review model on a large snapshot', async () => {
+  const { buildWorkspaceReviewModel, buildWorkspaceReviewSummary } = await importWorkspaceReview();
+  const kinds = ['html', 'md', 'ts', 'json', 'png', 'rs', 'txt'];
+  const files = Array.from({ length: 3000 }, (_, index) => ({
+    path: `${index % 2 ? 'Docs' : 'src'}/file-${3000 - index}.${kinds[index % kinds.length]}`,
+    status: index % 3 ? 'M' : '??',
+    additions: 1,
+    deletions: 0,
+  }));
+  const gitSnapshot = {
+    is_repo: true, root: '/repo', branch: 'main', sha: 'abc1234', upstream: null, dirty_count: files.length, files,
+  };
+  const summary = buildWorkspaceReviewSummary({ events: [], gitSnapshot, workingDir: '/repo' });
+  const model = buildWorkspaceReviewModel({ session: session(), events: [], messages: [], gitSnapshot });
+
+  assert.equal(summary.changedFiles, model.changedFiles.length);
+  assert.equal(summary.artifacts, model.artifacts.length);
+  assert.ok(summary.artifacts > 0 && summary.artifacts < files.length);
+  const paths = model.changedFiles.map((file) => file.path);
+  assert.deepEqual(paths, [...paths].sort((left, right) => left.localeCompare(right)), 'the detail list stays sorted');
+});
+
 test('maps Codex todo_list summaries to unified todos', async () => {
   const { buildWorkspaceReviewModel } = await importWorkspaceReview();
   const model = buildWorkspaceReviewModel({
