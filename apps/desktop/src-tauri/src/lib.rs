@@ -25,6 +25,7 @@ mod dsh_history;
 mod event_bus;
 mod event_dispatcher;
 mod external_control;
+mod git_env;
 mod hermes_bridge;
 mod hermes_installer;
 mod history;
@@ -4448,6 +4449,7 @@ fn run_git_command(working_dir: &str, args: &[&str]) -> Result<String, String> {
 
 fn run_git_command_raw(working_dir: &str, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
+        .args(git_env::GIT_NO_FSMONITOR_ARGS)
         .arg("--literal-pathspecs")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
@@ -4812,6 +4814,7 @@ fn get_workspace_file_diff(
     let has_head = run_git_command(&working_dir, &["rev-parse", "--verify", "HEAD"]).is_ok();
     let raw = if is_untracked || !has_head {
         let output = Command::new("git")
+            .args(git_env::GIT_NO_FSMONITOR_ARGS)
             .arg("--literal-pathspecs").arg("-C").arg(&working_dir)
             .args(["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-index", "--", "/dev/null", &absolute])
             .output().map_err(|error| format!("Failed to run git: {}", error))?;
@@ -6809,6 +6812,28 @@ mod tests {
             "git {:?} failed: {}",
             args,
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn workspace_git_commands_skip_a_hung_fsmonitor() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("create temp repo");
+        let hooks = tempfile::tempdir().expect("create hook dir");
+        run_test_git(dir.path(), &["init", "-q"]);
+        // A fsmonitor that never answers, like the stuck macOS daemon.
+        let hook = hooks.path().join("hung-fsmonitor");
+        std::fs::write(&hook, "#!/bin/sh\nsleep 60\n").expect("write hook");
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("chmod hook");
+        run_test_git(dir.path(), &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+
+        let started = std::time::Instant::now();
+        let status = super::run_git_command(dir.path().to_str().unwrap(), &["status", "--porcelain"]);
+        assert!(status.is_ok(), "{status:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "git status waited on fsmonitor for {:?}",
+            started.elapsed()
         );
     }
 
