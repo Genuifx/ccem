@@ -52,11 +52,79 @@ async function importHarness() {
         const { flushSync } = require('react-dom');
         const { memoizeReplayUpdater, usePruneConfirmedLocalUserPrompts } = require('@/components/workspace/workspaceReplayState');
         const { appendSessionEvents, filterConfirmedLocalUserPrompts } = require('@/components/workspace/workspaceEventTranscript');
+        const { createTranscriptCommitRecovery } = require('@/components/workspace/workspaceTranscriptCommitRecovery');
 
         const event = (seq, payload = { type: 'system_message', message: 'chunk ' + seq }) => ({
           runtime_id: 'native-test', seq, occurred_at: '2026-11-01T00:00:00Z', payload,
         });
         exports.event = event;
+
+        // Mirrors the native session view's poll loop: each batch commits
+        // through the real commit recovery (startTransition), the marker is
+        // acknowledged in a layout effect, and the next poll waits for it.
+        exports.runPollLoopScenario = async function runPollLoopScenario(container, { fixed, durationMs, batchSize, renderCostMs = 0, uiUpdateEveryMs = 0 }) {
+          const stats = { renders: 0, commits: 0, merges: 0, polls: 0, recovered: 0 };
+          let latestEvents = [];
+          function Harness() {
+            const [events, setEvents] = useState([]);
+            const [marker, setMarker] = useState(null);
+            const [prompts, setPrompts] = useState([]);
+            const recovery = React.useMemo(() => createTranscriptCommitRecovery({
+              isCurrent: () => true,
+              isSameRuntime: () => true,
+              onRecover: () => { stats.recovered += 1; },
+            }), []);
+            stats.renders += 1;
+            latestEvents = events;
+            const [, setUiTick] = useState(0);
+            if (renderCostMs) { const until = performance.now() + renderCostMs; while (performance.now() < until) { /* heavy view */ } }
+            React.useEffect(() => {
+              if (!uiUpdateEveryMs) return undefined;
+              const id = setInterval(() => setUiTick((tick) => tick + 1), uiUpdateEveryMs);
+              return () => clearInterval(id);
+            }, []);
+            React.useLayoutEffect(() => { stats.commits += 1; });
+            React.useLayoutEffect(() => { if (marker) recovery.acknowledge('poll', marker); }, [marker, recovery]);
+            const unconfirmed = useMemo(() => filterConfirmedLocalUserPrompts(prompts, events), [events, prompts]);
+            if (fixed) {
+              usePruneConfirmedLocalUserPrompts(events, prompts, unconfirmed, setPrompts);
+            } else {
+              React.useEffect(() => {
+                setPrompts((previous) => filterConfirmedLocalUserPrompts(previous, events));
+              }, [events]);
+            }
+            React.useEffect(() => {
+              let alive = true;
+              let seq = 0;
+              let commitId = 0;
+              const tick = () => {
+                if (!alive) return;
+                if (!recovery.hasPending('poll')) {
+                  stats.polls += 1;
+                  const batch = Array.from({ length: batchSize }, () => event(++seq));
+                  const identity = { runtimeId: 'native-test', generation: 1, commitId: ++commitId };
+                  const merge = (previous) => { stats.merges += 1; return appendSessionEvents(previous, batch); };
+                  const update = fixed ? memoizeReplayUpdater(merge) : merge;
+                  recovery.enqueue('poll', identity, (isOwned, canReplayEvents) => {
+                    setEvents((previous) => (canReplayEvents() ? update(previous) : previous));
+                    setMarker((current) => (isOwned() ? identity : current));
+                  });
+                }
+                setTimeout(tick, 1);
+              };
+              tick();
+              return () => { alive = false; recovery.cancel(); };
+            }, [recovery]);
+            return null;
+          }
+          const root = createRoot(container);
+          flushSync(() => root.render(React.createElement(Harness)));
+          await new Promise((resolve) => setTimeout(resolve, durationMs));
+          const seqs = latestEvents.map((item) => item.seq);
+          const result = { ...stats, events: seqs.length, inOrder: seqs.every((seq, index) => seq === index + 1) };
+          root.unmount();
+          return result;
+        };
 
         // A poll batch committed inside a transition stays pending while
         // synchronous renders keep interrupting it; React then replays every
@@ -223,4 +291,35 @@ test('pruning still removes a prompt once its user_prompt event arrives', async 
   } finally {
     dom.restore();
   }
+});
+
+async function pollLoop(options) {
+  const { runPollLoopScenario } = await harness();
+  const dom = installDom();
+  try {
+    return await runPollLoopScenario(dom.container, { durationMs: 1500, batchSize: 20, renderCostMs: 6, ...options });
+  } finally {
+    dom.restore();
+  }
+}
+
+test('pruning no longer doubles the render work of every poll batch', async () => {
+  const old = await pollLoop({ fixed: false });
+  const fixed = await pollLoop({ fixed: true });
+  // The old effect re-rendered the heavy view once more per events change.
+  assert.ok(old.renders / old.polls >= 1.8, `old renders/poll ${old.renders}/${old.polls}`);
+  assert.ok(fixed.renders / fixed.polls <= 1.3, `fixed renders/poll ${fixed.renders}/${fixed.polls}`);
+  // Whole batches only; the last poll may still be in flight.
+  assert.ok(fixed.inOrder && fixed.events % 20 === 0 && fixed.events >= (fixed.polls - 1) * 20, JSON.stringify(fixed));
+});
+
+test('interrupted poll transitions no longer re-merge every queued batch', async () => {
+  // Run past the 2s commit-recovery deadline: its flushSync commits a batch
+  // after the starved transition, and React then replays the queued
+  // updaters from the frozen base on every interrupting render.
+  const old = await pollLoop({ fixed: false, uiUpdateEveryMs: 4, durationMs: 3500 });
+  const fixed = await pollLoop({ fixed: true, uiUpdateEveryMs: 4, durationMs: 3500 });
+  assert.ok(old.merges > old.polls * 10, `old merges/poll ${old.merges}/${old.polls}`);
+  assert.ok(fixed.merges <= fixed.polls * 2 + 2, `fixed merges/poll ${fixed.merges}/${fixed.polls}`);
+  assert.ok(fixed.inOrder, 'every committed event appears once, in order');
 });
