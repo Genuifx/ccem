@@ -1,5 +1,11 @@
 # ccem
 
+## 2.108.0
+
+### Minor Changes
+
+- 修复生产依赖审计阻断：range-scoped override 将 decode-uri-component 固定到 0.5.1（GHSA-QR28-FPJM-WQ7F）。同时包含 workspace 消息回溯、Doctor 瞬时 CPU 与忙碌归因、状态栏窄窗适配、侧栏流式会话记忆化、KimiCodePlan k3.1-pro 预设刷新与跨实例 cron 结果安全恢复。
+
 ## 2.107.0
 
 ### Minor Changes
