@@ -55,9 +55,9 @@ describe('presets', () => {
 
     it('should keep highlighted provider presets aligned with official defaults', () => {
       expect(ENV_PRESETS.KimiCodePlan.ANTHROPIC_BASE_URL).toBe('https://api.kimi.com/coding/');
-      expect(ENV_PRESETS.KimiCodePlan.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('k3[1m]');
-      expect(ENV_PRESETS.KimiCodePlan.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('k3[1m]');
-      expect(ENV_PRESETS.KimiCodePlan.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('k3[1m]');
+      expect(ENV_PRESETS.KimiCodePlan.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('k3.1-pro[1m]');
+      expect(ENV_PRESETS.KimiCodePlan.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('k3.1-pro[1m]');
+      expect(ENV_PRESETS.KimiCodePlan.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('k3.1-pro[1m]');
 
       expect(ENV_PRESETS.Bailian.ANTHROPIC_BASE_URL).toBe(
         'https://dashscope.aliyuncs.com/apps/anthropic',
