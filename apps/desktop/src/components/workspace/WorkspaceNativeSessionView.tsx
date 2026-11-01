@@ -154,6 +154,7 @@ import {
   type LocalUserPrompt,
   type TranscriptDerivationState,
 } from './workspaceEventTranscript';
+import { memoizeReplayUpdater, usePruneConfirmedLocalUserPrompts } from './workspaceReplayState';
 import { createTranscriptCommitRecovery } from './workspaceTranscriptCommitRecovery';
 import {
   createTranscriptBackfillEventUpdate,
@@ -2345,9 +2346,12 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
     [events, localUserPrompts],
   );
 
-  useEffect(() => {
-    setLocalUserPrompts((previous) => filterConfirmedLocalUserPrompts(previous, events));
-  }, [events]);
+  usePruneConfirmedLocalUserPrompts(
+    events,
+    localUserPrompts,
+    unconfirmedLocalUserPrompts,
+    setLocalUserPrompts,
+  );
 
   const nativeQueuedPromptPresentation = useMemo(
     () => partitionNativeQueuedPromptPresentation(unconfirmedLocalUserPrompts),
@@ -2798,11 +2802,11 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
         transcriptPartialObservationRef.current, pendingTranscriptPartialObservationRef.current, requestScope,
       ),
     );
-    const updateEvents = createTranscriptBackfillEventUpdate(
+    const updateEvents = memoizeReplayUpdater(createTranscriptBackfillEventUpdate(
       result.status,
       fullBatch,
       request.startedWithSeq,
-    );
+    ));
     const commitMarker = {
       ...requestScope,
       commitId: transcriptBackfillCommitSequenceRef.current + 1,
@@ -2983,19 +2987,18 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
           pendingTranscriptPartialObservationRef.current.observation;
       }
 
+      // Shared by the transition commit and its flushSync recovery.
+      const replayBatch = memoizeReplayUpdater((previous: SessionEventRecord[]) => {
+        if (isInitialReplay && batch.events.length === 0) {
+          return [];
+        }
+        return isInitialReplay
+          ? mergeWorkspaceReplayEvents(previous, batch.events)
+          : appendSessionEvents(previous, batch.events);
+      });
       const commitPollReplay = (isOwned: () => boolean, canReplayEvents: () => boolean) => {
         if (batch.events.length > 0 || (isInitialReplay && initialReplayComplete)) {
-          setEvents((previous) => {
-            if (!canReplayEvents()) {
-              return previous;
-            }
-            if (isInitialReplay && batch.events.length === 0) {
-              return [];
-            }
-            return isInitialReplay
-              ? mergeWorkspaceReplayEvents(previous, batch.events)
-              : appendSessionEvents(previous, batch.events);
-          });
+          setEvents((previous) => (canReplayEvents() ? replayBatch(previous) : previous));
         }
         if (initialReplayComplete || incrementalReplay?.state === 'partial') {
           setTranscriptBackfillView((current) => {
