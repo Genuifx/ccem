@@ -1,5 +1,11 @@
 # ccem
 
+## 2.109.0
+
+### Minor Changes
+
+- Managed Claude Code runtime with registry selection, workspace poll-replay loop fix, and fsmonitor freeze guard.
+
 ## 2.108.0
 
 ### Minor Changes
