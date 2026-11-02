@@ -17,7 +17,7 @@ const target = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../sr
 const expected = `${JSON.stringify(permissionArgs, null, 2)}\n`;
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   if (process.argv.includes('--check')) {
-    if (fs.readFileSync(target, 'utf8') !== expected) {
+    if (fs.readFileSync(target, 'utf8').replaceAll('\r\n', '\n') !== expected) {
       throw new Error('Claude permission arguments differ from core presets; regenerate prepare-claude-permission-args.mjs');
     }
   } else {
