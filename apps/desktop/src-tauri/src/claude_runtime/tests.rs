@@ -144,6 +144,9 @@ fn claude_runtime_probes_versions_capabilities_and_pinned_path_without_reselecti
 fn claude_runtime_probe_has_a_deadline_even_for_an_exited_wrapper_holding_pipes() {
     let temp = tempfile::tempdir().unwrap();
     let slow = script(temp.path(), "slow", "#!/bin/sh\nsleep 2\n");
+    // Warm the login-shell PATH probe cache so its latency stays out of the
+    // deadline budget asserted below.
+    let _ = crate::terminal::get_user_path();
     let started = Instant::now();
     assert!(
         bounded_output(&slow, "--version", Duration::from_millis(50))
