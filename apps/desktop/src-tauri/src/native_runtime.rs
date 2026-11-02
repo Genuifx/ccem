@@ -1831,6 +1831,8 @@ pub(crate) fn spawn_native_helper_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_native_helper_command(&mut command);
+    // The helper hands its environment to every Claude/Codex agent it starts.
+    crate::git_env::disable_git_fsmonitor(&mut command);
 
     let child = Arc::new(
         SharedChild::spawn(&mut command)

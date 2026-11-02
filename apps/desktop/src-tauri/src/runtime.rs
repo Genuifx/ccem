@@ -1220,6 +1220,7 @@ fn build_claude_command(
         .current_dir(&options.working_dir);
 
     config::clear_managed_claude_env(&mut command);
+    crate::git_env::disable_git_fsmonitor(&mut command);
     let mut env_vars = options.env_vars.clone();
     crate::agent_profile::apply_env("claude", &mut env_vars);
     for (key, value) in &env_vars {
