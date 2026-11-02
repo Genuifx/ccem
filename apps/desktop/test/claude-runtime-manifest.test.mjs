@@ -86,7 +86,7 @@ test('maintainer inspection verifies archive integrity and hashes only the origi
 test('checked-in recommended downloads match the installed locked SDK', async () => {
   const manifest = JSON.parse(await fs.readFile(path.join(root, 'apps/desktop/src-tauri/resources/claude-runtime-manifest.json'), 'utf8'));
   const installedSdk = JSON.parse(await fs.readFile(path.join(root, 'packages/native-runtime-helper/node_modules/@anthropic-ai/claude-agent-sdk/package.json'), 'utf8'));
-  const lockText = await fs.readFile(path.join(root, 'pnpm-lock.yaml'), 'utf8');
+  const lockText = (await fs.readFile(path.join(root, 'pnpm-lock.yaml'), 'utf8')).replaceAll('\r\n', '\n');
   assert.doesNotThrow(() => validatePinnedManifest(manifest, installedSdk, lockText));
 });
 

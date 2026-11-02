@@ -130,7 +130,7 @@ async function download(url, destination, integrity) {
 
 async function main() {
   const sdk = JSON.parse(await fs.readFile(path.join(repoRoot, 'packages/native-runtime-helper/node_modules/@anthropic-ai/claude-agent-sdk/package.json'), 'utf8'));
-  const lockText = await fs.readFile(path.join(repoRoot, 'pnpm-lock.yaml'), 'utf8');
+  const lockText = (await fs.readFile(path.join(repoRoot, 'pnpm-lock.yaml'), 'utf8')).replaceAll('\r\n', '\n');
   if (process.argv.includes('--check')) {
     validatePinnedManifest(JSON.parse(await fs.readFile(manifestPath, 'utf8')), sdk, lockText);
     console.log(`Claude runtime manifest matches Agent SDK ${sdk.version} / Claude ${sdk.claudeCodeVersion}`);
