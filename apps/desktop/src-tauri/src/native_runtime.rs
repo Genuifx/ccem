@@ -33,7 +33,7 @@ use crate::router::{
 use crate::secure_fs::write_private_atomic;
 use crate::session_provenance::bind_source_session_id;
 use crate::system_proxy::resolve_codex_proxy_env;
-use crate::terminal::{self, resolve_claude_path, resolve_codex_path, TerminalType};
+use crate::terminal::{self, resolve_codex_path, TerminalType};
 use crate::workspace_decorations::AttentionSummary;
 use chrono::{DateTime, Utc};
 use rand::{rngs::OsRng, RngCore};
@@ -333,6 +333,10 @@ pub struct NativeSessionRecord {
     /// Captured at creation. Records predating profile selection use shared Codex state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_isolated: Option<bool>,
+    /// The executable selected when this runtime was created. Preference changes
+    /// must not change an existing runtime when its helper is restarted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_path: Option<String>,
     pub transport: NativeTransport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_session_id: Option<String>,
@@ -2469,6 +2473,9 @@ impl NativeRuntimeManager {
             );
         }
         let mut options = options;
+        if options.provider == NativeProvider::Claude && options.claude_path.is_none() {
+            options.claude_path = Some(crate::claude_runtime::shared().resolve_for_launch()?.path);
+        }
         let codex_isolated = if options.provider == NativeProvider::Codex {
             let mode = match options.codex_isolated {
                 Some(mode) => mode,
@@ -2490,6 +2497,10 @@ impl NativeRuntimeManager {
         crate::agent_profile::apply_env(client, &mut options.terminal_env_vars);
         validate_task_model(options.provider, options.model.as_deref())?;
         self.prepare_router_launch(&mut options, false)?;
+        if let Some(path) = options.claude_path.as_deref() {
+            terminal::configure_claude_runtime_env(path, &mut options.helper_env_vars);
+            terminal::configure_claude_runtime_env(path, &mut options.terminal_env_vars);
+        }
         options.initial_annotations =
             validate_prompt_annotations(options.initial_annotations.as_ref())?;
         merge_helper_env_path(&mut options.helper_env_vars, &terminal::get_user_path());
@@ -2501,6 +2512,7 @@ impl NativeRuntimeManager {
             runtime_id: runtime_id.clone(),
             provider: options.provider,
             codex_isolated: options.codex_isolated,
+            claude_path: options.claude_path.clone(),
             transport: NativeTransport::NativeSdk,
             // A fork starts with its parent's provider id in the helper init
             // options. It is not the child session's identity and must never be
@@ -7698,6 +7710,11 @@ impl NativeRuntimeManager {
         if let Err(error) = prepare_result {
             return Err(self.rollback_reconnect_failure(runtime_id, &rollback_record, error));
         }
+        if let Some(path) = options.claude_path.as_deref() {
+            terminal::configure_claude_runtime_env(path, &mut options.helper_env_vars);
+            terminal::configure_claude_runtime_env(path, &mut options.terminal_env_vars);
+        }
+        record.claude_path = options.claude_path.clone();
         record.router = options.router_record.clone();
 
         let start_seq = self
@@ -7846,6 +7863,11 @@ impl NativeRuntimeManager {
             .map(build_helper_router_init);
         let helper_path = native_helper_script_path(&app)?;
         let mut profile_env = HashMap::new();
+        if let Some(path) = handle.claude_path.as_deref() {
+            // Keep installation ownership stable even when a later settings
+            // update replaces the per-model environment in the JS helper.
+            terminal::configure_claude_runtime_env(path, &mut profile_env);
+        }
         pin_codex_profile(options.provider, options.codex_isolated, &mut profile_env);
         crate::agent_profile::apply_env(options.provider.as_str(), &mut profile_env);
         inject_ccem_runtime_env(&mut profile_env, runtime_id);
@@ -11344,6 +11366,17 @@ fn prepare_direct_router_launch(
     Ok(())
 }
 
+fn captured_claude_runtime_path(record: &NativeSessionRecord) -> Result<Option<String>, String> {
+    if record.provider != NativeProvider::Claude { return Ok(None); }
+    match record.claude_path.as_deref() {
+        Some(path) => {
+            crate::claude_runtime::shared().validate_pinned_path(path)?;
+            Ok(Some(path.to_string()))
+        }
+        None => crate::claude_runtime::shared().resolve_for_launch().map(|runtime| Some(runtime.path)),
+    }
+}
+
 fn build_runtime_bootstrap_options(
     record: &NativeSessionRecord,
 ) -> Result<NativeSessionOptions, String> {
@@ -11372,6 +11405,11 @@ fn build_runtime_bootstrap_options(
     crate::agent_profile::apply_env(client, &mut terminal_env_vars);
     inject_ccem_runtime_env(&mut helper_env_vars, &record.runtime_id);
     inject_ccem_runtime_env(&mut terminal_env_vars, &record.runtime_id);
+    let claude_path = captured_claude_runtime_path(record)?;
+    if let Some(path) = claude_path.as_deref() {
+        terminal::configure_claude_runtime_env(path, &mut helper_env_vars);
+        terminal::configure_claude_runtime_env(path, &mut terminal_env_vars);
+    }
 
     Ok(NativeSessionOptions {
         provider: record.provider,
@@ -11388,7 +11426,7 @@ fn build_runtime_bootstrap_options(
         seed_boundary_message_count: record.seed_boundary_message_count,
         helper_env_vars,
         terminal_env_vars,
-        claude_path: resolve_claude_path(),
+        claude_path,
         codex_path: resolve_codex_path(),
         codex_base_url,
         codex_api_key,
@@ -11519,6 +11557,25 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex, OnceLock};
     use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    #[test]
+    fn captured_claude_runtime_survives_record_reload_and_never_reselects_missing_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("captured-claude");
+        fs::write(&binary, "#!/bin/sh\ncase \"$1\" in --version) echo '2.1.220 (Claude Code)';; *) echo '--input-format --output-format --permission-mode --resume';; esac\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut record = native_record("claude-pinned-path", "stopped", false);
+        record.claude_path = Some(binary.to_string_lossy().into_owned());
+        let record: NativeSessionRecord = serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(super::captured_claude_runtime_path(&record).unwrap(), record.claude_path);
+        fs::remove_file(&binary).unwrap();
+        assert!(super::captured_claude_runtime_path(&record).is_err());
+        let mut codex = record;
+        codex.provider = NativeProvider::Codex;
+        assert_eq!(super::captured_claude_runtime_path(&codex).unwrap(), None);
+    }
 
     #[test]
     fn task_model_validation_preserves_legacy_absence() {
@@ -11725,6 +11782,7 @@ mod tests {
             runtime_id: runtime_id.to_string(),
             provider: NativeProvider::Claude,
             codex_isolated: None,
+            claude_path: None,
             transport: NativeTransport::NativeSdk,
             provider_session_id: None,
             browser_actor_id: super::legacy_browser_actor_id(NativeProvider::Claude, runtime_id),
@@ -12031,6 +12089,7 @@ mod tests {
             runtime_id: runtime_id.to_string(),
             provider: NativeProvider::Claude,
             codex_isolated: None,
+            claude_path: None,
             transport: NativeTransport::NativeSdk,
             provider_session_id: None,
             browser_actor_id: super::legacy_browser_actor_id(NativeProvider::Claude, runtime_id),

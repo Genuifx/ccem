@@ -13,6 +13,14 @@ const helperDist = path.join(helperRoot, 'dist', 'native-runtime-helper.mjs');
 const resourceTarget = path.join(desktopRoot, 'src-tauri', 'resources', 'native-runtime-helper.mjs');
 const binariesDir = path.join(desktopRoot, 'src-tauri', 'binaries');
 
+// SDK upgrades must deliberately update the trusted optional-runtime hashes.
+execFileSync(process.execPath, [path.join(__dirname, 'update-claude-runtime-manifest.mjs'), '--check'], {
+  cwd: repoRoot, stdio: 'inherit',
+});
+execFileSync(process.execPath, [path.join(__dirname, 'prepare-claude-permission-args.mjs'), '--check'], {
+  cwd: repoRoot, stdio: 'inherit',
+});
+
 // ---------------------------------------------------------------------------
 // Node.js version gate — zstd (node:zlib zstdCompress) requires >= 22.15.0
 // ---------------------------------------------------------------------------

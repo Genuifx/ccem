@@ -1,7 +1,7 @@
 use crate::config::MANAGED_CLAUDE_ENV_KEYS;
 use crate::diagnostic_log;
 use crate::terminal::{
-    get_user_path, resolve_claude_path, resolve_codex_path, resolve_opencode_path,
+    get_user_path, resolve_codex_path, resolve_opencode_path,
     resolve_tmux_path,
 };
 use serde::Serialize;
@@ -113,6 +113,11 @@ impl TmuxManager {
         working_dir: &Path,
     ) -> Result<TmuxWindowInfo, String> {
         let mut prepared_env = env_vars.clone();
+        let client_binary = match client {
+            "codex" => resolve_codex_path().unwrap_or_else(|| "codex".to_string()),
+            "opencode" => resolve_opencode_path().unwrap_or_else(|| "opencode".to_string()),
+            _ => crate::terminal::prepare_claude_runtime_env(&mut prepared_env)?,
+        };
         if matches!(client, "claude" | "codex") {
             crate::agent_profile::prepare_env(client, &mut prepared_env)?;
         }
@@ -147,6 +152,7 @@ impl TmuxManager {
             env_vars,
             &launch_environment_target,
             &tmux_binary,
+            &client_binary,
         );
         let mut create_args = vec![
             "new-session".to_string(),
@@ -1520,6 +1526,7 @@ fn build_tmux_launch_command(
         env_vars,
         &format!("{DEFAULT_TMUX_SESSION}:{DEFAULT_TMUX_WINDOW}"),
         "tmux",
+        client,
     )
     .command
 }
@@ -1530,14 +1537,10 @@ fn build_tmux_launch_spec(
     env_vars: &HashMap<String, String>,
     target: &str,
     tmux_binary: &str,
+    client_binary: &str,
 ) -> TmuxLaunchSpec {
     let mut env_vars = env_vars.clone();
     crate::agent_profile::apply_env(client, &mut env_vars);
-    let client_binary = match client {
-        "codex" => resolve_codex_path().unwrap_or_else(|| "codex".to_string()),
-        "opencode" => resolve_opencode_path().unwrap_or_else(|| "opencode".to_string()),
-        _ => resolve_claude_path().unwrap_or_else(|| "claude".to_string()),
-    };
     let mut environment = vec![format!("PATH={}", get_user_path())];
     let mut environment_keys = vec!["PATH".to_string()];
     let mut cleared_keys = Vec::new();
@@ -1553,7 +1556,7 @@ fn build_tmux_launch_spec(
         environment_keys.push(key.clone());
     }
 
-    let mut command_parts = vec![shell_quote(&client_binary)];
+    let mut command_parts = vec![shell_quote(client_binary)];
     if client == "codex" && crate::agent_profile::codex_isolated_for_env(&env_vars) {
         command_parts.push("-c".to_string());
         command_parts.push(shell_quote(&format!("sqlite_home={}", serde_json::to_string(&env_vars["CODEX_HOME"]).unwrap())));
@@ -2696,6 +2699,22 @@ mod tests {
         assert!(command.contains("unset CLAUDECODE"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn launch_spec_executes_the_selected_binary_with_literal_path_and_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let binary = root.path().join("selected ' $(touch injected)");
+        std::fs::write(&binary, "#!/bin/sh\nprintf '%s\\n' selected-runtime \"$@\"\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let spec = build_tmux_launch_spec("claude", &["--resume".into(), "session ' value".into()], &HashMap::new(), "fixture", "/usr/bin/true", binary.to_str().unwrap());
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &spec.command]).current_dir(root.path()).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "selected-runtime\n--resume\nsession ' value\n");
+        assert!(!root.path().join("injected").exists());
+    }
+
     #[test]
     fn launch_command_supports_codex_resume_subcommand() {
         let command = build_tmux_launch_command(
@@ -2711,7 +2730,7 @@ mod tests {
     fn codex_tmux_launch_keeps_the_pinned_profile() {
         for isolated in [false, true] {
             let env = HashMap::from([("CCEM_CODEX_ISOLATED".into(), if isolated { "1" } else { "0" }.into())]);
-            let spec = build_tmux_launch_spec("codex", &["resume".into(), "session-123".into()], &env, "test:main", "tmux");
+            let spec = build_tmux_launch_spec("codex", &["resume".into(), "session-123".into()], &env, "test:main", "tmux", "codex");
             assert_eq!(spec.command.contains("sqlite_home="), isolated);
             assert!(spec.environment.contains(&format!("CODEX_HOME={}", crate::agent_home::codex_home_for_mode(isolated).display())));
             assert!(spec.environment.contains(&format!("CCEM_CODEX_ISOLATED={}", if isolated { "1" } else { "0" })));
@@ -2732,6 +2751,7 @@ mod tests {
             &env_vars,
             "ccem-session123:main",
             "/opt/homebrew/bin/tmux",
+            "/test/selected-claude",
         );
 
         assert!(!spec.command.contains("sk-ant-secret-value"));
@@ -2806,6 +2826,7 @@ mod tests {
             &env_vars,
             "ccem-session123:main",
             "/opt/homebrew/bin/tmux",
+            "/test/selected-claude",
         );
 
         assert!(spec.command.starts_with("unset ANTHROPIC_BASE_URL "));

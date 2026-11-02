@@ -1472,8 +1472,17 @@ pub fn search_skills_stream(app: AppHandle, query: String) {
         );
 
         let user_path = get_user_path();
-
-        let mut cmd = Command::new("claude");
+        let mut runtime_env = HashMap::new();
+        let claude_binary = match crate::terminal::prepare_claude_runtime_env(&mut runtime_env) {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = app.emit("skill-search-stream", serde_json::json!({"type":"error","error":error}).to_string());
+                let _ = app.emit("skill-search-done", ());
+                return;
+            }
+        };
+        let mut cmd = Command::new(claude_binary);
+        cmd.envs(&runtime_env);
         cmd.args([
             "-p",
             &prompt,

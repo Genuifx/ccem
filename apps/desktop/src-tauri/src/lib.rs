@@ -10,6 +10,7 @@ mod bot_binding;
 mod browser;
 mod browser_overlay;
 mod channel;
+mod claude_runtime;
 mod codex_migration;
 mod companion;
 mod config;
@@ -1509,7 +1510,7 @@ async fn create_native_session(
                 seed_boundary_message_count,
                 helper_env_vars: resolved.env_vars.clone(),
                 terminal_env_vars: resolved.env_vars,
-                claude_path: terminal::resolve_claude_path(),
+                claude_path: Some(claude_runtime::shared().resolve_for_launch().map_err(native_create_rejection)?.path),
                 codex_path: None,
                 codex_base_url: None,
                 codex_api_key: None,
@@ -3385,8 +3386,44 @@ fn check_ccem_installed() -> bool {
 }
 
 #[tauri::command]
-fn check_claude_installed() -> bool {
-    terminal::is_claude_installed()
+async fn check_claude_installed() -> bool {
+    tauri::async_runtime::spawn_blocking(terminal::is_claude_installed).await.unwrap_or(false)
+}
+
+#[tauri::command]
+async fn get_claude_runtime_status(refresh: Option<bool>) -> Result<claude_runtime::ClaudeRuntimeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || claude_runtime::shared().status(refresh.unwrap_or(false)))
+        .await.map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+async fn set_claude_runtime_source(source: claude_runtime::ClaudeRuntimeSource) -> Result<claude_runtime::ClaudeRuntimeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || claude_runtime::shared().set_preference(source))
+        .await.map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn set_claude_runtime_registry(registry_url: String) -> Result<claude_runtime::ClaudeRuntimeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || claude_runtime::shared().set_registry(&registry_url))
+        .await
+        .map_err(|e| format!("Claude runtime registry task failed: {e}"))?
+}
+
+#[tauri::command]
+async fn install_claude_runtime() -> Result<claude_runtime::ClaudeRuntimeStatus, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let manager = claude_runtime::shared();
+        let prepared = manager.prepare_install()?;
+        let status = manager.status(false);
+        tauri::async_runtime::spawn_blocking(move || { let _ = prepared.run(); });
+        Ok(status)
+    }).await.map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+async fn cancel_claude_runtime_install() -> Result<claude_runtime::ClaudeRuntimeStatus, String> {
+    tauri::async_runtime::spawn_blocking(|| claude_runtime::shared().cancel_install())
+        .await.map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -6229,6 +6266,11 @@ pub fn run_desktop_app() -> i32 {
             get_continuous_usage_days,
             check_ccem_installed,
             check_claude_installed,
+            get_claude_runtime_status,
+            set_claude_runtime_source,
+            set_claude_runtime_registry,
+            install_claude_runtime,
+            cancel_claude_runtime_install,
             check_codex_installed,
             check_opencode_installed,
             check_tmux_installed,

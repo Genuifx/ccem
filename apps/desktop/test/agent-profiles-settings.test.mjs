@@ -17,7 +17,7 @@ test('Codex defaults to shared state, toggles persist, and failed preparation ke
       this.port2 = { postMessage: (data) => queueMicrotask(() => this.port1.onmessage?.({ data })) };
     }
   };
-  for (const [key, value] of Object.entries({ window: dom.window, document: dom.window.document, IS_REACT_ACT_ENVIRONMENT: true, MessageChannel })) {
+  for (const [key, value] of Object.entries({ window: dom.window, document: dom.window.document, DocumentFragment: dom.window.DocumentFragment, HTMLElement: dom.window.HTMLElement, HTMLSelectElement: dom.window.HTMLSelectElement, Event: dom.window.Event, IS_REACT_ACT_ENVIRONMENT: true, MessageChannel })) {
     saved.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
     Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
   }
@@ -42,6 +42,15 @@ test('Codex defaults to shared state, toggles persist, and failed preparation ke
         isolated = args.isolated;
         return profiles();
       }
+      if (command === 'get_claude_runtime_status') return {
+        preference: 'auto', recommendedVersion: '2.1.220', minimumSystemVersion: '2.1.220',
+        registryUrl: 'https://registry.npmjs.org/', registryError: null,
+        system: { state: 'available', path: '/system/claude', version: '2.1.220', detail: null },
+        managed: { state: 'missing', path: null, version: null, detail: null },
+        selected: { source: 'system', path: '/system/claude', version: '2.1.220' },
+        install: { state: 'idle', downloadedBytes: 0, totalBytes: null, error: null },
+        supported: true, unsupportedReason: null,
+      };
       return new Promise((resolve) => { resolveLogin = resolve; });
     },
     notifications: [],
@@ -61,9 +70,11 @@ test('Codex defaults to shared state, toggles persist, and failed preparation ke
       },
       outfile, bundle: true, platform: 'node', format: 'cjs', jsx: 'automatic', logLevel: 'silent',
       plugins: [{ name: 'ipc-boundary', setup(builder) {
-        builder.onResolve({ filter: /^(@tauri-apps\/api\/core|sonner|@\/locales|@\/store|@\/features\/conversations\/historyData)$/ }, ({ path }) => ({ path, namespace: 'fixture' }));
+        builder.onResolve({ filter: /^(@tauri-apps\/api\/core|sonner|@\/locales|@\/store|@\/features\/conversations\/historyData|@\/lib\/nativeSurfaceOcclusion|@\/lib\/nativeBrowserOverlay)$/ }, ({ path }) => ({ path, namespace: 'fixture' }));
         builder.onLoad({ filter: /.*/, namespace: 'fixture' }, ({ path }) => ({
-          contents: path === '@/store'
+          contents: path === '@/lib/nativeSurfaceOcclusion' ? 'export const useNativeSurfaceOcclusion = open => open;'
+            : path === '@/lib/nativeBrowserOverlay' ? 'export const useNativeBrowserOverlayRef = ref => ref;'
+            : path === '@/store'
             ? 'export const useAppStore = { getState: () => ({ setInstalledSkills: (skills) => globalThis.__profileTest.skills = skills }) };'
             : path === '@/features/conversations/historyData'
             ? 'export const invalidateHistoryCache = () => globalThis.__profileTest.invalidations++;'

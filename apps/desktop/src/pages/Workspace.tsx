@@ -82,6 +82,8 @@ import { ComposerControls } from '@/components/workspace/ComposerControls';
 import type { EffortLevel } from '@/components/workspace/ComposerControls';
 import type { PermissionModeName } from '@ccem/core/browser';
 import { nativeCreateFailure, type ComposerSubmitResult } from '@/components/workspace/composerSubmissionResult';
+import { ClaudeRuntimeRequiredDialog } from '@/components/ClaudeRuntimeSettings';
+import { isClaudeRuntimeRequiredError } from '@/lib/claude-runtime';
 import {
   buildComposerPromptPreview,
   buildComposerPromptText,
@@ -617,6 +619,7 @@ export function Workspace({
   const [isResumingHistorySession, setIsResumingHistorySession] = useState(false);
   const [codexModelMigrationWarning, setCodexModelMigrationWarning] = useState<CodexModelMigrationWarning | null>(null);
   const codexModelMigrationDecisionRef = useRef<((shouldContinue: boolean) => void) | null>(null);
+  const [claudeRuntimeRequired, setClaudeRuntimeRequired] = useState(false);
   const acknowledgedCodexModelWarningsRef = useRef(new Set<string>());
   const [isGlobalSearchOpen, setIsGlobalSearchOpen] = useState(false);
   const {
@@ -2801,9 +2804,14 @@ export function Workspace({
       return true;
     } catch (error) {
       console.error('Failed to resume split pane session:', error);
-      if (createAttempted) return createAccepted ? true : 'delivery_uncertain';
-      toast.error(t('workspace.nativeCreateFailed'));
-      return false;
+      if (createAccepted) return true;
+      const failure = nativeCreateFailure(error);
+      if (provider === 'claude' && isClaudeRuntimeRequiredError(error)) {
+        setClaudeRuntimeRequired(true);
+      } else {
+        toast.error(failure.detail || t('workspace.nativeCreateFailed'));
+      }
+      return createAttempted ? failure.result : false;
     }
   }, [
     buildComposerPromptPreview,
@@ -3444,7 +3452,11 @@ export function Workspace({
       console.error('Failed to create native workspace session:', error);
       if (createAccepted) return true;
       const failure = nativeCreateFailure(error);
-      toast.error(failure.detail || t('workspace.nativeCreateFailed'));
+      if (composeProvider === 'claude' && isClaudeRuntimeRequiredError(error)) {
+        setClaudeRuntimeRequired(true);
+      } else {
+        toast.error(failure.detail || t('workspace.nativeCreateFailed'));
+      }
       return createAttempted ? failure.result : false;
     } finally {
       setIsCreatingNativeSession(false);
@@ -3656,7 +3668,11 @@ export function Workspace({
       console.error('Failed to continue workspace history session:', error);
       if (createAccepted) return true;
       const failure = nativeCreateFailure(error);
-      toast.error(failure.detail || t('workspace.nativeCreateFailed'));
+      if (provider === 'claude' && isClaudeRuntimeRequiredError(error)) {
+        setClaudeRuntimeRequired(true);
+      } else {
+        toast.error(failure.detail || t('workspace.nativeCreateFailed'));
+      }
       return createAttempted ? failure.result : false;
     } finally {
       setIsResumingHistorySession(false);
@@ -3818,7 +3834,11 @@ export function Workspace({
     } catch (error) {
       console.error('Failed to fork session from turn:', error);
       const { detail } = nativeCreateFailure(error);
-      toast.error(detail || t('workspace.forkTurnCreateFailed'));
+      if (isClaudeRuntimeRequiredError(error)) {
+        setClaudeRuntimeRequired(true);
+      } else {
+        toast.error(detail || t('workspace.forkTurnCreateFailed'));
+      }
     } finally {
       setIsForkingTurn(false);
     }
@@ -4857,6 +4877,7 @@ export function Workspace({
         onCancel={() => settleCodexModelMigrationDecision(false)}
         onContinue={() => settleCodexModelMigrationDecision(true)}
       />
+      <ClaudeRuntimeRequiredDialog open={claudeRuntimeRequired} onOpenChange={setClaudeRuntimeRequired} />
     </div>
     </WorkspaceFileLinkContext.Provider>
     </WorkspaceSidePanelContext.Provider>

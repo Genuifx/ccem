@@ -7,6 +7,8 @@ import { useLocale } from '@/locales';
 import type { AgentProfileStatus } from '@/lib/tauri-ipc';
 import { invalidateHistoryCache } from '@/features/conversations/historyData';
 import { useAppStore } from '@/store';
+import { ClaudeRuntimeRequiredDialog, ClaudeRuntimeSettings } from '@/components/ClaudeRuntimeSettings';
+import { isClaudeRuntimeLoginRequiredError } from '@/lib/claude-runtime';
 
 export function AgentProfilesSettings() {
   const { t } = useLocale();
@@ -16,6 +18,7 @@ export function AgentProfilesSettings() {
   const [launching, setLaunching] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [runtimeRequired, setRuntimeRequired] = useState(false);
 
   const load = async () => {
     setLoading(true);
@@ -37,7 +40,11 @@ export function AgentProfilesSettings() {
       await invoke('login_agent_profile', { provider });
       toast.success(t('agentProfiles.loginOpened'));
     } catch (error) {
-      toast.error(String(error));
+      if (provider === 'claude' && isClaudeRuntimeLoginRequiredError(error)) {
+        setRuntimeRequired(true);
+      } else {
+        toast.error(String(error));
+      }
     } finally {
       setLaunching(null);
     }
@@ -89,9 +96,13 @@ export function AgentProfilesSettings() {
             </div>
           )}
           <p className="text-xs font-mono text-muted-foreground break-all select-text">{profile.directory}</p>
+          {profile.provider === 'claude' && <div className="border-t border-border-subtle pt-3">
+            <ClaudeRuntimeSettings disabled={launching !== null || saving} />
+          </div>}
         </div>
       ))}
       <p className="text-xs text-muted-foreground">{t('agentProfiles.loginHint')}</p>
+      <ClaudeRuntimeRequiredDialog open={runtimeRequired} onOpenChange={setRuntimeRequired} context="login" />
     </div>
   );
 }

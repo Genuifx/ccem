@@ -984,7 +984,7 @@ impl ExternalControlManager {
                     seed_boundary_message_count: None,
                     helper_env_vars: resolved.env_vars.clone(),
                     terminal_env_vars: resolved.env_vars,
-                    claude_path: terminal::resolve_claude_path(),
+                    claude_path: Some(crate::claude_runtime::shared().resolve_for_launch()?.path),
                     codex_path: None,
                     codex_base_url: None,
                     codex_api_key: None,

@@ -262,7 +262,6 @@ pub fn set_preferred_terminal(terminal: TerminalType) -> Result<(), String> {
 /// Cached result of ccem launch support check
 static CCEM_LAUNCH_SUPPORTED: OnceLock<bool> = OnceLock::new();
 static CCEM_INSTALLED: OnceLock<bool> = OnceLock::new();
-static CLAUDE_INSTALLED: OnceLock<bool> = OnceLock::new();
 static OPENCODE_INSTALLED: OnceLock<bool> = OnceLock::new();
 static LOGIN_SHELL_PATHS: OnceLock<Vec<PathBuf>> = OnceLock::new();
 #[cfg(not(windows))]
@@ -830,7 +829,7 @@ pub fn resolve_ccem_path() -> Option<String> {
 }
 
 /// Resolve the full path to the `claude` binary.
-pub fn resolve_claude_path() -> Option<String> {
+pub(crate) fn claude_binary_candidates() -> Vec<String> {
     let home = dirs::home_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_default();
@@ -842,7 +841,31 @@ pub fn resolve_claude_path() -> Option<String> {
         "/usr/local/bin/claude".to_string(),
         "/opt/homebrew/bin/claude".to_string(),
     ]);
-    resolve_highest_versioned_binary_path("claude", &candidates)
+    collect_binary_candidates("claude", &candidates)
+}
+
+pub fn resolve_claude_path() -> Option<String> {
+    crate::claude_runtime::shared().resolve_for_launch().ok().map(|runtime| runtime.path)
+}
+
+/// Resolve once at the launch boundary; handoffs retain their captured executable.
+pub(crate) fn prepare_claude_runtime_env(env: &mut HashMap<String, String>) -> Result<String, String> {
+    let path = match env.get("CCEM_CLAUDE_PATH").filter(|path| !path.is_empty()) {
+        Some(path) => {
+            crate::claude_runtime::shared().validate_pinned_path(path)?;
+            path.clone()
+        }
+        None => crate::claude_runtime::shared().resolve_for_launch()?.path,
+    };
+    configure_claude_runtime_env(&path, env);
+    Ok(path)
+}
+
+pub(crate) fn configure_claude_runtime_env(path: &str, env: &mut HashMap<String, String>) {
+    env.insert("CCEM_CLAUDE_PATH".into(), path.to_string());
+    if crate::claude_runtime::shared().is_managed_path(path) {
+        env.insert("DISABLE_AUTOUPDATER".into(), "1".into());
+    }
 }
 
 /// Resolve the full path to the `codex` binary.
@@ -946,7 +969,7 @@ pub fn is_ccem_installed() -> bool {
 
 /// Returns whether Claude Code is installed.
 pub fn is_claude_installed() -> bool {
-    *CLAUDE_INSTALLED.get_or_init(|| resolve_claude_path().is_some())
+    resolve_claude_path().is_some()
 }
 
 /// Cached Codex install probe. The probe is populated by the existing
@@ -1001,43 +1024,6 @@ pub fn is_ccem_launch_supported() -> bool {
     *CCEM_LAUNCH_SUPPORTED.get_or_init(check_ccem_launch_support)
 }
 
-/// Build the short `ccem launch` command string.
-fn build_launch_command(
-    env_name: &str,
-    perm_mode: Option<&str>,
-    session_id: &str,
-    working_dir: &str,
-    resume_session_id: Option<&str>,
-    proxy_base_url: Option<&str>,
-) -> String {
-    let ccem = resolve_ccem_path().unwrap_or_else(|| "ccem".to_string());
-    let mut cmd = format!(
-        "'{}' launch --env '{}' --session-id '{}'",
-        ccem, env_name, session_id
-    );
-    if let Some(perm) = perm_mode {
-        cmd.push_str(&format!(" --perm '{}'", perm));
-    }
-    if let Some(resume_id) = resume_session_id {
-        let escaped_id = resume_id.replace("'", "'\\''");
-        cmd.push_str(&format!(" --resume-session '{}'", escaped_id));
-    }
-    if let Some(proxy_url) = proxy_base_url {
-        let escaped_url = proxy_url.replace("'", "'\\''");
-        cmd.push_str(&format!(" --proxy-base-url '{}'", escaped_url));
-    }
-    // Escape single quotes in working_dir
-    let escaped_dir = working_dir.replace("'", "'\\''");
-    cmd.push_str(&format!(" --working-dir '{}'", escaped_dir));
-    format!("( {} && {} )", profile_shell_environment("claude"), cmd)
-}
-
-fn profile_shell_environment(client: &str) -> String {
-    let mut env = HashMap::new();
-    crate::agent_profile::apply_env(client, &mut env);
-    shell_environment(env)
-}
-
 fn shell_environment(env: HashMap<String, String>) -> String {
     let mut entries = env.into_iter().collect::<Vec<_>>();
     entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1056,7 +1042,11 @@ pub fn open_agent_login(client: &str, codex_isolated: bool) -> Result<(), String
     crate::agent_profile::apply_env(client, &mut env);
     let codex_options = codex_sqlite_option(&env);
     let (binary, args) = match client {
-        "claude" => (resolve_claude_path().ok_or("Claude Code is not installed")?, "auth login".to_string()),
+        "claude" => {
+            let runtime = crate::claude_runtime::shared().resolve_for_launch()?;
+            configure_claude_runtime_env(&runtime.path, &mut env);
+            (runtime.path, "auth login".to_string())
+        },
         "codex" => (resolve_codex_path().ok_or("Codex is not installed")?, format!("{codex_options}login")),
         _ => return Err("Unsupported agent provider".into()),
     };
@@ -1099,8 +1089,18 @@ fn quote_posix_shell_word(value: &str) -> String {
     format!("'{}'", value.replace("'", "'\\''"))
 }
 
+fn claude_terminal_permission_args(mode: Option<&str>) -> Result<Vec<String>, String> {
+    let Some(mode) = mode else { return Ok(Vec::new()); };
+    let presets: HashMap<String, Vec<String>> = serde_json::from_str(
+        include_str!("../resources/claude-permission-args.json")
+    ).map_err(|error| format!("Invalid Claude permission presets: {error}"))?;
+    presets.get(mode).cloned().ok_or_else(|| format!("Unknown Claude permission mode: {mode}"))
+}
+
 /// Build the shell command to set environment variables and launch Claude
 fn build_shell_command(
+    claude_binary: &str,
+    permission_args: &[String],
     env_vars: &HashMap<String, String>,
     working_dir: &str,
     session_id: &str,
@@ -1144,12 +1144,14 @@ fn build_shell_command(
 
     // Launch claude (with optional --resume) and write exit code to file after it exits
     let escaped_session_id = session_id.replace("'", "'\\''");
-    let claude_cmd = if let Some(resume_id) = resume_session_id {
-        let escaped_resume = resume_id.replace("'", "'\\''");
-        format!("claude --resume '{}'", escaped_resume)
-    } else {
-        "claude".to_string()
-    };
+    let mut claude_cmd = quote_posix_shell_word(claude_binary);
+    for arg in permission_args {
+        claude_cmd.push(' ');
+        claude_cmd.push_str(&quote_posix_shell_word(arg));
+    }
+    if let Some(resume_id) = resume_session_id {
+        claude_cmd.push_str(&format!(" --resume {}", quote_posix_shell_word(resume_id)));
+    }
     parts.push(format!(
         "{}; echo $? > ~/.ccem/sessions/'{}'.exit",
         claude_cmd, escaped_session_id
@@ -1512,7 +1514,7 @@ pub fn launch_in_terminal(
     mut env_vars: HashMap<String, String>,
     working_dir: &str,
     session_id: &str,
-    env_name: &str,
+    _env_name: &str,
     perm_mode: Option<&str>,
     resume_session_id: Option<&str>,
     client: &str,
@@ -1537,24 +1539,12 @@ pub fn launch_in_terminal(
             resume_session_id,
             secret_path.as_deref(),
         )
-    } else if is_ccem_launch_supported() {
-        let proxy_base_url = env_vars.get("ANTHROPIC_BASE_URL").and_then(|url| {
-            if url.starts_with("http://127.0.0.1:") && url.contains("/proxy/claude/") {
-                Some(url.clone())
-            } else {
-                None
-            }
-        });
-        build_launch_command(
-            env_name,
-            perm_mode,
-            session_id,
-            working_dir,
-            resume_session_id,
-            proxy_base_url.as_deref(),
-        )
     } else {
-        build_shell_command(&env_vars, working_dir, session_id, resume_session_id)
+        let claude_binary = prepare_claude_runtime_env(&mut env_vars)?;
+        env_vars.insert("CCEM_RUNTIME_ID".into(), session_id.to_string());
+        env_vars.insert("CCEM_SESSION_ID".into(), session_id.to_string());
+        let permission_args = claude_terminal_permission_args(perm_mode)?;
+        build_shell_command(&claude_binary, &permission_args, &env_vars, working_dir, session_id, resume_session_id)
     };
 
     let script = match terminal {
@@ -2557,13 +2547,36 @@ mod tests {
         env_vars.insert("KEY1".to_string(), "value1".to_string());
         env_vars.insert("KEY2".to_string(), "value2".to_string());
 
-        let cmd = build_shell_command(&env_vars, "/home/user", "test-session-123", None);
+        let cmd = build_shell_command("claude", &[], &env_vars, "/home/user", "test-session-123", None);
 
         assert!(cmd.contains("mkdir -p ~/.ccem/sessions"));
         assert!(cmd.contains("cd '/home/user'"));
         assert!(cmd.contains("export KEY1='value1'"));
         assert!(cmd.contains("export KEY2='value2'"));
-        assert!(cmd.contains("claude; echo $? > ~/.ccem/sessions/'test-session-123'.exit"));
+        assert!(cmd.contains("'claude'; echo $? > ~/.ccem/sessions/'test-session-123'.exit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminal_launch_executes_only_the_selected_quoted_runtime_and_preserves_permissions() {
+        let root = temp_test_root("selected-claude-shell");
+        fs::create_dir_all(&root).unwrap();
+        let binary = root.join("claude ' $(touch injected)");
+        fs::write(&binary, "#!/bin/sh\nprintf '%s\\n' selected-runtime \"$@\"\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        let args = claude_terminal_permission_args(Some("readonly")).unwrap();
+        let command = build_shell_command(binary.to_str().unwrap(), &args, &HashMap::new(), root.to_str().unwrap(), "selected", Some("resume ' value"))
+            .replace("~/.ccem/sessions", &quote_posix_shell_word(root.join("sessions").to_str().unwrap()));
+        let output = Command::new("/bin/sh").args(["-c", &command]).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.starts_with("selected-runtime\n--permission-mode\nplan\n"));
+        assert!(stdout.contains("--disallowedTools\nEdit(*)\nWrite(*)\n"));
+        assert!(stdout.ends_with("--resume\nresume ' value\n"));
+        assert!(!root.join("injected").exists());
+        assert_eq!(fs::read_to_string(root.join("sessions/selected.exit")).unwrap(), "0\n");
+        assert!(claude_terminal_permission_args(Some("unsupported")).is_err());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(unix)]
@@ -2572,7 +2585,7 @@ mod tests {
         let root = temp_test_root("profile-shell-scope");
         fs::create_dir_all(&root).unwrap();
         let sessions = root.join("sessions");
-        let command = build_shell_command(&HashMap::new(), root.to_str().unwrap(), "scope", None)
+        let command = build_shell_command("claude", &[], &HashMap::new(), root.to_str().unwrap(), "scope", None)
             .replace("~/.ccem/sessions", &quote_posix_shell_word(sessions.to_str().unwrap()));
         // A shell function stands in for the provider binary, but the real
         // generated launch command controls all exports, cwd and status writes.
@@ -2732,7 +2745,7 @@ mod tests {
         ];
 
         for (name, working_dir) in malicious_paths {
-            let claude = build_shell_command(&HashMap::new(), working_dir, "sid", None);
+            let claude = build_shell_command("claude", &[], &HashMap::new(), working_dir, "sid", None);
             assert_cd_segment_is_safe(&claude, &format!("claude/{name}"), working_dir);
 
             let codex = build_codex_shell_command(&HashMap::new(), working_dir, "sid", None);
@@ -2752,7 +2765,7 @@ mod tests {
     #[test]
     fn test_working_dir_command_substitution_is_inert() {
         let working_dir = "/tmp/$(echo pwned)";
-        let claude = build_shell_command(&HashMap::new(), working_dir, "sid", None);
+        let claude = build_shell_command("claude", &[], &HashMap::new(), working_dir, "sid", None);
         let codex = build_codex_shell_command(&HashMap::new(), working_dir, "sid", None);
         let opencode =
             build_opencode_shell_command(&HashMap::new(), working_dir, "sid", None, None);

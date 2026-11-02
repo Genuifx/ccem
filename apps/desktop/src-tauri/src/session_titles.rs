@@ -51,6 +51,8 @@ pub(crate) fn resolve_helper_query_env(
     // resolve_claude_env owns the auth boundary, including official OAuth.
     let resolved = config::resolve_claude_env(env_name)?;
     let mut env_vars = resolved.env_vars;
+    let runtime = crate::claude_runtime::shared().resolve_for_launch()?;
+    terminal::configure_claude_runtime_env(&runtime.path, &mut env_vars);
     force_haiku_title_model(&mut env_vars);
     env_vars.insert("PATH".to_string(), terminal::get_user_path());
     let model = env_vars
@@ -62,7 +64,7 @@ pub(crate) fn resolve_helper_query_env(
         .to_string();
     Ok(HelperQueryEnv {
         env_vars,
-        claude_path: terminal::resolve_claude_path(),
+        claude_path: Some(runtime.path),
         model,
         working_dir: working_dir
             .map(str::trim)

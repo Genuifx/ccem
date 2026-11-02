@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "sdkVersion": "0.3.220",
+  "claudeVersion": "2.1.220",
+  "minimumSystemVersion": "2.1.220",
+  "packages": [
+    {
+      "platform": "darwin-arm64",
+      "url": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk-darwin-arm64/-/claude-agent-sdk-darwin-arm64-0.3.220.tgz",
+      "integrity": "sha512-7VxlbEosK7DODiOnsjoVd0DSJzbnaPrM2jelMHI0y8zx1UnLS3WC6EFUXbvy74F2sXqEznh2tzn7EKWInaRN6Q==",
+      "binaryPath": "package/claude",
+      "binarySha256": "8addc857f3fe64d5a0368af9ee50321b50afb4a6918ba3ef018ab84f5dbbe081",
+      "binaryBytes": 256908272,
+      "archiveBytes": 74858812,
+      "minimumOsVersion": "13.0"
+    },
+    {
+      "platform": "darwin-x64",
+      "url": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk-darwin-x64/-/claude-agent-sdk-darwin-x64-0.3.220.tgz",
+      "integrity": "sha512-X9RwDsSmbF6ultKZroaip+DL8WRgC64gHbrAwrRlAFSPNZV7zmJyP2ur8rW7KrxqmtuehdMMkw8+SAC/6hD2PA==",
+      "binaryPath": "package/claude",
+      "binarySha256": "dca7be0aa7d3d924836d440e0c6d8e3d47ef3c8e61fa5809b54b9017170ce2f3",
+      "binaryBytes": 266397712,
+      "archiveBytes": 79494526,
+      "minimumOsVersion": "13.0"
+    },
+    {
+      "platform": "win32-x64",
+      "url": "https://registry.npmjs.org/@anthropic-ai/claude-agent-sdk-win32-x64/-/claude-agent-sdk-win32-x64-0.3.220.tgz",
+      "integrity": "sha512-MuOuXhbr66HlGaWXD2f3w0k2PsvmnbkwcUZ0dAe2poFLdl72GC2dapwwOBefxm9QmoNqk9+jmv/dSKGOVWyvLw==",
+      "binaryPath": "package/claude.exe",
+      "binarySha256": "af5bf1f1b2aadffc768eccd787084c6fdf9ba81624cbe96c1c6d9ac1a1550231",
+      "binaryBytes": 265720480,
+      "archiveBytes": 85151236
+    }
+  ]
+}

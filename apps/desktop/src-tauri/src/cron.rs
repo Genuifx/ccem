@@ -6,7 +6,6 @@ use crate::session_provenance::{
     register_launch, spawn_claude_source_binding, SessionProvenanceUpsert, DEFAULT_CONFIG_SOURCE,
 };
 use crate::telegram;
-use crate::terminal::resolve_claude_path;
 use crate::unified_runtime::UnifiedSessionManager;
 use crate::wecom::{read_wecom_settings, WecomBridgeManager, WecomTaskBindingTargetType};
 use chrono::{DateTime, Utc};
@@ -938,9 +937,9 @@ fn build_cron_claude_command(
     env_vars: &HashMap<String, String>,
     expanded_path: &str,
     tool_policy: &ResolvedToolPolicy,
+    claude_binary: &str,
 ) -> Command {
-    let claude_binary = resolve_claude_path().unwrap_or_else(|| "claude".to_string());
-    let mut command = Command::new(&claude_binary);
+    let mut command = Command::new(claude_binary);
     command.arg("-p").arg(&task.prompt);
     command.args([
         "--permission-mode",
@@ -1171,7 +1170,7 @@ fn execute_task(
     let _lease = lease.unwrap();
     let _ = app.emit("cron-task-started", &run);
 
-    let env_vars = build_env_vars(&task.env_name);
+    let mut env_vars = build_env_vars(&task.env_name);
     let tool_policy = resolve_task_tool_policy(&task);
     let start = std::time::Instant::now();
 
@@ -1185,12 +1184,12 @@ fn execute_task(
     });
     register_cron_launch_provenance(&task, &run_id, &working_dir, started_at_instant);
 
-    let mut cmd =
-        build_cron_claude_command(&task, &working_dir, &env_vars, &expanded_path, &tool_policy);
-
-    let launch = crate::agent_home::ensure_agent_homes()
+    let launch = crate::terminal::prepare_claude_runtime_env(&mut env_vars)
         .map_err(std::io::Error::other)
-        .and_then(|_| cmd.spawn());
+        .and_then(|claude_binary| {
+            crate::agent_home::ensure_agent_homes().map_err(std::io::Error::other)?;
+            build_cron_claude_command(&task, &working_dir, &env_vars, &expanded_path, &tool_policy, &claude_binary).spawn()
+        });
     let (status_str, exit_code, stdout, stderr) = match launch {
         Ok(mut child) => {
             let stdout_collector = OutputCollector::spawn(child.stdout.take());
@@ -1800,8 +1799,18 @@ pub fn generate_cron_task_stream(app: AppHandle, query: String) {
             query
         );
 
+        let mut runtime_env = HashMap::new();
+        let claude_binary = match crate::terminal::prepare_claude_runtime_env(&mut runtime_env) {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = app.emit("cron-ai-stream", &serde_json::json!({"type":"error","error":error}).to_string());
+                let _ = app.emit("cron-ai-done", ());
+                return;
+            }
+        };
         let user_path = get_user_path();
-        let mut cmd = Command::new("claude");
+        let mut cmd = Command::new(claude_binary);
+        cmd.envs(&runtime_env);
         cmd.args(["-p", &prompt, "--output-format", "stream-json", "--verbose"])
             .env("PATH", &user_path)
             .env_remove("CLAUDECODE")
@@ -2233,7 +2242,9 @@ mod tests {
             &env_vars,
             "/usr/local/bin:/opt/homebrew/bin",
             &tool_policy,
+            "/test/selected-claude",
         );
+        assert_eq!(command.get_program(), "/test/selected-claude");
         let args = command
             .get_args()
             .map(|value| value.to_string_lossy().to_string())

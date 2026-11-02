@@ -173,7 +173,7 @@ async function importHarness() {
   const workspaceAst = ts.createSourceFile('workspace.tsx', workspaceSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   const launchCallbacks = {};
   function visitWorkspace(node) {
-    if (ts.isVariableDeclaration(node) && ['runCreateNativeConversation', 'runContinueHistorySession'].includes(node.name.getText(workspaceAst))) {
+    if (ts.isVariableDeclaration(node) && ['runCreateNativeConversation', 'runContinueHistorySession', 'resumeIntoSplitPane'].includes(node.name.getText(workspaceAst))) {
       launchCallbacks[node.name.getText(workspaceAst)] = node.initializer.arguments[0].getText(workspaceAst);
     }
     ts.forEachChild(node, visitWorkspace);
@@ -200,6 +200,7 @@ async function importHarness() {
         const ProcessingActionIcon = () => <span>stop</span>;
         import { WorkspaceSessionComposer } from '@/components/workspace/WorkspaceSessionComposer';
         import { COMPOSER_DELIVERY_UNCERTAIN_TOAST_ID, nativeComposerFailureResult, nativeCreateFailure } from '@/components/workspace/composerSubmissionResult';
+        import { isClaudeRuntimeRequiredError } from '@/lib/claude-runtime';
         import { readRecoveryDraft, writeRecoveryDraft, recoveryDraftDiagnostics } from '@/lib/recoveryDrafts';
         export const seedRecovery = writeRecoveryDraft;
         export const recoveryCounts = recoveryDraftDiagnostics;
@@ -397,6 +398,7 @@ async function importHarness() {
             const resolveComposerDispatch = ({prompt}) => ({ prompt, permMode: 'dev', runtimePermMode: 'dev' });
             const setIsCreatingNativeSession = () => {};
             const setIsResumingHistorySession = () => {};
+            const setClaudeRuntimeRequired = value => { state.runtimeRequired = value; };
             const preflightCodexModelMigration = () => {};
             const requestCodexModelMigrationDecision = () => {};
             const acknowledgedCodexModelWarningsRef = { current: new Set() };
@@ -410,12 +412,29 @@ async function importHarness() {
             };
             const runCreateNativeConversation = ${launchCallbacks.runCreateNativeConversation};
             const runContinueHistorySession = ${launchCallbacks.runContinueHistorySession};
+            const splitPaneId = route.launch === 'split-history' ? 'history:claude:history-fixture' : 'ended-runtime';
+            const upsertLiveSessionEntry = (summary, seed) => {
+              if (route.afterAcceptedFailure) throw new Error(route.afterAcceptedFailure);
+              state.upserted = { summary, seed };
+            };
+            const setSplitRuntimeIds = update => { state.panes = update(state.panes ?? [splitPaneId, 'other-runtime']); };
+            const setActiveLiveRuntimeId = update => { state.activePane = update(state.activePane ?? splitPaneId); };
+            const scheduleWorkspaceRefresh = () => {};
+            const resumeIntoSplitPane = ${launchCallbacks.resumeIntoSplitPane};
+            const resumeSplit = payload => resumeIntoSplitPane(splitPaneId, {
+              provider: composeProvider, providerSessionId: selectedSession.id,
+              envName: currentEnv, permMode: permissionMode, effort: composeEffort,
+              workingDir: effectiveComposeDir, codexIsolated: false,
+              resumeRouterFromRuntimeId: route.launch === 'split-ended' ? splitPaneId : null,
+              seedMessages: messages,
+            }, payload);
             return <WorkspaceSessionComposer
+              compact={route.launch?.startsWith('split-')}
               value={revision === 0 ? initialValue : ''}
               valueRevision={revision}
               recoveryDraftKey={route.recoveryKey}
               onValueChange={() => {}}
-              onSubmit={payload => { state.submission = (async () => { state.result = await (route.launch === 'compose' ? runCreateNativeConversation(payload) : route.launch === 'history' ? runContinueHistorySession(payload) : interactiveKind ? sendInteractivePromptReply({ ...payload, kind: interactiveKind, approved: false, toolUseId: 'attention-test', attentionSeq: 1 }) : handleSend(payload)); return state.result; })(); return state.submission; }}
+              onSubmit={payload => { state.submission = (async () => { state.result = await (route.launch === 'compose' ? runCreateNativeConversation(payload) : route.launch === 'history' ? runContinueHistorySession(payload) : route.launch?.startsWith('split-') ? resumeSplit(payload) : interactiveKind ? sendInteractivePromptReply({ ...payload, kind: interactiveKind, approved: false, toolUseId: 'attention-test', attentionSeq: 1 }) : handleSend(payload)); return state.result; })(); return state.submission; }}
               annotations={annotationOverrides ?? annotationModel.pendingAnnotations}
               onAnnotationsSent={annotationModel.markAllSent}
               onAnnotationsRestore={annotationModel.restoreAnnotations}
@@ -1581,6 +1600,8 @@ for (const scenario of [
   { name: 'interactive question', interactiveKind: 'ask_user_question' },
   { name: 'new conversation', launch: 'compose' },
   { name: 'history continuation', launch: 'history' },
+  { name: 'split history continuation', launch: 'split-history' },
+  { name: 'split ended continuation', launch: 'split-ended' },
 ]) {
   test(`actual ${scenario.name} lost ACK preserves editor but cannot restore a sendable submission`, async (t) => {
     const { container, restore } = installDom();
@@ -1620,7 +1641,30 @@ for (const scenario of [
   });
 }
 
-for (const launch of ['compose', 'history']) {
+for (const launch of ['compose', 'history', 'split-history', 'split-ended']) {
+  for (const provider of ['claude', 'codex']) {
+    test(`actual ${provider} ${launch} opens runtime setup only for a certified Claude startup rejection`, async (t) => {
+      const { container, restore } = installDom();
+      const harness = await (importedHarnessPromise ??= importHarness());
+      window.__ccemRecoveryTest = true;
+      const key = `runtime-required-${provider}-${launch}`;
+      harness.seedRecovery(key, 'keep this task until runtime is ready', []);
+      const mounted = harness.mountFailure(container, false, null, null, { launch, provider, recoveryKey: key });
+      t.after(() => { mounted.unmount(); restore(); });
+      await mounted.submit();
+      const detail = 'CLAUDE_RUNTIME_REQUIRED: {"reason":"missing","preference":"auto"}';
+      await mounted.reject(`NATIVE_CREATE_REJECTED: ${detail}`);
+      assert.equal(mounted.state.result, false);
+      assert.equal(mounted.state.runtimeRequired === true, provider === 'claude');
+      assert.deepEqual(mounted.state.errors, provider === 'claude' ? [] : [detail]);
+      assert.equal(harness.recoveryDraft(key).text, 'keep this task until runtime is ready');
+      assert.equal(harness.recoveryCounts().uncertain, 0);
+      assert.equal(mounted.state.calls, 1, 'opening setup does not resend the prompt');
+      assert.equal(mounted.state.panes, undefined, 'rejected submission does not replace a split pane');
+      assert.match(mounted.text(), /keep this task until runtime is ready/);
+    });
+  }
+
   for (const provider of ['claude', 'codex']) {
     test(`actual ${provider} ${launch} startup rejection shows the cause and keeps a retryable draft`, async (t) => {
       const { container, restore } = installDom();
@@ -1677,6 +1721,33 @@ for (const launch of ['compose', 'history']) {
     assert.equal(harness.recoveryCounts().uncertain, 0);
     mounted.unmount();
   });
+}
+
+for (const launch of ['split-history', 'split-ended']) {
+  for (const afterAcceptedFailure of [null, 'NATIVE_CREATE_REJECTED: CLAUDE_RUNTIME_REQUIRED: late UI failure']) {
+    test(`actual ${launch} accepted create ${afterAcceptedFailure ? 'with a later UI error' : 'replaces its pane'} never reopens setup or restores a retryable draft`, async (t) => {
+      const { container, restore } = installDom();
+      const harness = await (importedHarnessPromise ??= importHarness());
+      window.__ccemRecoveryTest = true;
+      const key = `accepted-${launch}`;
+      harness.seedRecovery(key, 'send exactly once from this pane', []);
+      const mounted = harness.mountFailure(container, false, null, null, { launch, recoveryKey: key, afterAcceptedFailure });
+      t.after(() => { mounted.unmount(); restore(); });
+      await mounted.submit();
+      await mounted.resolve({ runtime_id: 'resumed-runtime' });
+      assert.equal(mounted.state.result, true);
+      assert.equal(mounted.state.runtimeRequired, undefined);
+      assert.deepEqual(mounted.state.errors, []);
+      assert.equal(harness.recoveryDraft(key), null);
+      assert.equal(harness.recoveryCounts().uncertain, 0);
+      assert.equal(mounted.state.calls, 1);
+      assert.equal(mounted.text(), '');
+      if (!afterAcceptedFailure) {
+        assert.deepEqual(mounted.state.panes, ['resumed-runtime', 'other-runtime']);
+        assert.equal(mounted.state.activePane, 'resumed-runtime');
+      }
+    });
+  }
 }
 
 test('only audited native pre-admission failures are classified as definite rejection', async () => {
