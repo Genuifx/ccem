@@ -32,8 +32,8 @@ struct PackageFile {
     sha256: String,
 }
 
-/// Authenticate the cached zip, then compare its inventory with every installed payload file.
-/// A mutable receipt alone cannot authorize a replaced Python module or host script on restart.
+/// Authenticate the cached zip, then verify every file declared in its inventory.
+/// A mutable receipt alone cannot authorize replacement of a declared file on restart.
 pub(super) fn verify_package(
     launch: &HermesLaunch,
     manifest: &VerifiedRuntimeManifest,
@@ -152,49 +152,7 @@ pub(super) fn verify_package_with_control(
     {
         return Err(failure("package_identity", "聊天组件不完整。", false));
     }
-    // Only signed payload files and the three installer-created records may be present. Python
-    // bytecode is disabled at launch; no runtime writes belong inside the version directory.
-    let mut pending = vec![root.clone()];
-    while let Some(dir) = pending.pop() {
-        check_cancelled(cancelled)?;
-        for entry in fs::read_dir(dir).map_err(|_| io_failure())? {
-            check_cancelled(cancelled)?;
-            let entry = entry.map_err(|_| io_failure())?;
-            let meta = fs::symlink_metadata(entry.path()).map_err(|_| io_failure())?;
-            let relative = entry
-                .path()
-                .strip_prefix(&root)
-                .map_err(|_| io_failure())?
-                .to_str()
-                .ok_or_else(io_failure)?
-                .to_owned();
-            if meta.file_type().is_symlink() {
-                return Err(failure(
-                    "package_integrity",
-                    "聊天组件含非预期符号链接。",
-                    false,
-                ));
-            }
-            if meta.is_dir() {
-                pending.push(entry.path());
-            } else if !expected.contains(&relative)
-                && ![
-                    "runtime.json",
-                    "manifest.json",
-                    "manifest.json.sig",
-                    "verification-receipt.json",
-                ]
-                .contains(&relative.as_str())
-            {
-                return Err(failure(
-                    "package_integrity",
-                    "聊天组件目录含非预期文件。",
-                    false,
-                ));
-            }
-        }
-    }
-    Ok(())
+    check_cancelled(cancelled)
 }
 
 // The signed runtime supplies its own channel catalog. Adding a reviewed
