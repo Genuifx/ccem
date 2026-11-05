@@ -18,6 +18,7 @@ export interface CronTask {
   maxBudgetUsd: number | null;
   allowedTools: string[];
   disallowedTools: string[];
+  requiredSkills?: string[];
   enabled: boolean;
   timeoutSecs: number;
   templateId: string | null;
@@ -60,6 +61,7 @@ export interface CronCreateInput {
   maxBudgetUsd?: number | null;
   allowedTools?: string[] | null;
   disallowedTools?: string[] | null;
+  requiredSkills?: string[] | null;
   enabled?: boolean | null;
   timeoutSecs?: number | null;
   templateId?: string | null;
@@ -318,6 +320,7 @@ export function createCronTask(input: CronCreateInput, tasksPath = getCronTasksP
     maxBudgetUsd,
     allowedTools: input.allowedTools ?? [],
     disallowedTools: input.disallowedTools ?? [],
+    requiredSkills: normalizeRequiredSkills(input.requiredSkills ?? []),
     enabled: input.enabled ?? true,
     timeoutSecs,
     templateId: input.templateId?.trim() || null,
@@ -379,6 +382,7 @@ export function parseCronCreateJson(raw: string): CronCreateInput {
     envName: typeof parsed.envName === 'string' ? parsed.envName : null,
     executionProfile: typeof parsed.executionProfile === 'string' ? parsed.executionProfile : null,
     maxBudgetUsd: typeof parsed.maxBudgetUsd === 'number' ? parsed.maxBudgetUsd : null,
+    requiredSkills: normalizeRequiredSkills((parsed.requiredSkills ?? []) as string[]),
     allowedTools: Array.isArray(parsed.allowedTools)
       ? parsed.allowedTools.map(String)
       : null,
@@ -402,4 +406,11 @@ export function formatCronTaskTableRows(tasks: CronTask[]): string[][] {
     task.envName ?? '-',
     String(task.timeoutSecs),
   ]);
+}
+
+function normalizeRequiredSkills(skills: string[]): string[] {
+  if (!Array.isArray(skills) || skills.some(name => typeof name !== 'string' || !/^[a-zA-Z0-9_.:-]{1,256}$/.test(name.trim()))) {
+    throw new Error('Invalid required skill name');
+  }
+  return [...new Set(skills.map(name => name.trim()))];
 }

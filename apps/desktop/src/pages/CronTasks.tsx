@@ -1,3 +1,5 @@
+import { ClaudeTaskProfile } from '@/components/cron/ClaudeTaskProfile';
+import { Input } from '@/components/ui/input';
 import { HermesNotificationPicker } from '@/components/cron/HermesNotificationPicker';
 import type { CronHermesNotification } from '@/lib/hermes-ipc';
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
@@ -535,6 +537,7 @@ function TaskDialog({ open, onClose, onSave, editTask, environments }: {
     maxBudgetUsd?: number | null;
     allowedTools?: string[];
     disallowedTools?: string[];
+    requiredSkills?: string[];
     timeoutSecs?: number;
     wecomNotification?: CronWecomNotification | null;
     hermesNotification?: CronHermesNotification | null;
@@ -553,6 +556,7 @@ function TaskDialog({ open, onClose, onSave, editTask, environments }: {
   const [maxBudgetUsdInput, setMaxBudgetUsdInput] = useState('');
   const [allowedToolsInput, setAllowedToolsInput] = useState('');
   const [disallowedToolsInput, setDisallowedToolsInput] = useState('');
+  const [requiredSkillsInput, setRequiredSkillsInput] = useState('');
   const [timeoutSecs, setTimeoutSecs] = useState(300);
   const [notifyWecom, setNotifyWecom] = useState(false);
   const [hermesNotification, setHermesNotification] = useState<CronHermesNotification | null>(null);
@@ -596,6 +600,7 @@ function TaskDialog({ open, onClose, onSave, editTask, environments }: {
       setMaxBudgetUsdInput(editTask.maxBudgetUsd != null ? String(editTask.maxBudgetUsd) : '');
       setAllowedToolsInput(formatToolListInput(editTask.allowedTools));
       setDisallowedToolsInput(formatToolListInput(editTask.disallowedTools));
+      setRequiredSkillsInput(formatToolListInput(editTask.requiredSkills));
       setTimeoutSecs(editTask.timeoutSecs);
       setNotifyWecom(Boolean(editTask.wecomNotification?.enabled));
       setHermesNotification(editTask.hermesNotification ?? null);
@@ -612,6 +617,7 @@ function TaskDialog({ open, onClose, onSave, editTask, environments }: {
       setMaxBudgetUsdInput('');
       setAllowedToolsInput('');
       setDisallowedToolsInput('');
+      setRequiredSkillsInput('');
       setTimeoutSecs(300);
       setNotifyWecom(false);
       setHermesNotification(null);
@@ -651,6 +657,7 @@ function TaskDialog({ open, onClose, onSave, editTask, environments }: {
         maxBudgetUsd: parsedBudget,
         allowedTools: parseToolListInput(allowedToolsInput),
         disallowedTools: parseToolListInput(disallowedToolsInput),
+        requiredSkills: parseToolListInput(requiredSkillsInput),
         timeoutSecs,
         hermesNotification,
         wecomNotification: notifyWecom ? {
@@ -715,6 +722,12 @@ function TaskDialog({ open, onClose, onSave, editTask, environments }: {
                 <FolderOpen className="w-4 h-4" />
               </button>
             </div>
+          </div>
+          <div className="space-y-2">
+            <label htmlFor="cron-required-skills" className="text-xs font-medium text-muted-foreground">{t('cron.requiredSkills')}</label>
+            <Input id="cron-required-skills" value={requiredSkillsInput} onChange={e => setRequiredSkillsInput(e.target.value)} placeholder="lightweight-dev-mode, plugin:skill" />
+            <p className="text-2xs text-muted-foreground">{t('cron.requiredSkillsHint')}</p>
+            <ClaudeTaskProfile workingDir={workDir} />
           </div>
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             <div className="space-y-1.5">
@@ -1258,6 +1271,7 @@ export function CronTasks({
     maxBudgetUsd?: number | null;
     allowedTools?: string[];
     disallowedTools?: string[];
+    requiredSkills?: string[];
     timeoutSecs?: number;
     wecomNotification?: CronWecomNotification | null;
     hermesNotification?: CronHermesNotification | null;

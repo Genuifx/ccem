@@ -6126,6 +6126,8 @@ pub fn run_desktop_app() -> i32 {
         })
         .invoke_handler(tauri::generate_handler![
             agent_profile::get_agent_profiles,
+            cron::profile::inspect_claude_task_profile,
+            cron::profile::repair_claude_task_profile,
             agent_profile::set_codex_isolation,
             agent_profile::login_agent_profile,
             hermes_bridge::hermes_status,

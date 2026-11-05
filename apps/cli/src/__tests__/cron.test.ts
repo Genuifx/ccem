@@ -27,6 +27,18 @@ describe('cron task store', () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
+  it('persists explicit required skills, accepts plugin names and rejects paths', () => {
+    const input = parseCronCreateJson(JSON.stringify({
+      name: 'Skills', cronExpression: '0 9 * * *', prompt: 'Use my skills',
+      requiredSkills: ['  example  ', 'plugin:check', 'example'],
+    }));
+    const task = createCronTask(input, tasksPath);
+    expect(readCronTasks(tasksPath)[0].requiredSkills).toEqual(['example', 'plugin:check']);
+    expect(task.requiredSkills).toEqual(['example', 'plugin:check']);
+    expect(() => parseCronCreateJson('{"requiredSkills":["../escape"]}')).toThrow(/skill/);
+    expect(() => parseCronCreateJson('{"requiredSkills":"example"}')).toThrow(/skill/);
+  });
+
   it('creates a task through the structured store contract', () => {
     const task = createCronTask({
       name: 'Daily Review',

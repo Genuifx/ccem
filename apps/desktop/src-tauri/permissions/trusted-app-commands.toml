@@ -3,6 +3,8 @@ identifier = "trusted-app-commands"
 description = "Allows CCEM application commands only for explicitly trusted application webviews."
 commands.allow = [
   "get_agent_profiles",
+  "inspect_claude_task_profile",
+  "repair_claude_task_profile",
   "set_codex_isolation",
   "login_agent_profile",
   "get_claude_runtime_status",

@@ -77,6 +77,7 @@ export function registerCronCommands(program: Command): void {
     .option('--max-budget-usd <amount>', 'Optional max budget in USD')
     .option('--allowed-tools <items>', 'Comma-separated or JSON array of allowed tools')
     .option('--disallowed-tools <items>', 'Comma-separated or JSON array of disallowed tools')
+    .option('--required-skills <items>', 'Skills required before the task may run')
     .option('--timeout-secs <seconds>', 'Task timeout in seconds')
     .option('--template-id <id>', 'Optional template id')
     .option('--wecom-result', 'Send cron result summary to the configured WeCom default target')
@@ -98,6 +99,7 @@ export function registerCronCommands(program: Command): void {
               maxBudgetUsd: options.maxBudgetUsd === undefined ? null : Number(options.maxBudgetUsd),
               allowedTools: parseStringList(options.allowedTools),
               disallowedTools: parseStringList(options.disallowedTools),
+              requiredSkills: parseStringList(options.requiredSkills),
               enabled: options.disabled ? false : true,
               timeoutSecs: options.timeoutSecs === undefined ? null : Number(options.timeoutSecs),
               templateId: options.templateId,
