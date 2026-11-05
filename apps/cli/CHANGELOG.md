@@ -1,5 +1,11 @@
 # ccem
 
+## 2.110.0
+
+### Minor Changes
+
+- Release v2.110.0: Hermes runtime extra-file tolerance fixes.
+
 ## 2.109.0
 
 ### Minor Changes
