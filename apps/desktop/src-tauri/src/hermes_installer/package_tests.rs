@@ -87,7 +87,53 @@ fn verification_reports_real_files_and_preserves_integrity_checks() {
         "package_integrity"
     );
     fs::write(&launch.host, b"verified payload").unwrap();
+    verify_package(&launch, &manifest, &archive).unwrap();
+    fs::remove_file(&launch.host).unwrap();
+    assert!(verify_package(&launch, &manifest, &archive).is_err());
+}
+
+#[test]
+fn verification_accepts_extra_files_and_nested_cache() {
+    let (_temp, launch, manifest, archive) = fixture();
+    fs::write(launch.runtime_root.join(".DS_Store"), b"metadata").unwrap();
     fs::write(launch.source.join("unsigned.py"), b"unsigned").unwrap();
+    let cache = launch.source.join("__pycache__/nested");
+    fs::create_dir_all(&cache).unwrap();
+    fs::write(cache.join("module.pyc"), b"cache").unwrap();
+    verify_package(&launch, &manifest, &archive).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn verification_ignores_extra_symlinks_but_rejects_declared_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let (temp, launch, manifest, archive) = fixture();
+    let outside = temp.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("unrelated"), b"unrelated").unwrap();
+    symlink(&outside, launch.runtime_root.join("extra-link")).unwrap();
+    verify_package(&launch, &manifest, &archive).unwrap();
+
+    fs::remove_file(&launch.host).unwrap();
+    symlink(launch.runtime_root.join("LICENSE"), &launch.host).unwrap();
+    assert_eq!(
+        verify_package(&launch, &manifest, &archive)
+            .unwrap_err()
+            .code,
+        "package_integrity"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn verification_rejects_declared_paths_outside_runtime_root() {
+    use std::os::unix::fs::symlink;
+
+    let (temp, launch, manifest, archive) = fixture();
+    let outside = temp.path().join("moved-source");
+    fs::rename(&launch.source, &outside).unwrap();
+    symlink(&outside, &launch.source).unwrap();
     assert_eq!(
         verify_package(&launch, &manifest, &archive)
             .unwrap_err()
@@ -97,7 +143,21 @@ fn verification_reports_real_files_and_preserves_integrity_checks() {
 }
 
 #[test]
-fn cancellation_during_verification_and_directory_scan_can_retry() {
+fn verification_rejects_a_changed_archive() {
+    let (_temp, launch, manifest, archive) = fixture();
+    let mut bytes = fs::read(&archive).unwrap();
+    bytes[0] ^= 1;
+    fs::write(&archive, bytes).unwrap();
+    assert_eq!(
+        verify_package(&launch, &manifest, &archive)
+            .unwrap_err()
+            .code,
+        "archive_hash"
+    );
+}
+
+#[test]
+fn cancellation_during_verification_can_retry() {
     let (_temp, launch, manifest, archive) = fixture();
     for stop_at in [0, 64, 75] {
         let cancelled = AtomicBool::new(false);
