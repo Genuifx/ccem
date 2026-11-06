@@ -1,5 +1,11 @@
 # ccem
 
+## 2.111.0
+
+### Minor Changes
+
+- Release v2.111.0: isolated cron profile validation and recovery fixes.
+
 ## 2.110.0
 
 ### Minor Changes
