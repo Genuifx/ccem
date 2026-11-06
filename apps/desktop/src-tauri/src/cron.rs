@@ -1,5 +1,6 @@
 pub(crate) mod hermes_notifications;
 mod process;
+pub(crate) mod profile;
 mod recovery;
 use crate::config;
 use crate::session_provenance::{
@@ -47,6 +48,8 @@ pub struct CronTask {
     pub allowed_tools: Vec<String>,
     #[serde(rename = "disallowedTools", default)]
     pub disallowed_tools: Vec<String>,
+    #[serde(rename = "requiredSkills", default)]
+    pub required_skills: Vec<String>,
     pub enabled: bool,
     #[serde(rename = "timeoutSecs")]
     pub timeout_secs: u64,
@@ -920,6 +923,23 @@ fn resolve_task_tool_policy(task: &CronTask) -> ResolvedToolPolicy {
     }
 }
 
+fn validate_required_skills(skills: Vec<String>) -> Result<Vec<String>, String> {
+    let mut result = Vec::new();
+    for skill in skills {
+        let name = skill.trim();
+        if name.is_empty()
+            || name.len() > 256
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || "_-.:".contains(c))
+        {
+            return Err("Invalid required skill name".into());
+        }
+        if !result.iter().any(|item| item == name) {
+            result.push(name.to_string());
+        }
+    }
+    Ok(result)
+}
+
 fn official_permission_mode(mode_name: &str) -> &str {
     match mode_name {
         "yolo" => "bypassPermissions",
@@ -967,6 +987,7 @@ fn build_cron_claude_command(
         .current_dir(working_dir)
         .env("PATH", expanded_path)
         .env_remove("CLAUDECODE")
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -1189,7 +1210,32 @@ fn execute_task(
         .map_err(std::io::Error::other)
         .and_then(|claude_binary| {
             crate::agent_home::ensure_agent_homes().map_err(std::io::Error::other)?;
-            build_cron_claude_command(&task, &working_dir, &env_vars, &expanded_path, &tool_policy, &claude_binary).spawn()
+            let budget = || profile::remaining_budget(
+                start, Duration::from_secs(task.timeout_secs), Duration::from_secs(30),
+            );
+            let has_linked_skills = profile::check_profile(&app, &working_dir, budget()?)
+                .map_err(profile::preflight_error)?;
+            let mut command = build_cron_claude_command(
+                &task, &working_dir, &env_vars, &expanded_path, &tool_policy, &claude_binary,
+            );
+            let mut probe = Command::new(command.get_program());
+            probe.current_dir(&working_dir).args([
+                "-p", "--input-format", "stream-json", "--output-format", "stream-json",
+                "--verbose", "--settings", r#"{"disableAllHooks":true}"#,
+            ]);
+            for (key, value) in command.get_envs() {
+                if let Some(value) = value {
+                    probe.env(key, value);
+                } else {
+                    probe.env_remove(key);
+                }
+            }
+            if has_linked_skills || !task.required_skills.is_empty() {
+                profile::check_required_skills(
+                    probe, &task.required_skills, budget()?.min(Duration::from_secs(15)),
+                ).map_err(profile::preflight_error)?;
+            }
+            profile::spawn_before_deadline(&mut command, start, Duration::from_secs(task.timeout_secs))
         });
     let (status_str, exit_code, stdout, stderr) = match launch {
         Ok(mut child) => {
@@ -1264,7 +1310,11 @@ fn execute_task(
             (status_str, exit_code, stdout, stderr)
         }
         Err(error) => (
-            "failed".to_string(),
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                "timeout"
+            } else {
+                "failed"
+            }.to_string(),
             None,
             String::new(),
             format!("Failed to spawn claude: {}", error),
@@ -1532,6 +1582,7 @@ pub fn add_cron_task(
     max_budget_usd: Option<f64>,
     allowed_tools: Option<Vec<String>>,
     disallowed_tools: Option<Vec<String>>,
+    required_skills: Option<Vec<String>>,
     timeout_secs: Option<u64>,
     template_id: Option<String>,
     wecom_notification: Option<CronWecomNotification>,
@@ -1563,6 +1614,7 @@ pub fn add_cron_task(
         max_budget_usd,
         allowed_tools: allowed_tools.unwrap_or_default(),
         disallowed_tools: disallowed_tools.unwrap_or_default(),
+        required_skills: validate_required_skills(required_skills.unwrap_or_default())?,
         enabled: true,
         timeout_secs: timeout_secs.unwrap_or(300),
         template_id,
@@ -1593,6 +1645,7 @@ pub fn update_cron_task(
     max_budget_usd: Option<f64>,
     allowed_tools: Option<Vec<String>>,
     disallowed_tools: Option<Vec<String>>,
+    required_skills: Option<Vec<String>>,
     timeout_secs: Option<u64>,
     wecom_notification: Option<CronWecomNotification>,
     hermes_notification: Option<CronHermesNotification>,
@@ -1626,6 +1679,9 @@ pub fn update_cron_task(
     task.max_budget_usd = max_budget_usd;
     task.allowed_tools = allowed_tools.unwrap_or_default();
     task.disallowed_tools = disallowed_tools.unwrap_or_default();
+    if let Some(skills) = required_skills {
+        task.required_skills = validate_required_skills(skills)?;
+    }
     if let Some(v) = timeout_secs {
         task.timeout_secs = v;
     }
@@ -2065,6 +2121,7 @@ mod tests {
     #[test]
     fn build_cron_launch_provenance_uses_task_environment_for_workspace_history() {
         let task = CronTask {
+            required_skills: vec![],
             id: "cron-1".to_string(),
             name: "Example".to_string(),
             cron_expression: "0 9 * * 1-5".to_string(),
@@ -2185,6 +2242,7 @@ mod tests {
             max_budget_usd: Some(9.5),
             allowed_tools: vec!["Read".to_string(), "Bash".to_string()],
             disallowed_tools: vec!["WebSearch".to_string()],
+            required_skills: vec![],
             enabled: true,
             timeout_secs: 300,
             template_id: None,
@@ -2219,6 +2277,7 @@ mod tests {
             max_budget_usd: Some(9.5),
             allowed_tools: vec!["Read".to_string(), "WebSearch".to_string()],
             disallowed_tools: vec!["Bash".to_string()],
+            required_skills: vec![],
             enabled: true,
             timeout_secs: 300,
             template_id: None,
@@ -2358,6 +2417,7 @@ mod tests {
     #[test]
     fn cron_wecom_notification_resolves_explicit_target_and_normalizes_peer() {
         let task = CronTask {
+            required_skills: vec![],
             id: "cron-1".to_string(),
             name: "Example".to_string(),
             cron_expression: "0 9 * * *".to_string(),

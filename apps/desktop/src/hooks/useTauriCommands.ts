@@ -1479,6 +1479,7 @@ export function useTauriCommands() {
     maxBudgetUsd?: number | null;
     allowedTools?: string[];
     disallowedTools?: string[];
+    requiredSkills?: string[];
     timeoutSecs?: number;
     templateId?: string;
     wecomNotification?: CronWecomNotification | null;
@@ -1494,6 +1495,7 @@ export function useTauriCommands() {
       maxBudgetUsd: data.maxBudgetUsd ?? null,
       allowedTools: data.allowedTools ?? [],
       disallowedTools: data.disallowedTools ?? [],
+      requiredSkills: data.requiredSkills ?? [],
       timeoutSecs: data.timeoutSecs || 300,
       templateId: data.templateId || null,
       wecomNotification: data.wecomNotification ?? null,
@@ -1515,6 +1517,7 @@ export function useTauriCommands() {
     maxBudgetUsd?: number | null;
     allowedTools?: string[];
     disallowedTools?: string[];
+    requiredSkills?: string[];
     timeoutSecs?: number;
     wecomNotification?: CronWecomNotification | null;
     hermesNotification?: CronHermesNotification | null;

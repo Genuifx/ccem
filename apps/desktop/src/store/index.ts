@@ -121,6 +121,7 @@ export interface CronTask {
   maxBudgetUsd?: number | null;
   allowedTools?: string[];
   disallowedTools?: string[];
+  requiredSkills?: string[];
   enabled: boolean;
   timeoutSecs: number;
   templateId: string | null;

@@ -65,3 +65,45 @@ For isolated desktop self-tests only, debug builds accept absolute
 `CCEM_CLAUDE_RUNTIME_ROOT` and a `CCEM_CLAUDE_SYSTEM_PATH` discovery override.
 Release builds ignore both. These overrides do not change the download source
 or disable integrity validation.
+
+## Unattended task readiness
+
+Cron checks project trust in the isolated Claude profile before launching a task.
+It does not silently inherit trust from `~/.claude.json`. Existing tasks whose
+isolated project is untrusted now fail with an actionable `CCEM_PREFLIGHT` error
+instead of continuing after Claude ignores project permissions.
+
+In the task editor, **Check runtime** inspects the selected working directory
+(including `~/...`). **Trust this project** is an explicit, initially unselected
+choice. Recovery updates only that project entry; it does not copy official
+credentials or unrelated settings. Selected personal skills can be imported from
+`~/.claude/skills`, or materialized from existing isolated-profile links. Imports
+are independent copies, preserve references/scripts, and never overwrite an
+existing real skill directory. Nested links are rejected. Backups are retained
+under `~/.ccem/agents/claude/.profile-repair-backups/`. Source updates are not
+synchronized automatically. Avoid editing Claude configuration concurrently with
+recovery; changed configuration detected during repair is rejected.
+
+Tasks can optionally declare `requiredSkills` (CLI create: `--required-skills`,
+comma-separated; JSON: string array). Use the skill's command name, including its
+plugin prefix when applicable. If dependencies are declared or personal skill
+links exist, cron initializes the selected Claude runtime with the same cwd and
+environment and checks its discovered commands. This probe sends no user/model
+request and disables hooks. Working links remain supported; unrelated linked
+skills are not treated as required dependencies. Prompt text is not parsed to
+infer requirements, so existing tasks should declare any skills they depend on.
+
+Profile access is bounded to 30 seconds and Claude discovery to 15 seconds, both
+within the task's total timeout. A failed/timed-out preflight does not start the
+actual task. Availability checks cannot prove the business result of a prompt;
+the existing run status still reflects the process exit code.
+
+Focused verification:
+
+```sh
+node --test apps/desktop/src-tauri/resources/claude-profile-repair.test.cjs
+# from apps/desktop/src-tauri
+cargo test --locked cron:: -- --test-threads=1
+# from apps/cli
+pnpm exec vitest run src/__tests__/cron.test.ts
+```

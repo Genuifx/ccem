@@ -384,7 +384,7 @@ const CCEM_NODE_SIDECAR_NAME: &str = "ccem-node";
 /// Uses the same anchor as `runtime.rs::native_sidecar_exe_anchor()`:
 /// `current_exe().parent()` which is `Contents/MacOS/` in release and
 /// `target/{debug,release}/` in dev — both hold the sidecar.
-fn resolve_ccem_node_path(_app: &AppHandle) -> Result<PathBuf, DshHistoryError> {
+pub(crate) fn resolve_ccem_node_path(_app: &AppHandle) -> Result<PathBuf, DshHistoryError> {
     resolve_ccem_node_path_from_exe(std::env::current_exe().ok())
 }
 

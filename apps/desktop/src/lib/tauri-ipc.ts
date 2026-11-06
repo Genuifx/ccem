@@ -574,6 +574,7 @@ export interface TauriCommands {
       maxBudgetUsd?: number | null;
       allowedTools?: string[] | null;
       disallowedTools?: string[] | null;
+      requiredSkills?: string[] | null;
       timeoutSecs?: number;
       templateId?: string | null;
       wecomNotification?: CronWecomNotification | null;
@@ -593,6 +594,7 @@ export interface TauriCommands {
       maxBudgetUsd?: number | null;
       allowedTools?: string[] | null;
       disallowedTools?: string[] | null;
+      requiredSkills?: string[] | null;
       timeoutSecs?: number;
       wecomNotification?: CronWecomNotification | null;
   hermesNotification?: CronHermesNotification | null;
@@ -1753,6 +1755,7 @@ export interface CronTask {
   maxBudgetUsd?: number | null;
   allowedTools?: string[];
   disallowedTools?: string[];
+  requiredSkills?: string[];
   enabled: boolean;
   timeoutSecs: number;
   templateId?: string | null;
