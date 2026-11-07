@@ -246,3 +246,38 @@ test('continues to accept release-commit push readiness and mixed triggers', asy
     assert.deepEqual(result.runIds, { 'release-cli.yml': 101, 'mode2-signed-readiness.yml': 202 });
   }
 });
+
+test('can verify selected runs while checking their current attempt has not changed', async () => {
+  const selectedRuns = { 'release-cli.yml': { id: 101, run_attempt: 3 }, 'mode2-signed-readiness.yml': { id: 202, run_attempt: 3 } };
+  const fixture = fixtureFetch();
+  const urls = [];
+  const fetchImpl = async (url, options) => {
+    urls.push(url);
+    const match = new URL(url).pathname.match(/\/actions\/runs\/(101|202)$/u);
+    return match ? response(200, run(match[1] === '101' ? 'release-cli.yml' : 'mode2-signed-readiness.yml')) : fixture.fetchImpl(url, options);
+  };
+  const result = await verifyPretagReadinessRuns({ repository, token, sourceCommit, fetchImpl, selectedRuns });
+  assert.equal(result.runIds['release-cli.yml'], 101);
+  assert.ok(urls.some((url) => url.endsWith('/actions/runs/101')));
+  await assert.rejects(verifyPretagReadinessRuns({ repository, token, sourceCommit, selectedRuns,
+    fetchImpl: async () => response(200, run('release-cli.yml', { run_attempt: 4 })),
+  }), /selected run.*attempt changed/u);
+});
+
+test('selected-run verification detects a rerun started while its jobs are being loaded', async () => {
+  const fixture = fixtureFetch();
+  const selectedRuns = { 'release-cli.yml': { id: 101, run_attempt: 3 }, 'mode2-signed-readiness.yml': { id: 202, run_attempt: 3 } };
+  let jobsRead = false;
+  await assert.rejects(verifyPretagReadinessRuns({ repository, token, sourceCommit, selectedRuns,
+    fetchImpl: async (url, options) => {
+      const pathname = new URL(url).pathname;
+      const match = pathname.match(/\/actions\/runs\/(101|202)$/u);
+      if (match) return response(200, run(match[1] === '101' ? 'release-cli.yml' : 'mode2-signed-readiness.yml', {
+        run_attempt: jobsRead && match[1] === '101' ? 4 : 3,
+      }));
+      const result = await fixture.fetchImpl(url, options);
+      if (pathname.includes('/runs/101/attempts/3/jobs')) jobsRead = true;
+      return result;
+    },
+  }), /attempt changed/u);
+});

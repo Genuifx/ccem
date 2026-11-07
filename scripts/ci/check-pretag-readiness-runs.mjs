@@ -3,10 +3,10 @@
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
+import { requestJson } from './release-http.mjs';
 
 const API_ORIGIN = 'https://api.github.com';
-const API_VERSION = '2022-11-28';
-const REQUIRED_WORKFLOWS = Object.freeze([
+export const REQUIRED_WORKFLOWS = Object.freeze([
   Object.freeze({
     workflow: 'release-cli.yml',
     requiredJob: 'Preflight npm Trusted Publisher',
@@ -76,29 +76,8 @@ function workflowJobsUrl(repository, runId, runAttempt, page) {
   return url.href;
 }
 
-async function responseJson(fetchImpl, url, token, label) {
-  let response;
-  try {
-    response = await fetchImpl(url, {
-      method: 'GET',
-      redirect: 'error',
-      headers: {
-        Accept: 'application/vnd.github+json',
-        Authorization: `Bearer ${token}`,
-        'X-GitHub-Api-Version': API_VERSION,
-      },
-    });
-  } catch {
-    fail(`${label} request failed`);
-  }
-  if (!response || response.status !== 200 || response.ok !== true) {
-    fail(`${label} read failed (${response?.status ?? 'invalid response'})`);
-  }
-  try {
-    return await response.json();
-  } catch {
-    fail(`${label} returned invalid JSON`);
-  }
+async function responseJson(fetchImpl, url, token, label, sleepImpl) {
+  return requestJson({ fetchImpl, url, token, label: `[pretag-readiness] ${label}`, sleepImpl });
 }
 
 function successfulExactRun(body, workflow, sourceCommit) {
@@ -128,6 +107,7 @@ async function loadExactAttemptJobs({
   run,
   workflow,
   fetchImpl,
+  sleepImpl,
 }) {
   const jobs = [];
   let expectedTotal = null;
@@ -137,6 +117,7 @@ async function loadExactAttemptJobs({
       workflowJobsUrl(repository, run.id, run.run_attempt, page),
       token,
       `${workflow} run ${run.id} attempt ${run.run_attempt} jobs`,
+      sleepImpl,
     );
     if (
       !body
@@ -166,6 +147,7 @@ function hasSuccessfulRequiredJob(jobs, run, requiredJob) {
   return jobs.some((job) => (
     job
     && typeof job === 'object'
+    && job.run_id === run.id
     && job.name === requiredJob
     && job.status === 'completed'
     && job.conclusion === 'success'
@@ -177,6 +159,8 @@ export async function verifyPretagReadinessRuns({
   token,
   sourceCommit,
   fetchImpl = globalThis.fetch,
+  selectedRuns,
+  sleepImpl,
 }) {
   const exactRepo = exactRepository(repository);
   const exactReadinessToken = exactToken(token);
@@ -186,13 +170,24 @@ export async function verifyPretagReadinessRuns({
   const runIds = {};
   for (const requirement of REQUIRED_WORKFLOWS) {
     const { workflow, requiredJob } = requirement;
-    const body = await responseJson(
-      fetchImpl,
-      workflowRunsUrl(exactRepo, workflow, exactSha),
-      exactReadinessToken,
-      workflow,
-    );
-    const run = successfulExactRun(body, workflow, exactSha);
+    let run;
+    if (selectedRuns) {
+      const selected = selectedRuns[workflow];
+      if (!Number.isSafeInteger(selected?.id) || selected.id <= 0
+        || !Number.isSafeInteger(selected.run_attempt) || selected.run_attempt <= 0) {
+        fail(`${workflow} selected run identity is malformed`);
+      }
+      const current = await responseJson(fetchImpl,
+        `${API_ORIGIN}/repos/${exactRepo}/actions/runs/${selected.id}`, exactReadinessToken, workflow, sleepImpl);
+      if (current?.id !== selected.id || current?.run_attempt !== selected.run_attempt) {
+        fail(`${workflow} selected run ${selected.id} attempt changed; inspect current readiness again`);
+      }
+      run = successfulExactRun({ workflow_runs: [current] }, workflow, exactSha);
+    } else {
+      const body = await responseJson(fetchImpl, workflowRunsUrl(exactRepo, workflow, exactSha),
+        exactReadinessToken, workflow, sleepImpl);
+      run = successfulExactRun(body, workflow, exactSha);
+    }
     if (!run) {
       fail(`${workflow} has no successful main push or workflow_dispatch run for exact source ${exactSha}`);
     }
@@ -202,11 +197,27 @@ export async function verifyPretagReadinessRuns({
       run,
       workflow,
       fetchImpl,
+      sleepImpl,
     });
     if (!hasSuccessfulRequiredJob(jobs, run, requiredJob)) {
       fail(`${workflow} run ${run.id} did not complete required job ${requiredJob}`);
     }
     runIds[workflow] = run.id;
+  }
+  if (selectedRuns) {
+    // Re-read after all job bodies: a rerun can advance the attempt while jobs
+    // for the previous successful attempt remain available.
+    for (const { workflow } of REQUIRED_WORKFLOWS) {
+      const selected = selectedRuns[workflow];
+      const current = await responseJson(fetchImpl,
+        `${API_ORIGIN}/repos/${exactRepo}/actions/runs/${selected.id}`, exactReadinessToken, workflow, sleepImpl);
+      if (current?.id !== selected.id || current?.run_attempt !== selected.run_attempt) {
+        fail(`${workflow} selected run ${selected.id} attempt changed during verification`);
+      }
+      if (!successfulExactRun({ workflow_runs: [current] }, workflow, exactSha)) {
+        fail(`${workflow} selected run ${selected.id} is no longer successful`);
+      }
+    }
   }
   return { repository: exactRepo, sourceCommit: exactSha, runIds };
 }
@@ -230,4 +241,81 @@ if (process.argv[1] && scriptPath === path.resolve(process.argv[1])) {
     process.stderr.write(`${error.message}\n`);
     process.exitCode = 1;
   });
+}
+
+// Read all exact-source attempts before deciding whether a workflow is absent. In
+// particular, a green automatic run with skipped jobs is not release evidence.
+export async function inspectPretagWorkflow({
+  repository, token, sourceCommit, workflow, fetchImpl = globalThis.fetch, sleepImpl,
+}) {
+  exactRepository(repository);
+  exactToken(token);
+  exactSourceCommit(sourceCommit);
+  const requirement = REQUIRED_WORKFLOWS.find((entry) => entry.workflow === workflow);
+  if (!requirement) fail(`unsupported readiness workflow ${workflow}`);
+  const runs = [];
+  let expectedTotal;
+  for (let page = 1; page <= 10; page += 1) {
+    const url = new URL(workflowRunsUrl(repository, workflow, sourceCommit));
+    url.searchParams.delete('status');
+    url.searchParams.set('page', String(page));
+    const body = await responseJson(fetchImpl, url.href, token, workflow, sleepImpl);
+    if (!body || !Number.isSafeInteger(body.total_count) || body.total_count < 0
+      || !Array.isArray(body.workflow_runs) || body.workflow_runs.length > PAGE_SIZE) {
+      fail(`${workflow} runs response is malformed`);
+    }
+    if (expectedTotal == null) expectedTotal = body.total_count;
+    if (body.total_count !== expectedTotal) fail(`${workflow} runs changed during pagination; inspect again`);
+    runs.push(...body.workflow_runs);
+    if (runs.length > expectedTotal) fail(`${workflow} runs response exceeded total_count`);
+    if (runs.length === expectedTotal) break;
+    if (body.workflow_runs.length < PAGE_SIZE) fail(`${workflow} runs response ended before total_count`);
+    if (page === 10) fail(`${workflow} runs exceed the 1000-run API search window; inspect manually`);
+  }
+  const exactRuns = runs.filter((run) => run && run.path === `.github/workflows/${workflow}`
+    && run.head_sha === sourceCommit && run.head_branch === 'main'
+    && ['push', 'workflow_dispatch'].includes(run.event));
+  for (const run of exactRuns) {
+    if (!Number.isSafeInteger(run.id) || run.id <= 0 || !Number.isSafeInteger(run.run_attempt) || run.run_attempt <= 0) {
+      fail(`${workflow} run identity is malformed`);
+    }
+  }
+  function attemptTime(run) {
+    const values = [run.updated_at, ...(run.run_started_at == null ? [] : [run.run_started_at])];
+    if (values.some((value) => typeof value !== 'string'
+      || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/u.test(value)
+      || !Number.isFinite(Date.parse(value)))) {
+      fail(`${workflow} run ${run.id} attempt timestamp is missing or malformed`);
+    }
+    return Math.max(...values.map((value) => Date.parse(value)));
+  }
+  function blockerPriority(run) {
+    if (run.status !== 'completed') return 3;
+    if (run.conclusion === 'skipped' && run.event === 'push') return 0;
+    return run.conclusion === 'success' ? 1 : 4;
+  }
+  // A rerun retains its old run ID. Use attempt activity, and conservatively
+  // prefer a blocker if GitHub's second-resolution timestamps are tied.
+  for (const run of exactRuns) attemptTime(run);
+  exactRuns.sort((a, b) => attemptTime(b) - attemptTime(a)
+    || blockerPriority(b) - blockerPriority(a) || b.id - a.id);
+  const base = { ...requirement, runs: exactRuns };
+  for (const run of exactRuns) {
+    if (run.status === 'completed' && run.conclusion === 'success') {
+      const jobs = await loadExactAttemptJobs({ repository, token, run, workflow, fetchImpl, sleepImpl });
+      if (hasSuccessfulRequiredJob(jobs, run, requirement.requiredJob)) return { ...base, state: 'ready', run };
+      const skippedAutomatic = run.event === 'push' && (jobs.length === 0
+        || jobs.every((job) => job.status === 'completed' && job.conclusion === 'skipped'));
+      if (!skippedAutomatic) return { ...base, state: 'failed', run, reason: `required job ${requirement.requiredJob} did not succeed` };
+    } else if (['queued', 'in_progress', 'waiting', 'pending', 'requested'].includes(run.status) && run.conclusion == null) {
+      return { ...base, state: 'pending', run };
+    } else if (run.status === 'completed' && run.conclusion === 'skipped' && run.event === 'push') {
+      // The workflow's release-message filter intentionally skipped an ordinary fix.
+    } else if (run.status === 'completed' && typeof run.conclusion === 'string') {
+      return { ...base, state: 'failed', run, reason: `workflow concluded ${run.conclusion}` };
+    } else {
+      fail(`${workflow} run ${run.id} has an unknown status; inspect manually`);
+    }
+  }
+  return { ...base, state: 'missing' };
 }

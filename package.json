@@ -30,11 +30,15 @@
     "test:release-candidate": "node --test scripts/ci/resolve-release-candidate.test.mjs",
     "test:release-repository-settings": "node --test scripts/ci/check-release-repository-settings.test.mjs",
     "test:release-workflows": "node --test scripts/ci/release-workflow-behavior.test.mjs scripts/ci/release-cli-preflight.test.mjs",
-    "check:all": "pnpm check:i18n && pnpm check:file-size && pnpm check:workflow-yaml && pnpm check:npm-publish-metadata && pnpm test:npm-publish-metadata && pnpm test:pretag-readiness && pnpm test:release-candidate && pnpm test:release-repository-settings && pnpm test:release-workflows",
+    "check:all": "pnpm check:i18n && pnpm check:file-size && pnpm check:workflow-yaml && pnpm check:npm-publish-metadata && pnpm test:npm-publish-metadata && pnpm test:pretag-readiness && pnpm test:release-candidate && pnpm test:release-repository-settings && pnpm test:release-workflows && pnpm check:test-paths && pnpm test:test-paths && pnpm test:release-resume",
     "verify": "pnpm check:tauri-versions && pnpm audit:prod:high && pnpm test:run && pnpm build && cd apps/desktop/src-tauri && cargo test",
     "changeset": "changeset",
     "version-packages": "changeset version && node scripts/sync-version.js",
-    "release": "pnpm build && pnpm test:run && pnpm changeset publish"
+    "release": "pnpm build && pnpm test:run && pnpm changeset publish",
+    "check:test-paths": "node scripts/ci/check-test-paths.mjs",
+    "test:test-paths": "node --test scripts/ci/check-test-paths.test.mjs apps/desktop/test/fixture-paths.test.mjs",
+    "release:resume": "node scripts/ci/release-resume.mjs",
+    "test:release-resume": "node --test scripts/ci/release-http.test.mjs scripts/ci/release-readiness-state.test.mjs scripts/ci/release-resume.test.mjs"
   },
   "devDependencies": {
     "@changesets/cli": "^2.29.8",

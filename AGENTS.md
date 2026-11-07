@@ -98,6 +98,8 @@ cd apps/desktop/src-tauri && cargo test --locked
 
 Pick the smallest command set that actually verifies the changed surface area, but do not skip verification entirely.
 
+For new filesystem-based tests, reuse the shared ESM fixture and Rust symlink helpers described in [Portable test paths and symlinks](docs/test-path-helpers.md). Keep traversal/security checks and exact serialized-path contracts intact; document a local source-guard exception when literal spelling is the behavior under test. Run `pnpm check:test-paths` and `pnpm test:test-paths`.
+
 ### D. Desktop self-test
 
 For desktop-, Tauri-, runtime-, history-, settings-, notifications-, or other app-facing changes, self-test through the running app before closing the task.

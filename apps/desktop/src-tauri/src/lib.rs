@@ -1,6 +1,9 @@
 #![allow(dead_code)]
 #![allow(clippy::too_many_arguments)]
 
+#[cfg(test)]
+mod test_support;
+
 mod agent_home;
 mod agent_profile;
 mod analytics;

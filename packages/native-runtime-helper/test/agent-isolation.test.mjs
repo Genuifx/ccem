@@ -7,9 +7,14 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 import { createCodexExecutableFixture } from './codex-executable-fixture.mjs';
+import { withCodexFixtureCleanup } from './codex-fixture-lifecycle.mjs';
 
 const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem helper isolation '));
-after(() => fs.rm(temporary, { recursive: true, force: true }));
+const retainedFixtures = new Set();
+after(async () => {
+  assert.equal(retainedFixtures.size, 0, `Cleanup unproven; retained ${temporary}: ${[...retainedFixtures].join(', ')}`);
+  await fs.rm(temporary, { recursive: true, force: true });
+});
 const helper = path.join(temporary, 'helper.mjs');
 await build({
   entryPoints: [fileURLToPath(new URL('../src/index.ts', import.meta.url))],
@@ -18,6 +23,7 @@ await build({
 const executable = await createCodexExecutableFixture(temporary, `
   const fs = require('node:fs');
   fs.writeFileSync(process.env.CCEM_ISOLATION_CAPTURE, JSON.stringify({
+    pid: process.pid, ppid: process.ppid,
     args: process.argv.slice(2),
     home: process.env.CODEX_HOME, sqlite: process.env.CODEX_SQLITE_HOME,
     isolated: process.env.CCEM_CODEX_ISOLATED,
@@ -29,24 +35,19 @@ const executable = await createCodexExecutableFixture(temporary, `
   process.stdout.write(JSON.stringify({ type: 'thread.started', thread_id: '11111111-2222-3333-4444-555555555555' }) + '\\n');
   process.stdout.write(JSON.stringify({ type: 'turn.started' }) + '\\n');
   process.stdout.write(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 0, cached_input_tokens: 0, output_tokens: 0 } }) + '\\n');
+  if (process.env.CCEM_FIXTURE_EXIT_GATE) {
+    const timer = setInterval(() => {
+      if (fs.existsSync(process.env.CCEM_FIXTURE_EXIT_GATE)) clearInterval(timer);
+    }, 10);
+  }
 `);
 
-async function stopHelper(child, closed) {
-  const wait = async () => {
-    let timer;
-    try {
-      return await Promise.race([
-        closed.then(() => true),
-        new Promise((resolve) => { timer = setTimeout(() => resolve(false), 2000); }),
-      ]);
-    } finally {
-      clearTimeout(timer);
-    }
-  };
-  child.kill('SIGTERM');
-  if (await wait()) return;
-  child.kill('SIGKILL');
-  assert.ok(await wait(), 'helper did not close after forced fixture cleanup');
+async function withFixtureCleanup(options, body) {
+  try { return await withCodexFixtureCleanup(options, body); }
+  catch (error) {
+    if (error.fixtureCleanupIncomplete) retainedFixtures.add(options.capture);
+    throw error;
+  }
 }
 
 for (const selectedApiKey of [undefined, 'ccem-selected-key']) {
@@ -68,7 +69,7 @@ for (const selectedApiKey of [undefined, 'ccem-selected-key']) {
     let stderr = '';
     child.stdout.on('data', (data) => { stdout += data; });
     child.stderr.on('data', (data) => { stderr += data; });
-    try {
+    await withFixtureCleanup({ child, closed, capture, output: () => ({ stdout, stderr }) }, async () => {
       child.stdin.write(JSON.stringify({
         type: 'init', provider: 'codex', env_name: 'test', working_dir: temporary,
         perm_mode: 'safe', initial_prompt: 'fixture prompt', codex_path: executable,
@@ -93,9 +94,7 @@ for (const selectedApiKey of [undefined, 'ccem-selected-key']) {
       assert.equal(captured.accessToken, undefined);
       assert.equal(captured.hostCredentials, undefined);
       assert.equal(captured.apiKey, selectedApiKey);
-    } finally {
-      await stopHelper(child, closed);
-    }
+    });
   });
 }
 
@@ -122,7 +121,7 @@ for (const isolated of [false, true]) {
     let stderr = '';
     child.stdout.on('data', (data) => { stdout += data; });
     child.stderr.on('data', (data) => { stderr += data; });
-    try {
+    await withFixtureCleanup({ child, closed, capture, output: () => ({ stdout, stderr }) }, async () => {
       child.stdin.write(JSON.stringify({
         type: 'init', provider: 'codex', env_name: 'test', working_dir: temporary,
         perm_mode: 'safe', codex_path: executable,
@@ -152,8 +151,56 @@ for (const isolated of [false, true]) {
       assert.equal(captured.accessToken, isolated ? undefined : 'official-access');
       assert.equal(captured.oauth, undefined);
       assert.equal(captured.hostCredentials, undefined);
-    } finally {
-      await stopHelper(child, closed);
-    }
+    });
   });
 }
+
+
+test('real SDK cleanup waits for fixture exit after capture and turn.completed', async (t) => {
+  const capture = path.join(temporary, 'delayed-capture.json');
+  const gate = path.join(temporary, 'release-delayed-fixture');
+  const child = spawn(process.execPath, [helper], {
+    cwd: temporary, stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, CCEM_AGENT_HOME: path.join(temporary, 'delayed-agents'),
+      CCEM_ISOLATION_CAPTURE: capture, CCEM_FIXTURE_EXIT_GATE: gate, CCEM_CODEX_ISOLATED: '1' },
+  });
+  const closed = new Promise((resolve) => child.once('close', resolve));
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (data) => { stdout += data; });
+  child.stderr.on('data', (data) => { stderr += data; });
+  let finished = false;
+  const running = withFixtureCleanup({ child, closed, capture, output: () => ({ stdout, stderr }) }, async () => {
+    child.stdin.write(JSON.stringify({ type: 'init', provider: 'codex', env_name: 'test',
+      working_dir: temporary, perm_mode: 'safe', initial_prompt: 'fixture prompt', codex_path: executable }) + '\n');
+  }).then(() => ({ error: null }), (error) => ({ error })).then((result) => { finished = true; return result; });
+  t.after(async () => {
+    await fs.writeFile(gate, 'release');
+    const result = await running;
+    if (result.error) throw result.error;
+  });
+  let captured;
+  for (let attempt = 0; attempt < 150; attempt++) {
+    try { captured = JSON.parse(await fs.readFile(capture, 'utf8')); break; }
+    catch (error) { if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error; }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.ok(captured, `${stdout}\n${stderr}`);
+  let completed = false;
+  for (let attempt = 0; attempt < 150; attempt++) {
+    completed = stdout.split('\n').slice(0, -1).filter(Boolean).some((line) => {
+      const event = JSON.parse(line);
+      return event.type === 'event' && event.payload?.type === 'lifecycle' && event.payload.stage === 'turn_completed';
+    });
+    if (completed) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.ok(completed, `Helper never observed turn.completed: ${stdout}\n${stderr}`);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(finished, false, 'fixture capture and turn.completed must not release cleanup');
+  assert.doesNotThrow(() => process.kill(captured.pid, 0));
+  await fs.writeFile(gate, 'release');
+  const result = await running;
+  if (result.error) throw result.error;
+  assert.throws(() => process.kill(captured.pid, 0), { code: 'ESRCH' });
+});

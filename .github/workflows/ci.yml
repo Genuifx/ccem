@@ -76,6 +76,12 @@ jobs:
           node scripts/hermes/check-release.mjs
           node --test scripts/hermes/release-contract.test.mjs
 
+      - name: Verify portable test helpers
+        run: pnpm check:test-paths && pnpm test:test-paths
+
+      - name: Verify non-publishing release recovery
+        run: pnpm test:pretag-readiness && pnpm test:release-resume
+
       - name: Run tests
         # Collect downstream platform failures in the same run; any failure still fails this step.
         run: pnpm -r --no-bail test:run
