@@ -53,6 +53,16 @@ describe('presets', () => {
       expect(ENV_PRESETS.OpenRouter).toBeDefined();
     });
 
+    it('should have TeaPotRouter preset with correct structure', () => {
+      expect(ENV_PRESETS.TeaPotRouter).toBeDefined();
+      expect(ENV_PRESETS.TeaPotRouter.ANTHROPIC_BASE_URL).toBe('https://api.teapotrouter.com');
+      expect(ENV_PRESETS.TeaPotRouter.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5-5');
+      expect(ENV_PRESETS.TeaPotRouter.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-sonnet-5-5');
+      expect(ENV_PRESETS.TeaPotRouter.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-haiku-4-5');
+      expect(ENV_PRESETS.TeaPotRouter.ANTHROPIC_MODEL).toBeDefined();
+      expect(ENV_PRESET_METADATA.TeaPotRouter.credentialUrl).toContain('teapotrouter.com');
+    });
+
     it('should keep highlighted provider presets aligned with official defaults', () => {
       expect(ENV_PRESETS.KimiCodePlan.ANTHROPIC_BASE_URL).toBe('https://api.kimi.com/coding/');
       expect(ENV_PRESETS.KimiCodePlan.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('k3.1-pro[1m]');

@@ -66,6 +66,13 @@ export const ENV_PRESETS: Record<
     ANTHROPIC_DEFAULT_HAIKU_MODEL: '~anthropic/claude-haiku-latest',
     ANTHROPIC_MODEL: 'opus'
   },
+  'TeaPotRouter': {
+    ANTHROPIC_BASE_URL: 'https://api.teapotrouter.com',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-5-5',
+    ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-5-5',
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5',
+    ANTHROPIC_MODEL: 'opus'
+  },
   'Ollama': {
     ANTHROPIC_BASE_URL: 'http://localhost:11434',
     ANTHROPIC_DEFAULT_OPUS_MODEL: 'gemma4:31b',
@@ -129,6 +136,11 @@ export const ENV_PRESET_METADATA: Record<string, EnvPresetMetadata> = {
     displayName: { zh: 'OpenRouter', en: 'OpenRouter' },
     description: { zh: 'OpenRouter Anthropic 兼容入口', en: 'OpenRouter Anthropic-compatible routing' },
     credentialUrl: 'https://openrouter.ai/settings/keys',
+  },
+  'TeaPotRouter': {
+    displayName: { zh: 'TeaPotRouter', en: 'TeaPotRouter' },
+    description: { zh: 'TeaPotRouter Claude Code API 入口', en: 'TeaPotRouter Claude Code API endpoint' },
+    credentialUrl: 'https://teapotrouter.com/dashboard',
   },
   'Ollama': {
     displayName: { zh: 'Ollama', en: 'Ollama' },
