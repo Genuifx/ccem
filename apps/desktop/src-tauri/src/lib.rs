@@ -3,6 +3,7 @@
 
 mod agent_home;
 mod agent_profile;
+mod agy_history;
 mod analytics;
 mod app_update_engine;
 mod app_updates;

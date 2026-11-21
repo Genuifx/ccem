@@ -1,7 +1,8 @@
 // apps/desktop/src-tauri/src/analytics.rs
 //
-// Native JSONL scanner for Claude, Codex, OpenCode, and DSH usage.
+// Native JSONL scanner for Claude, Codex, Antigravity (agy), OpenCode, and DSH usage.
 
+use crate::agy_history;
 use crate::dsh_history;
 use crate::opencode;
 use crate::{agent_home, config};
@@ -628,9 +629,24 @@ fn get_model_price<'a>(
         return Some(p);
     }
 
+    // Strip Antigravity/CLI effort suffixes (e.g. `gemini-3.1-pro-high` -> `gemini-3.1-pro`)
+    // for pricing lookup while keeping the full model ID intact for reporting.
+    let effort_base = ["-xhigh", "-high", "-medium", "-low", "-max"]
+        .iter()
+        .find_map(|suffix| normalized.strip_suffix(suffix));
+    if let Some(base) = effort_base {
+        if let Some(p) = prices.get(base) {
+            return Some(p);
+        }
+    }
+
     for (key, value) in prices {
         let norm_key = normalize_model_name(key);
-        if key.contains(&normalized) || normalized.contains(&norm_key) {
+        if key.contains(&normalized)
+            || normalized.contains(&norm_key)
+            || effort_base
+                .is_some_and(|base| key.contains(base) || base.contains(&norm_key))
+        {
             return Some(value);
         }
     }
@@ -696,6 +712,7 @@ fn calculate_cost_or_zero(
 enum UsageSource {
     Claude,
     Codex,
+    Agy,
 }
 
 #[derive(Debug, Clone)]
@@ -708,17 +725,33 @@ struct JsonlDiscovery {
     files: Vec<DiscoveredFile>,
     claude_complete: bool,
     codex_complete: bool,
+    agy_complete: bool,
 }
 
-fn discover_jsonl_files(codex_home: &Path) -> JsonlDiscovery {
+fn discover_jsonl_files(codex_home: &Path, agy_home: &Path) -> JsonlDiscovery {
     let (mut files, claude_complete) = discover_claude_jsonl_files();
     let (codex_files, codex_complete) = discover_codex_jsonl_files(codex_home);
+    let (agy_files, agy_complete) = discover_agy_jsonl_files(agy_home);
     files.extend(codex_files);
+    files.extend(agy_files);
     JsonlDiscovery {
         files,
         claude_complete,
         codex_complete,
+        agy_complete,
     }
+}
+
+fn discover_agy_jsonl_files(agy_home: &Path) -> (Vec<DiscoveredFile>, bool) {
+    let (paths, complete) = agy_history::discover_agy_transcript_files(agy_home);
+    let files = paths
+        .into_iter()
+        .map(|path| DiscoveredFile {
+            path,
+            source: UsageSource::Agy,
+        })
+        .collect();
+    (files, complete)
 }
 
 /// Read both profiles; aggregation never prepares or migrates agent homes.
@@ -1157,6 +1190,116 @@ fn parse_codex_jsonl_reader<R: BufRead>(
 }
 
 // ============================================================================
+// Antigravity (agy) JSONL parsing
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+struct AgyJsonlLine {
+    #[serde(rename = "type")]
+    entry_type: Option<String>,
+    created_at: Option<String>,
+    model: Option<String>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+}
+
+/// Shared per-line Antigravity (`agy`) accumulator.
+/// Each `PLANNER_RESPONSE` step records per-request (non-cumulative) token
+/// counts where `input_tokens` is uncached input and `cache_read_tokens` is
+/// disjoint cached input.
+fn accumulate_agy_line(
+    entries: &mut Vec<CacheEntry>,
+    line: &str,
+    prices: &HashMap<String, ModelPrice>,
+) {
+    if line.trim().is_empty() {
+        return;
+    }
+
+    let parsed: AgyJsonlLine = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(_) => return,
+    };
+
+    if parsed.entry_type.as_deref() != Some("PLANNER_RESPONSE") {
+        return;
+    }
+
+    let input_tokens = parsed.input_tokens.unwrap_or(0);
+    let output_tokens = parsed.output_tokens.unwrap_or(0);
+    let cache_read_tokens = parsed.cache_read_tokens.unwrap_or(0);
+    let cache_creation_tokens = 0;
+
+    if input_tokens == 0 && output_tokens == 0 && cache_read_tokens == 0 {
+        return;
+    }
+
+    let model = parsed
+        .model
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let cost = calculate_cost_or_zero(
+        &model,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+        prices,
+    );
+
+    let timestamp = parsed
+        .created_at
+        .as_deref()
+        .and_then(normalize_agy_timestamp)
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+
+    entries.push(CacheEntry {
+        timestamp,
+        model,
+        environment: Some(agy_history::AGY_NATIVE_ENV_NAME.to_string()),
+        usage: CacheUsage {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+            cost,
+        },
+    });
+}
+
+/// Normalize Antigravity step timestamps to canonical RFC3339 while rejecting Go zero-times.
+fn normalize_agy_timestamp(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.starts_with("0001-01-01") {
+        return None;
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        return Some(dt.to_rfc3339());
+    }
+    if let Some((date_part, rest)) = trimmed.split_once(' ') {
+        let candidate = format!("{date_part}T{rest}");
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&candidate) {
+            return Some(dt.to_rfc3339());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+fn parse_agy_jsonl_reader<R: BufRead>(
+    reader: R,
+    prices: &HashMap<String, ModelPrice>,
+) -> CacheStats {
+    let mut entries = Vec::new();
+    for line in reader.lines().map_while(Result::ok) {
+        accumulate_agy_line(&mut entries, &line, prices);
+    }
+    CacheStats { entries }
+}
+
+// ============================================================================
 // Byte-level JSONL parsing: full + append-aware incremental share one core
 // ============================================================================
 
@@ -1219,6 +1362,7 @@ fn parse_jsonl_tail(
                 UsageSource::Codex => {
                     accumulate_codex_line(&mut codex_state, &mut entries, line, prices)
                 }
+                UsageSource::Agy => accumulate_agy_line(&mut entries, line, prices),
             }
         }
         line_start = index + 1;
@@ -1328,9 +1472,10 @@ fn source_aware_entry(
     let source_name = match source {
         UsageSource::Claude => SOURCE_CLAUDE,
         UsageSource::Codex => SOURCE_CODEX,
+        UsageSource::Agy => SOURCE_AGY,
     };
     let rollup = CacheRollup::from_entries(source_name, &stats.entries);
-    if source == UsageSource::Codex {
+    if matches!(source, UsageSource::Codex | UsageSource::Agy) {
         stats.entries.clear();
     }
     CacheFileEntry {
@@ -1340,12 +1485,12 @@ fn source_aware_entry(
         parse_offset,
         last_line_complete,
         codex_state: match source {
-            UsageSource::Claude => None,
             UsageSource::Codex => Some(codex_state.unwrap_or_default()),
+            UsageSource::Claude | UsageSource::Agy => None,
         },
         claude_state: match source {
             UsageSource::Claude => Some(claude_state.unwrap_or_default()),
-            UsageSource::Codex => None,
+            UsageSource::Codex | UsageSource::Agy => None,
         },
         append_anchor: None,
         revision: None,
@@ -1443,7 +1588,7 @@ fn incremental_refresh_entry(
         discovered.source,
     );
 
-    if discovered.source == UsageSource::Codex {
+    if matches!(discovered.source, UsageSource::Codex | UsageSource::Agy) {
         let mut accumulator = RollupAccumulator::from_rollup(&cached.rollup);
         accumulator.add(&entry.rollup);
         entry.rollup = accumulator.finish();
@@ -1898,6 +2043,38 @@ fn retain_unseen_local_log_entries(
     }
 }
 
+/// Retain previously cached Antigravity transcripts that disappeared from
+/// disk (retention cleanup or transient dir miss), EXCEPT when a sibling
+/// transcript (`transcript.jsonl` <-> `transcript_full.jsonl`) for the same
+/// conversation logs directory is already present in `next` — preventing
+/// permanent 2x double-counting on compact/full transitions.
+fn retain_unseen_agy_log_entries(
+    existing: &CacheFile,
+    next: &mut HashMap<String, CacheFileEntry>,
+) {
+    let seen_logs_dirs: HashSet<PathBuf> = next
+        .keys()
+        .filter(|path| detect_source_from_path(path) == Some(SOURCE_AGY))
+        .filter_map(|path| Path::new(path).parent().map(Path::to_path_buf))
+        .collect();
+
+    for (path, entry) in &existing.files {
+        if detect_source_from_path(path) != Some(SOURCE_AGY) {
+            continue;
+        }
+        if next.contains_key(path) {
+            continue;
+        }
+        if Path::new(path)
+            .parent()
+            .is_some_and(|dir| seen_logs_dirs.contains(dir))
+        {
+            continue;
+        }
+        next.insert(path.clone(), entry.clone());
+    }
+}
+
 fn should_write_usage_cache(
     desktop_cache_exists: bool,
     existing: &CacheFile,
@@ -2004,7 +2181,10 @@ fn refresh_usage_cache() -> CacheFile {
 fn refresh_usage_cache_locked() -> CacheFile {
     let prices = load_model_prices();
     let codex_isolated = agent_home::codex_isolated();
-    let discovery = discover_jsonl_files(&agent_home::codex_home_for_mode(codex_isolated));
+    let discovery = discover_jsonl_files(
+        &agent_home::codex_home_for_mode(codex_isolated),
+        &agent_home::agy_home(),
+    );
     let mut existing_cache = read_usage_cache();
     let desktop_cache_exists = usage_cache_path().exists() && existing_cache.last_updated.is_some();
     let remapped = dirs::home_dir().is_some_and(|_| {
@@ -2042,10 +2222,10 @@ fn refresh_usage_cache_locked() -> CacheFile {
         new_cache.files.insert(path_str, entry);
     }
 
-    if !discovery.claude_complete || !discovery.codex_complete {
+    if !discovery.claude_complete || !discovery.codex_complete || !discovery.agy_complete {
         eprintln!(
-            "Usage source enumeration incomplete (claude={}, codex={}); unseen local-log entries retained",
-            discovery.claude_complete, discovery.codex_complete
+            "Usage source enumeration incomplete (claude={}, codex={}, agy={}); unseen local-log entries retained",
+            discovery.claude_complete, discovery.codex_complete, discovery.agy_complete
         );
     }
 
@@ -2054,6 +2234,7 @@ fn refresh_usage_cache_locked() -> CacheFile {
     // retain_unseen_local_log_entries.
     retain_unseen_local_log_entries(&existing_cache, SOURCE_CLAUDE, &mut new_cache.files);
     retain_unseen_local_log_entries(&existing_cache, SOURCE_CODEX, &mut new_cache.files);
+    retain_unseen_agy_log_entries(&existing_cache, &mut new_cache.files);
 
     let opencode_result = load_opencode_cache_entries(&prices, &existing_cache);
     for (path_key, entry) in opencode_result.entries {
@@ -2914,6 +3095,12 @@ fn detect_source_from_path(path: &str) -> Option<&'static str> {
     {
         return Some(SOURCE_CODEX);
     }
+    if Path::new(path).starts_with(agent_home::agy_home().join("brain"))
+        || path.contains("/.gemini/antigravity-cli/brain/")
+        || path.contains("\\.gemini\\antigravity-cli\\brain\\")
+    {
+        return Some(SOURCE_AGY);
+    }
     if path.starts_with("opencode://") {
         return Some(SOURCE_OPENCODE);
     }
@@ -3292,20 +3479,21 @@ mod tests {
     use super::{
         aggregate_cache, aggregate_model_breakdown, build_local_opencode_cache_entries,
         cache_files_have_same_meta, calculate_streak, default_prices, detect_source_from_path,
-        dsh_provider_to_environment, extract_date, extract_hour, extract_model_breakdown_bucket,
-        format_week_bucket, full_parse_jsonl, get_file_meta, lock_usage_snapshot,
-        lock_usage_stats_memo, model_price_lookup_count, normalize_usage_source,
-        parse_claude_jsonl_reader, parse_codex_jsonl_reader, parse_opencode_export_stats,
-        parse_opencode_session_items, read_usage_cache_at, read_usage_summary_from,
-        refresh_discovered_entry, reset_model_price_lookup_count, retain_incomplete_source_entries,
-        retain_unseen_local_log_entries, shared_usage_cache, should_reuse_usage_stats,
+        discover_agy_jsonl_files, dsh_provider_to_environment, extract_date, extract_hour,
+        extract_model_breakdown_bucket, format_week_bucket, full_parse_jsonl, get_file_meta,
+        lock_usage_snapshot, lock_usage_stats_memo, model_price_lookup_count,
+        normalize_usage_source, parse_agy_jsonl_reader, parse_claude_jsonl_reader,
+        parse_codex_jsonl_reader, parse_opencode_export_stats, parse_opencode_session_items,
+        read_usage_cache_at, read_usage_summary_from, refresh_discovered_entry,
+        reset_model_price_lookup_count, retain_incomplete_source_entries,
+        retain_unseen_agy_log_entries, retain_unseen_local_log_entries, shared_usage_cache, should_reuse_usage_stats,
         should_write_usage_cache, snapshot_is_fresh, update_global_rollup, usage_cache_path,
         write_json_atomic, write_usage_summary_to, CacheEntry, CacheFile, CacheFileEntry,
         CacheMeta, CacheRollup, CacheRollupBucket, CacheStats, CacheUsage, ClaudeParseState,
         CodexParseState, DiscoveredFile, ModelBreakdownGranularity, ModelPrice, TokenUsageWithCost,
         UsageSource, UsageStats, ANALYTICS_SHADOW_INCREMENTAL, OPENCODE_NATIVE_ENV_NAME,
-        SOURCE_CLAUDE, SOURCE_CODEX, SOURCE_DSH, SOURCE_OPENCODE, TEST_SNAPSHOT_REFRESH,
-        USAGE_CACHE_VERSION, USAGE_SUMMARY_VERSION,
+        SOURCE_AGY, SOURCE_CLAUDE, SOURCE_CODEX, SOURCE_DSH, SOURCE_OPENCODE,
+        TEST_SNAPSHOT_REFRESH, USAGE_CACHE_VERSION, USAGE_SUMMARY_VERSION,
     };
     use chrono::{Datelike, Local, TimeZone};
     use std::collections::HashMap;
@@ -6058,5 +6246,271 @@ mod tests {
     fn normalize_usage_source_accepts_agy() {
         assert_eq!(normalize_usage_source(Some("agy")).unwrap(), Some("agy"));
         assert_eq!(normalize_usage_source(Some("AGY")).unwrap(), Some("agy"));
+    }
+
+    #[test]
+    fn agy_jsonl_parses_planner_responses_and_skips_other_steps() {
+        let content = [
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-21T03:52:10Z","content":"hi"}"#,
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-21T03:52:11Z","model":"gemini-4-neon-high","input_tokens":13470,"cache_read_tokens":0,"output_tokens":115,"content":"hello"}"#,
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"RUNNING","created_at":"2026-11-21T03:52:12Z","content":"tool output"}"#,
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-21T03:52:15Z","model":"gemini-4-neon-high","input_tokens":2000,"cache_read_tokens":13471,"output_tokens":250,"content":"done"}"#,
+        ]
+        .join("\n");
+
+        let stats = parse_agy_jsonl_reader(content.as_bytes(), &default_prices());
+        assert_eq!(stats.entries.len(), 2);
+        assert_eq!(stats.entries[0].model, "gemini-4-neon-high");
+        assert_eq!(stats.entries[0].environment.as_deref(), Some("Antigravity"));
+        assert_eq!(stats.entries[0].usage.input_tokens, 13470);
+        assert_eq!(stats.entries[0].usage.cache_read_tokens, 0);
+        assert_eq!(stats.entries[0].usage.output_tokens, 115);
+
+        assert_eq!(stats.entries[1].usage.input_tokens, 2000);
+        assert_eq!(stats.entries[1].usage.cache_read_tokens, 13471);
+        assert_eq!(stats.entries[1].usage.output_tokens, 250);
+    }
+
+    #[test]
+    fn agy_incremental_append_and_prefix_rewrite_match_full_parse() {
+        let dir = std::env::temp_dir().join(format!(
+            "ccem-agy-analytics-inc-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let logs_dir = dir
+            .join("brain")
+            .join("conv-1")
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+        let path = logs_dir.join("transcript.jsonl");
+
+        let line1 = r#"{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-21T03:52:11Z","model":"gemini-4-neon-high","input_tokens":1000,"cache_read_tokens":0,"output_tokens":100}"#;
+        let line2 = r#"{"step_index":3,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-21T03:52:15Z","model":"gemini-4-neon-high","input_tokens":500,"cache_read_tokens":1001,"output_tokens":80}"#;
+        fs::write(&path, format!("{line1}\n")).unwrap();
+
+        let discovered = discovered_at(&path, UsageSource::Agy);
+        let prices = default_prices();
+        let meta1 = CacheMeta {
+            mtime: 1_000.0,
+            size: fs::metadata(&path).unwrap().len(),
+        };
+        let entry1 = refresh_discovered_entry(None, &discovered, meta1, &prices);
+        assert!(entry1.stats.entries.is_empty()); // compact rollup-only storage
+        assert_eq!(entry1.rollup.buckets.len(), 1);
+        assert_eq!(entry1.rollup.buckets[0].source, SOURCE_AGY);
+        assert_eq!(entry1.rollup.buckets[0].usage.input_tokens, 1000);
+
+        // Append line2 -> incremental refresh (shadow-compared against full parse in cfg(test))
+        fs::write(&path, format!("{line1}\n{line2}\n")).unwrap();
+        let meta2 = CacheMeta {
+            mtime: 2_000.0,
+            size: fs::metadata(&path).unwrap().len(),
+        };
+        let entry2 = refresh_discovered_entry(Some(&entry1), &discovered, meta2, &prices);
+        assert_eq!(entry2.rollup.buckets[0].usage.input_tokens, 1500);
+        assert_eq!(entry2.rollup.buckets[0].usage.cache_read_tokens, 1001);
+        assert_eq!(entry2.rollup.buckets[0].usage.output_tokens, 180);
+
+        // Rewrite prefix (compaction) -> append_anchor detects change & falls back to full re-parse
+        let compacted = r#"{"step_index":0,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-21T03:55:00Z","model":"gemini-4-neon-high","input_tokens":777,"cache_read_tokens":222,"output_tokens":33}"#;
+        fs::write(&path, format!("{compacted}\n{line2}\n{line2}\n")).unwrap();
+        let meta3 = CacheMeta {
+            mtime: 3_000.0,
+            size: fs::metadata(&path).unwrap().len(),
+        };
+        let entry3 = refresh_discovered_entry(Some(&entry2), &discovered, meta3, &prices);
+        assert_eq!(entry3.rollup.buckets[0].usage.input_tokens, 777 + 500 + 500);
+        assert_eq!(
+            entry3.rollup.buckets[0].usage.cache_read_tokens,
+            222 + 1001 + 1001
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agy_pricing_handles_effort_suffix_and_unpriced_subscription_models() {
+        let mut prices = HashMap::new();
+        prices.insert(
+            "gemini-3.1-pro".to_string(),
+            ModelPrice {
+                input_cost_per_token: 2e-6,
+                output_cost_per_token: 12e-6,
+                cache_read_input_token_cost: Some(0.2e-6),
+                cache_creation_input_token_cost: None,
+            },
+        );
+
+        // Effort suffix stripped for lookup -> priced cleanly
+        let priced_line = r#"{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-21T03:52:11Z","model":"gemini-3.1-pro-high","input_tokens":1000,"cache_read_tokens":500,"output_tokens":100}"#;
+        // Unknown/subscription-only model -> cost 0, marked unpriced in aggregate_cache
+        let unpriced_line = r#"{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-21T03:52:12Z","model":"gemini-4-neon-high","input_tokens":2000,"cache_read_tokens":3000,"output_tokens":200}"#;
+
+        let stats = parse_agy_jsonl_reader(
+            format!("{priced_line}\n{unpriced_line}\n").as_bytes(),
+            &prices,
+        );
+        let rollup = CacheRollup::from_entries(SOURCE_AGY, &stats.entries);
+        let mut files = HashMap::new();
+        files.insert(
+            "/Users/test/.gemini/antigravity-cli/brain/c1/.system_generated/logs/transcript.jsonl"
+                .to_string(),
+            CacheFileEntry {
+                meta: CacheMeta {
+                    mtime: 1.0,
+                    size: 100,
+                },
+                stats: CacheStats::default(),
+                rollup,
+                parse_offset: 100,
+                last_line_complete: true,
+                codex_state: None,
+                claude_state: None,
+                append_anchor: None,
+                revision: None,
+            },
+        );
+        let cache = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files,
+            global_rollup: CacheRollup::default(),
+            last_updated: None,
+        };
+
+        let agy_stats = aggregate_cache(&cache, Some(SOURCE_AGY), &prices);
+        assert_eq!(agy_stats.total.input_tokens, 3000);
+        assert_eq!(agy_stats.total.cache_read_tokens, 3500);
+        assert_eq!(agy_stats.total.output_tokens, 300);
+        assert!(agy_stats.total.cost > 0.0);
+        assert_eq!(agy_stats.total.unpriced_tokens, 5200);
+        assert!(agy_stats.total.cost_incomplete);
+        assert_eq!(
+            agy_stats.by_model.get("gemini-3.1-pro-high").unwrap().unpriced_tokens,
+            0
+        );
+        assert_eq!(
+            agy_stats.by_model.get("gemini-4-neon-high").unwrap().unpriced_tokens,
+            5200
+        );
+    }
+
+    #[test]
+    fn detect_source_from_path_recognizes_agy_and_discovers_subagent_transcripts() {
+        assert_eq!(
+            detect_source_from_path(
+                "/Users/test/.gemini/antigravity-cli/brain/abc/.system_generated/logs/transcript.jsonl"
+            ),
+            Some(SOURCE_AGY)
+        );
+        assert_eq!(
+            detect_source_from_path(
+                r"C:\Users\test\.gemini\antigravity-cli\brain\abc\.system_generated\logs\transcript.jsonl"
+            ),
+            Some(SOURCE_AGY)
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "ccem-agy-analytics-discover-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let main_logs = dir
+            .join("brain")
+            .join("main-1")
+            .join(".system_generated")
+            .join("logs");
+        let sub_logs = dir
+            .join("brain")
+            .join("sub-1")
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&main_logs).unwrap();
+        fs::create_dir_all(&sub_logs).unwrap();
+        fs::write(main_logs.join("transcript.jsonl"), "{}\n").unwrap();
+        fs::write(main_logs.join("transcript_full.jsonl"), "{}\n").unwrap();
+        fs::write(sub_logs.join("transcript_full.jsonl"), "{}\n").unwrap();
+
+        let (files, complete) = discover_agy_jsonl_files(&dir);
+        assert!(complete);
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|f| f.source == UsageSource::Agy));
+        assert!(files
+            .iter()
+            .any(|f| f.path == main_logs.join("transcript.jsonl")));
+        assert!(files
+            .iter()
+            .any(|f| f.path == sub_logs.join("transcript_full.jsonl")));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agy_sibling_compact_full_transition_never_double_counts_and_normalizes_timestamps() {
+        let prices = default_prices();
+        // Go space-separated timestamp normalizes cleanly to RFC3339 (preserving hour bucket);
+        // Go zero-time 0001-01-01 is rejected instead of polluting daily_history.
+        let content = [
+            r#"{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-21 08:57:18.264499+00:00","model":"gemini-4-neon-high","input_tokens":100,"cache_read_tokens":50,"output_tokens":20}"#,
+            r#"{"step_index":2,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"0001-01-01 00:00:00+00:00","model":"gemini-4-neon-high","input_tokens":10,"cache_read_tokens":0,"output_tokens":5}"#,
+        ]
+        .join("\n");
+        let parsed = parse_agy_jsonl_reader(content.as_bytes(), &prices);
+        assert_eq!(parsed.entries.len(), 2);
+        assert_eq!(parsed.entries[0].timestamp, "2026-11-21T08:57:18.264499+00:00");
+        assert!(extract_hour(&parsed.entries[0].timestamp).is_some());
+        assert!(!parsed.entries[1].timestamp.starts_with("0001-01-01"));
+
+        // Sibling dedupe: existing cache had transcript_full.jsonl for conv-1 + transcript.jsonl for conv-2;
+        // next refresh discovers transcript.jsonl for conv-1 (compact appeared) and misses conv-2.
+        let conv1_full = "/Users/test/.gemini/antigravity-cli/brain/conv-1/.system_generated/logs/transcript_full.jsonl".to_string();
+        let conv1_compact = "/Users/test/.gemini/antigravity-cli/brain/conv-1/.system_generated/logs/transcript.jsonl".to_string();
+        let conv2_compact = "/Users/test/.gemini/antigravity-cli/brain/conv-2/.system_generated/logs/transcript.jsonl".to_string();
+
+        let make_entry = |input: u64| CacheFileEntry {
+            meta: CacheMeta { mtime: 1.0, size: 10 },
+            stats: CacheStats::default(),
+            rollup: CacheRollup::from_entries(
+                SOURCE_AGY,
+                &[CacheEntry {
+                    timestamp: "2026-11-21T08:57:18Z".to_string(),
+                    model: "gemini-4-neon-high".to_string(),
+                    environment: Some("Antigravity".to_string()),
+                    usage: CacheUsage {
+                        input_tokens: input,
+                        output_tokens: 10,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                        cost: 0.0,
+                    },
+                }],
+            ),
+            parse_offset: 10,
+            last_line_complete: true,
+            codex_state: None,
+            claude_state: None,
+            append_anchor: None,
+            revision: None,
+        };
+
+        let mut existing_files = HashMap::new();
+        existing_files.insert(conv1_full.clone(), make_entry(100));
+        existing_files.insert(conv2_compact.clone(), make_entry(200));
+        let existing = CacheFile {
+            version: USAGE_CACHE_VERSION,
+            files: existing_files,
+            global_rollup: CacheRollup::default(),
+            last_updated: None,
+        };
+
+        let mut next_files = HashMap::new();
+        next_files.insert(conv1_compact.clone(), make_entry(100));
+
+        retain_unseen_agy_log_entries(&existing, &mut next_files);
+
+        assert!(next_files.contains_key(&conv1_compact));
+        assert!(!next_files.contains_key(&conv1_full), "sibling transcript_full.jsonl must not be retained alongside transcript.jsonl");
+        assert!(next_files.contains_key(&conv2_compact), "unseen distinct conversation must still be retained");
     }
 }

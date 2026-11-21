@@ -2,7 +2,7 @@
 //
 // Conversation history support for both Claude and Codex sources.
 
-use crate::{agent_home, dsh_history, opencode, runtime, session_provenance};
+use crate::{agent_home, agy_history, dsh_history, opencode, runtime, session_provenance};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -870,6 +870,7 @@ fn load_legacy_conversation_detail(
             };
             parse_opencode_conversation_export(&export)
         }
+        SOURCE_AGY => agy_history::load_agy_conversation_detail(session_id),
         _ => Ok((vec![], vec![])),
     }
 }
@@ -1034,7 +1035,10 @@ pub async fn get_session_subagents(
                 Some(s) => s,
                 None => return Ok(empty()),
             };
-        // v1 supports Claude only — Codex/opencode have different sub-agent layouts.
+        if resolved_source == SOURCE_AGY {
+            return agy_history::load_agy_subagents(&session_id, detail_agent_id.as_deref());
+        }
+        // Codex/opencode have different sub-agent layouts.
         if resolved_source != SOURCE_CLAUDE {
             return Ok(empty());
         }
@@ -2286,17 +2290,27 @@ fn collect_history_provenance_records() -> Vec<session_provenance::SessionProven
 }
 
 fn load_agy_history() -> Result<Vec<HistorySession>, String> {
-    let records = match session_provenance::list_records_by_client(SOURCE_AGY) {
-        Ok(records) => records,
-        Err(_) => return Ok(Vec::new()),
-    };
-    let mut sessions = Vec::new();
-    for record in records.values() {
+    let mut sessions = agy_history::load_agy_history()?;
+    let provenance_records = session_provenance::list_records_by_client(SOURCE_AGY).unwrap_or_default();
+    let mut seen_ids: HashSet<String> = HashSet::with_capacity(sessions.len());
+
+    for session in &mut sessions {
+        seen_ids.insert(session.id.clone());
+        if let Some(record) = provenance_records.get(&session.id) {
+            apply_provenance_to_history_session(session, record);
+        }
+    }
+
+    for (session_id, record) in &provenance_records {
+        if seen_ids.contains(session_id) {
+            continue;
+        }
         if let Some(mut session) = history_session_from_provenance_record(SOURCE_AGY, record) {
             apply_provenance_to_history_session(&mut session, record);
             sessions.push(session);
         }
     }
+
     Ok(sessions)
 }
 
@@ -2304,6 +2318,9 @@ fn has_agy_session(session_id: &str) -> bool {
     let trimmed = session_id.trim();
     if trimmed.is_empty() {
         return false;
+    }
+    if agy_history::has_agy_session(trimmed) {
+        return true;
     }
     session_provenance::list_records_by_client(SOURCE_AGY)
         .map(|records| records.contains_key(trimmed))

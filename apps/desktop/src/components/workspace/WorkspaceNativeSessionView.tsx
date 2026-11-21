@@ -4641,7 +4641,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
             onLoadMediaPreview={(filePath) => getWorkspaceMediaPreview(reviewSession.project_dir, filePath)}
             isLive
             onLoadSubagents={
-              session.provider === 'claude' && session.provider_session_id
+              (session.provider === 'claude' || session.provider === 'agy') && session.provider_session_id
                 ? (detailAgentId) =>
                     getSessionSubagents(session.provider_session_id!, session.provider, detailAgentId, session.codex_isolated)
                 : undefined
