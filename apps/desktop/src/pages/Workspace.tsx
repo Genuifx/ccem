@@ -4689,7 +4689,8 @@ export function Workspace({
                     onLoadMediaPreview={(filePath) => getWorkspaceMediaPreview(workspaceReviewWorkingDir || '', filePath)}
                     isLive={workspaceMode !== 'history'}
                     onLoadSubagents={
-                      workspaceReviewSession.provider === 'claude' && workspaceReviewSession.provider_session_id
+                      (workspaceReviewSession.provider === 'claude' || workspaceReviewSession.provider === 'agy')
+                      && workspaceReviewSession.provider_session_id
                         ? (detailAgentId) =>
                             getSessionSubagents(
                               workspaceReviewSession.provider_session_id!,

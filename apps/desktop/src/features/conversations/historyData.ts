@@ -93,6 +93,8 @@ export function normalizeHistorySource(value: unknown): HistorySource | null {
       return 'codex';
     case 'opencode':
       return 'opencode';
+    case 'agy':
+      return 'agy';
     case 'dsh':
       return 'dsh';
     default:

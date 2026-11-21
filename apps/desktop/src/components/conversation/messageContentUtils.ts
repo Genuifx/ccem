@@ -191,6 +191,16 @@ export function getMessageCopyText(
   return '';
 }
 
+function pickString(obj: Record<string, unknown>, ...keys: string[]): string {
+  for (const key of keys) {
+    const val = obj[key];
+    if (typeof val === 'string' && val.length > 0) {
+      return val;
+    }
+  }
+  return '';
+}
+
 export function extractToolSummary(name: string | undefined, input: unknown): string {
   if (!input || typeof input !== 'object') return '';
   const obj = input as Record<string, unknown>;
@@ -198,28 +208,33 @@ export function extractToolSummary(name: string | undefined, input: unknown): st
   switch (name) {
     case 'Read':
     case 'Write':
-    case 'Edit': {
-      const fp = (obj.file_path as string) || (typeof obj.summary === 'string' ? obj.summary : '');
+    case 'Edit':
+    case 'read_file':
+    case 'write_file':
+    case 'edit_file': {
+      const fp = pickString(obj, 'file_path', 'Path', 'path', 'summary');
       if (!fp) return '';
-      const parts = fp.split('/');
+      const parts = fp.split(/[/\\]/);
       return parts.length > 2 ? parts.slice(-2).join('/') : fp;
     }
-    case 'Bash': {
-      const cmd = ((obj.command as string) || (typeof obj.summary === 'string' ? obj.summary : ''));
+    case 'Bash':
+    case 'run_command': {
+      const cmd = pickString(obj, 'toolSummary', 'command', 'CommandLine', 'summary');
       return cmd.length > 60 ? `${cmd.slice(0, 57)}...` : cmd;
     }
     case 'Glob':
     case 'Grep': {
-      const pat = (obj.pattern as string) || (typeof obj.summary === 'string' ? obj.summary : '');
-      return pat || '';
+      return pickString(obj, 'pattern', 'summary');
     }
-    case 'Task': {
-      const desc = (obj.description as string) || (obj.prompt as string) || (typeof obj.summary === 'string' ? obj.summary : '') || '';
+    case 'Task':
+    case 'invoke_subagent': {
+      const desc = pickString(obj, 'Role', 'description', 'prompt', 'Prompt', 'summary');
       return desc.length > 50 ? `${desc.slice(0, 47)}...` : desc;
     }
-    case 'WebFetch': {
-      const url = (obj.url as string) || (typeof obj.summary === 'string' ? obj.summary : '') || '';
-      return url.length > 50 ? `${url.slice(0, 47)}...` : url;
+    case 'WebFetch':
+    case 'search_web': {
+      const target = pickString(obj, 'url', 'query', 'summary');
+      return target.length > 50 ? `${target.slice(0, 47)}...` : target;
     }
     default: {
       for (const val of Object.values(obj)) {
