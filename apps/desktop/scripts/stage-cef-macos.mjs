@@ -310,9 +310,29 @@ async function runtimeCandidatesFromOutDir(targetDir, target, profile) {
     if (error.code === 'ENOENT') return [];
     throw error;
   }
-  return entries
-    .filter((entry) => entry.isDirectory() && entry.name.startsWith('cef-dll-sys-'))
-    .map((entry) => path.join(buildDir, entry.name, 'out', runtimeDirectoryName(target)));
+  const candidates = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    // Cargo <= 1.99: build/cef-dll-sys-<hash>/out/<runtime>
+    if (entry.name.startsWith('cef-dll-sys-')) {
+      candidates.push(path.join(buildDir, entry.name, 'out', runtimeDirectoryName(target)));
+      continue;
+    }
+    // Cargo 1.100 nests one level deeper: build/cef-dll-sys/<hash>/out/<runtime>
+    if (entry.name !== 'cef-dll-sys') continue;
+    let nested;
+    try {
+      nested = await fsp.readdir(path.join(buildDir, entry.name), { withFileTypes: true });
+    } catch (error) {
+      if (error.code === 'ENOENT') continue;
+      throw error;
+    }
+    for (const child of nested) {
+      if (!child.isDirectory()) continue;
+      candidates.push(path.join(buildDir, entry.name, child.name, 'out', runtimeDirectoryName(target)));
+    }
+  }
+  return candidates;
 }
 
 export async function resolveRuntime({

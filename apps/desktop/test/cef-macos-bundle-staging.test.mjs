@@ -197,6 +197,49 @@ test('CEF_PATH resolution accepts one exact pinned runtime and rejects ambiguity
   );
 });
 
+test('resolveRuntime finds the CEF runtime in both Cargo build-dir layouts', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-cef-layout-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const buildDir = path.join(root, 'target', 'aarch64-apple-darwin', 'release', 'build');
+  const legacyRuntime = path.join(buildDir, 'cef-dll-sys-0bd2a3f97f5e2c06', 'out', 'cef_macos_aarch64');
+  const nestedRuntime = path.join(buildDir, 'cef-dll-sys', '52fbdc8db3155069', 'out', 'cef_macos_aarch64');
+
+  // Cargo 1.100 layout only: build/cef-dll-sys/<hash>/out/<runtime>.
+  await createRuntime(nestedRuntime);
+  const expectedFrameworkExecutableSha256 = await cefFileSha256(
+    path.join(nestedRuntime, FRAMEWORK_NAME, 'Chromium Embedded Framework'),
+  );
+  const expectedFrameworkTreeSha256 = await cefDirectoryTreeSha256(
+    path.join(nestedRuntime, FRAMEWORK_NAME),
+  );
+  const nestedResolved = await resolveRuntime({
+    target: 'aarch64-apple-darwin',
+    targetDir: path.join(root, 'target'),
+    profile: 'release',
+    fixtureDir: null,
+    expectedFrameworkExecutableSha256,
+    expectedFrameworkTreeSha256,
+  });
+  assert.equal(nestedResolved.directory, await fs.realpath(nestedRuntime));
+  assert.equal(nestedResolved.version, CEF_FULL_VERSION);
+  assert.equal(nestedResolved.source, 'Cargo OUT_DIR');
+
+  // Both layouts present (e.g. target dir carried over from Cargo <=1.99):
+  // staging stays fail-closed on ambiguity instead of guessing.
+  await createRuntime(legacyRuntime);
+  await assert.rejects(
+    resolveRuntime({
+      target: 'aarch64-apple-darwin',
+      targetDir: path.join(root, 'target'),
+      profile: 'release',
+      fixtureDir: null,
+      expectedFrameworkExecutableSha256,
+      expectedFrameworkTreeSha256,
+    }),
+    /expected exactly one valid CEF 150\.0\.10 runtime from Cargo OUT_DIR; found 2/,
+  );
+});
+
 test('fixture staging is atomic and emits the complete CEF Helper.app layout', {
   skip: process.platform === 'win32' ? 'requires POSIX executable-mode semantics' : false,
 }, async (t) => {
