@@ -1,4 +1,4 @@
-export type WorkspaceComposerProvider = 'claude' | 'codex';
+export type WorkspaceComposerProvider = 'claude' | 'codex' | 'agy';
 
 export interface ComposerCommandDefinition {
   token: string;
@@ -81,6 +81,15 @@ const CODEX_COMMANDS: ComposerCommandDefinition[] = [
   { token: '/version' },
 ];
 
+const AGY_COMMANDS: ComposerCommandDefinition[] = [
+  ...CCEM_COMMANDS,
+  { token: '/compact' },
+  { token: '/help' },
+  { token: '/model' },
+  { token: '/plan' },
+  { token: '/status' },
+];
+
 const CAPABILITIES: Record<WorkspaceComposerProvider, WorkspaceComposerCapabilities> = {
   claude: {
     provider: 'claude',
@@ -96,6 +105,14 @@ const CAPABILITIES: Record<WorkspaceComposerProvider, WorkspaceComposerCapabilit
     planModeKind: 'command_prefix',
     planCommandPrefix: '/plan',
     commands: CODEX_COMMANDS,
+    supportsImages: true,
+    supportsEnvRouting: false,
+  },
+  agy: {
+    provider: 'agy',
+    label: 'Antigravity',
+    planModeKind: 'session_permission',
+    commands: AGY_COMMANDS,
     supportsImages: true,
     supportsEnvRouting: false,
   },

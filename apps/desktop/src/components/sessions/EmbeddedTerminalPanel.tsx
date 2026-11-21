@@ -52,7 +52,9 @@ export function EmbeddedTerminalPanel({
     ? 'OpenCode PTY'
     : activeSession?.client === 'codex'
       ? 'Codex PTY'
-      : 'Claude PTY';
+      : activeSession?.client === 'agy'
+        ? 'Antigravity PTY'
+        : 'Claude PTY';
 
   useEffect(() => {
     activeSessionIdRef.current = activeSessionId;

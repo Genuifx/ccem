@@ -1,4 +1,4 @@
-export type SessionLaunchClient = 'claude' | 'codex' | 'opencode';
+export type SessionLaunchClient = 'claude' | 'codex' | 'opencode' | 'agy';
 
 export interface LaunchSingleSessionInput {
   selectedWorkingDir?: string | null;

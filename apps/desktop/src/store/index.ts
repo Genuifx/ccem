@@ -29,7 +29,7 @@ export interface Environment {
 }
 
 export type ArrangeLayout = 'horizontal2' | 'vertical2' | 'grid4' | 'left_main3';
-export type LaunchClient = 'claude' | 'codex' | 'opencode';
+export type LaunchClient = 'claude' | 'codex' | 'opencode' | 'agy';
 
 /**
  * Lightweight summary published by whichever workspace context (live session,

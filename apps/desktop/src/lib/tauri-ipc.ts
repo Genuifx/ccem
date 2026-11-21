@@ -9,6 +9,7 @@ import type { CronHermesNotification, CronHermesDelivery } from '@/lib/hermes-ip
  */
 
 import type { Environment, Session } from '@/store';
+import type { AgyRuntimeStatus } from '@/lib/agy-runtime';
 import type { ClaudeRuntimeSource, ClaudeRuntimeStatus } from '@/lib/claude-runtime';
 import type {
   BrowserSurfaceAcquireRequest,
@@ -37,7 +38,9 @@ import type {
 export interface TauriCommands {
   get_agent_profiles: [void, AgentProfileStatus[]];
   set_codex_isolation: [{ isolated: boolean }, AgentProfileStatus[]];
-  login_agent_profile: [{ provider: 'claude' | 'codex' }, void];
+  login_agent_profile: [{ provider: 'claude' | 'codex' | 'agy' }, void];
+  get_agy_runtime_status: [void, AgyRuntimeStatus];
+  set_agy_custom_path: [{ path: string | null }, AgyRuntimeStatus];
   get_claude_runtime_status: [{ refresh?: boolean } | void, ClaudeRuntimeStatus];
   set_claude_runtime_source: [{ source: ClaudeRuntimeSource }, ClaudeRuntimeStatus];
   set_claude_runtime_registry: [{ registryUrl: string }, ClaudeRuntimeStatus];
@@ -196,7 +199,7 @@ export interface TauriCommands {
       permMode?: string;
       workingDir?: string;
       resumeSessionId?: string;
-      client?: 'claude' | 'codex' | 'opencode' | null;
+      client?: 'claude' | 'codex' | 'opencode' | 'agy' | null;
       codexIsolated?: boolean | null;
     },
     Session
@@ -207,7 +210,7 @@ export interface TauriCommands {
       permMode?: string | null;
       workingDir?: string | null;
       resumeSessionId?: string | null;
-      client?: 'claude' | 'codex' | 'opencode' | null;
+      client?: 'claude' | 'codex' | 'opencode' | 'agy' | null;
       codexIsolated?: boolean | null;
       launchTraceId?: string | null;
     },
@@ -352,7 +355,7 @@ export interface TauriCommands {
   ];
   create_native_session: [
     {
-      provider: 'claude' | 'codex';
+      provider: 'claude' | 'codex' | 'agy';
       envName: string;
       permMode?: string | null;
       runtimePermMode?: string | null;
@@ -521,7 +524,7 @@ export interface TauriCommands {
   // 使用统计
   get_usage_stats: [
     void | {
-      source?: 'claude' | 'codex' | 'opencode' | null;
+      source?: 'claude' | 'codex' | 'opencode' | 'agy' | null;
       force?: boolean;
     },
     AnalyticsUsageStats
@@ -531,6 +534,7 @@ export interface TauriCommands {
   check_ccem_installed: [void, boolean];
   check_claude_installed: [void, boolean];
   check_codex_installed: [void, boolean];
+  check_agy_installed: [void, boolean];
   check_opencode_installed: [void, boolean];
   check_tmux_installed: [void, boolean];
   get_platform_capabilities: [void, PlatformCapabilities];
@@ -704,6 +708,7 @@ export interface DesktopSettings {
   proxyDebugCodexUpstreamBaseUrl?: string;
   proxyDebugLogMaxBytes?: number;
   proxyDebugRecordMode?: string;
+  agyPath?: string | null;
 }
 
 export interface PetNotificationReadState {
@@ -921,7 +926,7 @@ export interface ManagedSessionSummary {
   last_event_seq?: number | null;
 }
 
-export type NativeProvider = 'claude' | 'codex';
+export type NativeProvider = 'claude' | 'codex' | 'agy';
 
 export type CodexModelMigrationPreflightResult =
   | {
@@ -1401,8 +1406,8 @@ export interface TodoSnapshotItemV1 {
 
 export interface TodoSnapshotV1 {
   version: 1;
-  provider: 'claude' | 'codex';
-  source: 'TodoWrite' | 'TaskCreate' | 'TaskUpdate' | 'TaskList' | 'todo_list';
+  provider: 'claude' | 'codex' | 'agy';
+  source: 'TodoWrite' | 'TaskCreate' | 'TaskUpdate' | 'TaskList' | 'todo_list' | 'plan';
   revision: number;
   items: TodoSnapshotItemV1[];
 }
@@ -1501,7 +1506,7 @@ export type SessionEventPayload =
       type: 'input_operation';
       operation_id: string;
       client_message_ids: string[];
-      provider: 'claude' | 'codex';
+      provider: 'claude' | 'codex' | 'agy';
       stage: 'started' | 'completed' | 'failed' | 'unknown';
       detail: string;
       command_id?: string;
@@ -1510,7 +1515,7 @@ export type SessionEventPayload =
   | {
       type: 'turn_metrics';
       operation_id: string;
-      provider: 'claude' | 'codex';
+      provider: 'claude' | 'codex' | 'agy';
       output_tokens: number;
       elapsed_ms: number;
       generation_ms?: number;
@@ -1518,7 +1523,7 @@ export type SessionEventPayload =
   | {
       type: 'turn_progress';
       operation_id: string;
-      provider: 'claude' | 'codex';
+      provider: 'claude' | 'codex' | 'agy';
       output_tokens: number;
       generation_ms?: number;
     }

@@ -83,7 +83,10 @@ import type { EffortLevel } from '@/components/workspace/ComposerControls';
 import type { PermissionModeName } from '@ccem/core/browser';
 import { nativeCreateFailure, type ComposerSubmitResult } from '@/components/workspace/composerSubmissionResult';
 import { ClaudeRuntimeRequiredDialog } from '@/components/ClaudeRuntimeSettings';
+import { AgyAuthRequiredDialog } from '@/components/AgyRuntimeCard';
 import { isClaudeRuntimeRequiredError } from '@/lib/claude-runtime';
+import { checkAgyInstalled, isAgyAuthRequiredError } from '@/lib/agy-runtime';
+import { AGY_RUNTIME_CHANGED_EVENT } from '@/hooks/useAgyRuntime';
 import {
   buildComposerPromptPreview,
   buildComposerPromptText,
@@ -147,6 +150,7 @@ import {
 import { useWorkspaceSessionDecorations } from '@/components/workspace/useWorkspaceSessionDecorations';
 import { useWorkspaceAnnotations } from '@/components/workspace/useWorkspaceAnnotations';
 import type {
+  NativeProvider,
   NativeSessionSummary,
   SessionEventRecord,
   SessionPromptAnnotation,
@@ -154,6 +158,12 @@ import type {
   WorkspaceCommand,
   WorkspaceGitSnapshot,
 } from '@/lib/tauri-ipc';
+
+function toNativeProvider(source: string | null | undefined): NativeProvider {
+  if (source === 'codex') return 'codex';
+  if (source === 'agy') return 'agy';
+  return 'claude';
+}
 import {
   buildLiveSessionTreeState,
   buildWorkspaceSidebarSessions,
@@ -558,10 +568,12 @@ export function Workspace({
   const [isLoadingMessages, setIsLoadingMessages] = useState(false);
   const isLoadingMessagesRef = useRef(false);
   const [codexInstalled, setCodexInstalled] = useState(false);
+  const [agyInstalled, setAgyInstalled] = useState(false);
   const [opencodeInstalled, setOpenCodeInstalled] = useState(false);
+  const [agyAuthRequired, setAgyAuthRequired] = useState(false);
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceViewMode>('compose');
-  const [composeProvider, setComposeProvider] = useState<'claude' | 'codex'>(
-    launchClient === 'codex' ? 'codex' : 'claude'
+  const [composeProvider, setComposeProvider] = useState<NativeProvider>(
+    launchClient === 'codex' ? 'codex' : launchClient === 'agy' ? 'agy' : 'claude'
   );
   const [composePrompt, setComposePrompt] = useState('');
   const composePromptRef = useRef('');
@@ -1042,12 +1054,19 @@ export function Workspace({
         })
         .catch(() => {});
       checkCodexInstalled().then(setCodexInstalled).catch(() => {});
+      checkAgyInstalled().then(setAgyInstalled).catch(() => {});
       checkOpenCodeInstalled().then(setOpenCodeInstalled).catch(() => {});
       void restoreNativeSessions();
     }, { delayMs: 220, timeoutMs: 1400 });
 
+    const handleAgyRuntimeChanged = () => {
+      checkAgyInstalled().then(setAgyInstalled).catch(() => {});
+    };
+    window.addEventListener(AGY_RUNTIME_CHANGED_EVENT, handleAgyRuntimeChanged);
+
     return () => {
       cancelDeferred();
+      window.removeEventListener(AGY_RUNTIME_CHANGED_EVENT, handleAgyRuntimeChanged);
     };
   }, [checkCodexInstalled, checkOpenCodeInstalled, loadCronTasks, loadInstalledSkills, restoreNativeSessions]);
 
@@ -2162,7 +2181,7 @@ export function Workspace({
   ) => {
     const liveSession = liveEntry?.session;
     let runtimeId = liveSession?.runtime_id;
-    let provider: 'claude' | 'codex' | undefined = liveSession?.provider;
+    let provider: NativeProvider | undefined = liveSession?.provider;
     let status = liveSession?.status;
 
     if (!runtimeId || !provider || !status) {
@@ -2217,7 +2236,7 @@ export function Workspace({
     : null;
   const workspaceReviewSession = useMemo<NativeSessionSummary>(() => {
     const provider = workspaceMode === 'history' && selectedSession
-      ? selectedSession.source === 'codex' ? 'codex' : 'claude'
+      ? toNativeProvider(selectedSession.source)
       : composeProvider;
     const envName = workspaceMode === 'history' && selectedSession
       ? historyEnv
@@ -2388,7 +2407,11 @@ export function Workspace({
       ? activeLiveEntry.session.project_dir || null
       : effectiveComposeDir;
   const skillsProvider = workspaceMode === 'history' && selectedSession
-    ? selectedSession.source === 'codex' ? 'codex' : 'claude'
+    ? selectedSession.source === 'codex'
+      ? 'codex'
+      : selectedSession.source === 'agy'
+        ? 'agy'
+        : 'claude'
     : workspaceMode === 'live' && activeLiveEntry
       ? activeLiveEntry.session.provider
       : composeProvider;
@@ -2658,7 +2681,7 @@ export function Workspace({
       void hydrateLiveEntryFromHistory(record);
       return record.runtime_id;
     }
-    if (session.source !== 'claude' && session.source !== 'codex') return null;
+    if (session.source !== 'claude' && session.source !== 'codex' && session.source !== 'agy') return null;
     const paneId = toSplitHistoryPaneId(toSessionKey(session));
     setSplitHistorySessions((current) => ({ ...current, [paneId]: session }));
     return paneId;
@@ -2725,7 +2748,7 @@ export function Workspace({
   const resumeIntoSplitPane = useCallback(async (
     paneId: string,
     target: {
-      provider: 'claude' | 'codex';
+      provider: NativeProvider;
       providerSessionId: string;
       envName: string;
       permMode: string;
@@ -2808,6 +2831,8 @@ export function Workspace({
       const failure = nativeCreateFailure(error);
       if (provider === 'claude' && isClaudeRuntimeRequiredError(error)) {
         setClaudeRuntimeRequired(true);
+      } else if (provider === 'agy' && isAgyAuthRequiredError(error)) {
+        setAgyAuthRequired(true);
       } else {
         toast.error(failure.detail || t('workspace.nativeCreateFailed'));
       }
@@ -2867,7 +2892,7 @@ export function Workspace({
     seedMessages: ConversationMessageData[],
   ): Promise<ComposerSubmitResult> => {
     const session = splitHistorySessionsRef.current[paneId];
-    if (!session || (session.source !== 'claude' && session.source !== 'codex')) return false;
+    if (!session || (session.source !== 'claude' && session.source !== 'codex' && session.source !== 'agy')) return false;
     return resumeIntoSplitPane(paneId, {
       provider: session.source,
       providerSessionId: session.id,
@@ -3091,7 +3116,7 @@ export function Workspace({
     sidebarSessions,
   ]);
 
-  const openComposer = useCallback((client: 'claude' | 'codex', dir?: string | null) => {
+  const openComposer = useCallback((client: NativeProvider, dir?: string | null) => {
     setComposeProvider(client);
     setLaunchClient(client);
     setWorkspaceMode('compose');
@@ -3454,6 +3479,8 @@ export function Workspace({
       const failure = nativeCreateFailure(error);
       if (composeProvider === 'claude' && isClaudeRuntimeRequiredError(error)) {
         setClaudeRuntimeRequired(true);
+      } else if (composeProvider === 'agy' && isAgyAuthRequiredError(error)) {
+        setAgyAuthRequired(true);
       } else {
         toast.error(failure.detail || t('workspace.nativeCreateFailed'));
       }
@@ -3670,6 +3697,8 @@ export function Workspace({
       const failure = nativeCreateFailure(error);
       if (provider === 'claude' && isClaudeRuntimeRequiredError(error)) {
         setClaudeRuntimeRequired(true);
+      } else if (provider === 'agy' && isAgyAuthRequiredError(error)) {
+        setAgyAuthRequired(true);
       } else {
         toast.error(failure.detail || t('workspace.nativeCreateFailed'));
       }
@@ -4194,6 +4223,7 @@ export function Workspace({
           routeDraft={composeRouteDraft}
           onRouteDraftChange={updateComposeRouteDraftState}
           codexInstalled={codexInstalled}
+          agyInstalled={agyInstalled}
           opencodeInstalled={opencodeInstalled}
           onLaunchNewSession={handleNewSession}
           secondaryActions={(
@@ -4250,7 +4280,7 @@ export function Workspace({
       return null;
     }
 
-    const historyProvider = selectedSession.source === 'codex' ? 'codex' : 'claude';
+    const historyProvider = toNativeProvider(selectedSession.source);
     const historyRouteDraftAvailable = selectedHistorySupportsInline
       && isRouteDraftRowVisible(selectedSession.source);
     const historyRouteResolutionBlocked = isHistoryRouteContinuationBlocked(
@@ -4324,6 +4354,7 @@ export function Workspace({
           routeDraft={historyRouteDraftAvailable ? historyRouteDraft : null}
           onRouteDraftChange={historyRouteDraftAvailable ? updateHistoryRouteDraft : undefined}
           codexInstalled={codexInstalled}
+          agyInstalled={agyInstalled}
           opencodeInstalled={opencodeInstalled}
           onLaunchNewSession={handleNewSession}
           annotations={historyAnnotations.pendingAnnotations}
@@ -4743,6 +4774,7 @@ export function Workspace({
                           onResumeTerminal={isSplitPane ? resumeSplitPaneHandlers[runtimeId] : undefined}
                           onSessionUpdate={handleLiveSessionUpdate}
                           codexInstalled={codexInstalled}
+                          agyInstalled={agyInstalled}
                           opencodeInstalled={opencodeInstalled}
                           onLaunchNewSession={handleNewSession}
                           onForkTurnRequest={openForkTurn}
@@ -4878,6 +4910,7 @@ export function Workspace({
         onContinue={() => settleCodexModelMigrationDecision(true)}
       />
       <ClaudeRuntimeRequiredDialog open={claudeRuntimeRequired} onOpenChange={setClaudeRuntimeRequired} />
+      <AgyAuthRequiredDialog open={agyAuthRequired} onOpenChange={setAgyAuthRequired} />
     </div>
     </WorkspaceFileLinkContext.Provider>
     </WorkspaceSidePanelContext.Provider>

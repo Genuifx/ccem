@@ -113,6 +113,7 @@ const externalStubPlugin = {
       contents: `
         function NullComp() { return null; }
         NullComp.Color = NullComp;
+        export const Antigravity = NullComp;
         export const Claude = NullComp;
         export const Codex = NullComp;
         export const DeepSeek = NullComp;

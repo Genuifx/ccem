@@ -3,7 +3,7 @@ export type PetNotificationTone = 'running' | 'done' | 'attention' | 'failed' | 
 export interface PetNotificationItem {
   id: string;
   runtimeId: string;
-  provider: 'claude' | 'codex';
+  provider: 'claude' | 'codex' | 'agy';
   providerSessionId: string | null;
   title: string;
   message: string;

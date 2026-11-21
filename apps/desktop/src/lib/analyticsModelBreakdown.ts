@@ -2,7 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type { ModelBreakdownHistory } from '@/types/analytics';
 
 export type TimeGranularity = 'hour' | 'day' | 'week' | 'month';
-export type AnalyticsUsageSource = 'all' | 'claude' | 'codex' | 'opencode' | 'dsh';
+export type AnalyticsUsageSource = 'all' | 'claude' | 'codex' | 'opencode' | 'agy' | 'dsh';
 
 const CACHE_TTL_MS = 60_000;
 const REQUEST_TIMEOUT_MS = 60_000;

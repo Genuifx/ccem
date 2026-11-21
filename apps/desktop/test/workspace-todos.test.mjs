@@ -863,3 +863,37 @@ test('live native view always issues one limited initial replay before increment
     /isInitialReplay[\s\S]*mergeWorkspaceReplayEvents\(previous, batch\.events\)/,
   );
 });
+
+test('accepts structured ACP plan todo snapshots for agy provider', async () => {
+  const { buildWorkspaceTodos } = await importWorkspaceTodos();
+  const result = buildWorkspaceTodos([
+    event(1, {
+      type: 'tool_use_completed',
+      tool_use_id: 'agy-plan-1',
+      raw_name: 'plan',
+      result_summary: 'plan updated',
+      success: true,
+      todo_snapshot: {
+        version: 1,
+        provider: 'agy',
+        source: 'plan',
+        revision: 1,
+        items: [
+          { id: 'step-1', text: 'Inspect ACP handshake', status: 'completed' },
+          { id: 'step-2', text: 'Wire frontend composer', status: 'in_progress' },
+        ],
+      },
+    }),
+  ]);
+
+  assert.equal(result.source, 'structured');
+  assert.equal(result.total, 2);
+  assert.equal(result.completed, 1);
+  assert.deepEqual(
+    result.items.map((item) => [item.id, item.status, item.sourceLabel]),
+    [
+      ['step-1', 'completed', 'plan'],
+      ['step-2', 'in_progress', 'plan'],
+    ],
+  );
+});

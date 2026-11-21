@@ -25,7 +25,9 @@ export interface WorkspaceSidebarLiveSessionEntry {
 const TERMINAL_NATIVE_STATUSES = new Set(['stopped', 'error', 'handoff']);
 
 function toHistorySource(provider: NativeProvider): HistorySource {
-  return provider === 'codex' ? 'codex' : 'claude';
+  if (provider === 'codex') return 'codex';
+  if (provider === 'agy') return 'agy';
+  return 'claude';
 }
 
 function basename(path: string): string {
@@ -261,7 +263,7 @@ export function toLiveHistorySessionItem(
     || (!hasAuthoritativeTitleState ? entry.generatedTitle?.trim() : '')
     || entry.session.initial_user_prompt?.trim()
     || entry.initialPrompt?.trim()
-    || `${entry.session.provider === 'codex' ? 'Codex' : 'Claude'} workspace session`;
+    || `${entry.session.provider === 'codex' ? 'Codex' : entry.session.provider === 'agy' ? 'Antigravity' : 'Claude'} workspace session`;
 
   return {
     id: liveSessionSidebarId(entry),

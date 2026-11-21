@@ -1,6 +1,6 @@
 import { useDeferredValue, useState, useMemo, useRef, useEffect, type KeyboardEvent } from 'react';
 import { Search, MessageSquare } from '@/lib/lucide-react';
-import { Claude, Codex, DeepSeek, OpenCode } from '@lobehub/icons';
+import { Antigravity, Claude, Codex, DeepSeek, OpenCode } from '@lobehub/icons';
 import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
@@ -26,6 +26,8 @@ function SourceIcon({ source }: { source: HistorySource }) {
   switch (source) {
     case 'codex':
       return <Codex.Color size={12} />;
+    case 'agy':
+      return <Antigravity.Color size={12} />;
     case 'opencode':
       return <OpenCode size={12} className="h-3 w-3" />;
     case 'dsh':
@@ -39,6 +41,7 @@ function sourceLabel(source: HistorySource): string {
   switch (source) {
     case 'claude': return 'Claude';
     case 'codex': return 'Codex (OpenAI)';
+    case 'agy': return 'Antigravity';
     case 'opencode': return 'OpenCode';
     case 'dsh': return 'DeepSeek';
   }

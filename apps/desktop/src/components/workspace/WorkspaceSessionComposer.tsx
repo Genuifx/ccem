@@ -45,7 +45,7 @@ import {
   X,
   Zap,
 } from '@/lib/lucide-react';
-import { Claude, Codex, OpenCode } from '@lobehub/icons';
+import { Antigravity, Claude, Codex, OpenCode } from '@lobehub/icons';
 import { PromptArea } from '@/components/prompt-area';
 import { buildComposerRouteShortcutHandler } from '@/components/workspace/composerRouteShortcut';
 import {
@@ -240,6 +240,7 @@ interface WorkspaceSessionComposerProps {
   planModeAvailable?: boolean;
   planModeHint?: string;
   codexInstalled?: boolean;
+  agyInstalled?: boolean;
   opencodeInstalled?: boolean;
   onLaunchNewSession?: (client: LaunchClient) => void;
   queuedMessages?: ComposerQueuedMessage[];
@@ -487,6 +488,7 @@ function ComposerSkillInfoPanel({
 
 function ComposerQuickMenu({
   codexInstalled,
+  agyInstalled,
   opencodeInstalled,
   planModeEnabled,
   planButtonVisible,
@@ -499,6 +501,7 @@ function ComposerQuickMenu({
   onPlanModeEnabledChange,
 }: {
   codexInstalled: boolean;
+  agyInstalled: boolean;
   opencodeInstalled: boolean;
   planModeEnabled: boolean;
   planButtonVisible: boolean;
@@ -516,13 +519,16 @@ function ComposerQuickMenu({
   const sdkItems: { client: LaunchClient; icon: ReactNode; label: string; installed: boolean }[] = [
     { client: 'claude', icon: <Claude.Color size={16} />, label: t('workspace.newSessionClaude'), installed: true },
     { client: 'codex', icon: <Codex.Color size={16} />, label: t('workspace.newSessionCodex'), installed: codexInstalled },
+    { client: 'agy', icon: <Antigravity.Color size={16} />, label: t('workspace.newSessionAgy'), installed: agyInstalled },
     { client: 'opencode', icon: <OpenCode size={16} />, label: t('workspace.newSessionOpenCode'), installed: opencodeInstalled },
   ];
 
   const resolvedPlanHint = planModeHint ?? (
-    planModeKind === 'session_permission'
-      ? t('workspace.composerPlanModeHintClaude')
-      : t('workspace.composerPlanModeHintCodex')
+    provider === 'agy'
+      ? t('workspace.composerPlanModeHintAgy')
+      : planModeKind === 'session_permission'
+        ? t('workspace.composerPlanModeHintClaude')
+        : t('workspace.composerPlanModeHintCodex')
   );
 
   return (
@@ -949,6 +955,7 @@ export function WorkspaceSessionComposer({
   planModeAvailable,
   planModeHint,
   codexInstalled = false,
+  agyInstalled = false,
   opencodeInstalled = false,
   onLaunchNewSession,
   queuedMessages = [],
@@ -2234,6 +2241,7 @@ export function WorkspaceSessionComposer({
           >
             <ComposerQuickMenu
               codexInstalled={codexInstalled}
+              agyInstalled={agyInstalled}
               opencodeInstalled={opencodeInstalled}
               planModeEnabled={planModeEnabled}
               planButtonVisible={planButtonVisible}

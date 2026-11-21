@@ -216,14 +216,9 @@ interface ProxyTrafficDetail {
 }
 
 function normalizeLaunchClient(client?: string): LaunchClient {
-  switch (client?.toLowerCase()) {
-    case 'codex':
-      return 'codex';
-    case 'opencode':
-      return 'opencode';
-    default:
-      return 'claude';
-  }
+  const normalized = client?.toLowerCase();
+  if (normalized === 'codex' || normalized === 'opencode' || normalized === 'agy') return normalized;
+  return 'claude';
 }
 
 function toFrontendSession(tauriSession: TauriSession): Session {
@@ -580,11 +575,7 @@ export function useTauriCommands() {
           tmux_target: session.tmuxTarget,
         }),
         onCreateError: (error) => {
-          const clientLabel = options.client === 'codex'
-            ? 'Codex'
-            : options.client === 'opencode'
-              ? 'OpenCode'
-              : 'Claude Code';
+          const clientLabel = options.client === 'codex' ? 'Codex' : options.client === 'opencode' ? 'OpenCode' : options.client === 'agy' ? 'Antigravity' : 'Claude Code';
           setError(
             `Failed to launch ${clientLabel}: `
             + formatInteractiveSessionLaunchError(error),
@@ -985,7 +976,7 @@ export function useTauriCommands() {
   }, []);
 
   const createNativeSession = useCallback(async (options: {
-    provider: 'claude' | 'codex';
+    provider: 'claude' | 'codex' | 'agy';
     envName?: string;
     permMode?: string;
     runtimePermMode?: string | null;

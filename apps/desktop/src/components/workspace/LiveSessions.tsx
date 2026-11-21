@@ -87,7 +87,7 @@ export function LiveSessions({ onNavigate: _onNavigate }: LiveSessionsProps) {
                       <span className="flex items-center gap-1.5">
                         <span>{getProjectName(session.workingDir)}</span>
                         <span className="inline-flex items-center text-[9px] uppercase tracking-wide text-muted-foreground/80 rounded-md bg-white/[0.04] px-1.5 py-0.5">
-                          {session.client === 'codex' ? 'Codex' : 'Claude'}
+                          {session.client === 'codex' ? 'Codex' : session.client === 'agy' ? 'Antigravity' : session.client === 'opencode' ? 'OpenCode' : 'Claude'}
                         </span>
                         {session.terminalType === 'embedded' && (
                           <span className="inline-flex items-center text-[9px] uppercase tracking-wide text-cyan-300/80 rounded-md bg-cyan-300/[0.08] px-1.5 py-0.5">

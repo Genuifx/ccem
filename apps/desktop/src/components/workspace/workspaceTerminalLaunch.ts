@@ -1,6 +1,6 @@
 import type { LaunchClient } from '@/store';
 
-type TerminalLaunchClient = Extract<LaunchClient, 'claude' | 'codex'>;
+type TerminalLaunchClient = Extract<LaunchClient, 'claude' | 'codex' | 'agy'>;
 
 export interface LaunchWorkspaceTerminalSessionOptions {
   prompt: string;

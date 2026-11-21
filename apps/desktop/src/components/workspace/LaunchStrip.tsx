@@ -16,6 +16,7 @@ import type { LaunchClient } from '@/store';
 interface LaunchStripProps {
   launchClient: LaunchClient;
   codexInstalled: boolean;
+  agyInstalled?: boolean;
   currentEnv: string;
   environments: { name: string }[];
   permissionMode: PermissionModeName;
@@ -33,6 +34,7 @@ interface LaunchStripProps {
 export function LaunchStrip({
   launchClient,
   codexInstalled,
+  agyInstalled = false,
   currentEnv,
   environments,
   permissionMode,
@@ -47,7 +49,7 @@ export function LaunchStrip({
   onCopyBind,
 }: LaunchStripProps) {
   const { t } = useLocale();
-  const isCodex = launchClient === 'codex';
+  const isNativeManagedClient = launchClient === 'codex' || launchClient === 'agy';
 
   const dirDisplay = selectedWorkingDir
     ? getProjectName(selectedWorkingDir)
@@ -107,10 +109,11 @@ export function LaunchStrip({
             <SelectContent>
               <SelectItem value="claude">Claude</SelectItem>
               <SelectItem value="codex" disabled={!codexInstalled}>Codex</SelectItem>
+              <SelectItem value="agy" disabled={!agyInstalled}>Antigravity</SelectItem>
             </SelectContent>
           </Select>
 
-          {!isCodex && (
+          {!isNativeManagedClient && (
             <>
               <span className="text-muted-foreground/20 text-xs select-none">·</span>
 

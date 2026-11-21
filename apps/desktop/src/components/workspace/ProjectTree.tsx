@@ -1428,7 +1428,9 @@ export const ProjectTree = memo(function ProjectTree({
       ? t('workspace.newSessionCodex')
       : client === 'opencode'
         ? t('workspace.newSessionOpenCode')
-        : t('workspace.newSessionClaude');
+        : client === 'agy'
+          ? t('workspace.newSessionAgy')
+          : t('workspace.newSessionClaude');
 
     if (decoration?.attentionKind === 'plan_review') {
       return t('workspace.sessionClientLabel').replace('{client}', clientLabel)

@@ -1,6 +1,6 @@
 import { memo } from 'react';
 import { BadgeAlert, LoaderCircle } from '@/lib/lucide-react';
-import { Claude, Codex, DeepSeek, Gemini, Grok, Minimax, Moonshot, Ollama, OpenAI, OpenCode, OpenRouter, Qwen, XiaomiMiMo, Zhipu } from '@lobehub/icons';
+import { Antigravity, Claude, Codex, DeepSeek, Gemini, Grok, Minimax, Moonshot, Ollama, OpenAI, OpenCode, OpenRouter, Qwen, XiaomiMiMo, Zhipu } from '@lobehub/icons';
 import { cn } from '@/lib/utils';
 import type { HistorySessionItem } from '@/features/conversations/types';
 import type { Environment, LaunchClient } from '@/store';
@@ -22,6 +22,9 @@ function normalizeClient(value: string | undefined): LaunchClient {
   }
   if (value === 'opencode') {
     return 'opencode';
+  }
+  if (value === 'agy') {
+    return 'agy';
   }
   return 'claude';
 }
@@ -100,6 +103,9 @@ const SourceIdentityIcon = memo(function SourceIdentityIcon({
   if (client === 'codex') {
     return <Codex.Color size={16} className={className} />;
   }
+  if (client === 'agy') {
+    return <Antigravity.Color size={16} className={className} />;
+  }
   if (client === 'opencode') {
     return <OpenCode size={16} className={className} />;
   }
@@ -164,7 +170,7 @@ export const SessionTreeItemIcon = memo(function SessionTreeItemIcon({
 
   const client = resolveSessionClient(session, decoration);
   const providerHint = resolveEnvironmentIconHint(environment);
-  if (client !== 'codex' && providerHint) {
+  if (client !== 'codex' && client !== 'agy' && providerHint) {
     return (
       <span className={cn(TREE_ICON_FRAME_CLASS, className)}>
         <ProviderIdentityIcon hint={providerHint} />

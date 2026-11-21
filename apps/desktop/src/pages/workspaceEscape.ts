@@ -118,7 +118,7 @@ export function decideWorkspaceEscape(input: WorkspaceEscapeInput): WorkspaceEsc
 
   const runtimeId = input.runtimeId?.trim();
   const commandId = input.activeCommandId?.trim() || null;
-  const providerStop = (input.provider === 'codex' || input.provider === 'opencode')
+  const providerStop = (input.provider === 'codex' || input.provider === 'opencode' || input.provider === 'agy')
     && input.isProviderProcessing;
   if (!runtimeId || (!commandId && !providerStop)) {
     return { kind: 'ignore' };

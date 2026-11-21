@@ -41,13 +41,14 @@ const TODO_STATUSES = new Set<TodoSnapshotStatusV1>([
   'completed',
   'failed',
 ]);
-const TODO_PROVIDERS = new Set(['claude', 'codex']);
+const TODO_PROVIDERS = new Set(['claude', 'codex', 'agy']);
 const TODO_SOURCES = new Set([
   'TodoWrite',
   'TaskCreate',
   'TaskUpdate',
   'TaskList',
   'todo_list',
+  'plan',
 ]);
 
 function compactText(value: string) {

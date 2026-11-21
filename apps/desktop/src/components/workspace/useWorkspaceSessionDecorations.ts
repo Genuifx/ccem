@@ -9,7 +9,7 @@ export type WorkspaceAttentionKind = 'input_required' | 'plan_review' | 'permiss
 export interface WorkspaceSessionDecoration {
   sessionKey: string;
   runtimeId?: string;
-  client?: 'claude' | 'codex' | 'opencode';
+  client?: 'claude' | 'codex' | 'opencode' | 'agy';
   status?: string;
   isActive?: boolean;
   envName?: string;
@@ -47,7 +47,7 @@ function toDecorationSessionInput(session: HistorySessionItem): WorkspaceDecorat
 }
 
 function normalizeClient(value: unknown): WorkspaceSessionDecoration['client'] {
-  if (value === 'codex' || value === 'opencode') {
+  if (value === 'codex' || value === 'opencode' || value === 'agy') {
     return value;
   }
   return 'claude';

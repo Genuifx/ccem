@@ -16,7 +16,7 @@ import { ccemMotion, clearMotionProps, getMotionTargets, gsap, shouldReduceMotio
 import type { DailyActivity, UsageStats } from '@/types/analytics';
 import { shallow } from 'zustand/shallow';
 
-type UsageSourceFilter = 'all' | 'claude' | 'codex' | 'opencode' | 'dsh';
+type UsageSourceFilter = 'all' | 'claude' | 'codex' | 'agy' | 'opencode' | 'dsh';
 const ANALYTICS_CACHE_TTL_MS = 60_000;
 
 interface AnalyticsCacheResult {
@@ -488,7 +488,7 @@ export function Analytics() {
             role="radiogroup"
             aria-label="Source filter"
           >
-            {(['all', 'claude', 'codex', 'opencode', 'dsh'] as UsageSourceFilter[]).map((source) => (
+            {(['all', 'claude', 'codex', 'agy', 'opencode', 'dsh'] as UsageSourceFilter[]).map((source) => (
               <button
                 key={source}
                 data-testid={`analytics-filter-${source}`}
@@ -506,6 +506,7 @@ export function Analytics() {
                 {source === 'all' && t('analytics.sourceAll')}
                 {source === 'claude' && t('analytics.sourceClaude')}
                 {source === 'codex' && t('analytics.sourceCodex')}
+                {source === 'agy' && t('analytics.sourceAgy')}
                 {source === 'opencode' && t('analytics.sourceOpencode')}
                 {source === 'dsh' && 'DSH'}
               </button>

@@ -42,6 +42,12 @@ test('Codex defaults to shared state, toggles persist, and failed preparation ke
         isolated = args.isolated;
         return profiles();
       }
+      if (command === 'get_agy_runtime_status') return {
+        installed: true,
+        resolvedPath: '/usr/local/bin/agy',
+        customPath: null,
+        defaultHomeDir: '/fixture/home/.gemini/antigravity-cli',
+      };
       if (command === 'get_claude_runtime_status') return {
         preference: 'auto', recommendedVersion: '2.1.220', minimumSystemVersion: '2.1.220',
         registryUrl: 'https://registry.npmjs.org/', registryError: null,
@@ -70,9 +76,10 @@ test('Codex defaults to shared state, toggles persist, and failed preparation ke
       },
       outfile, bundle: true, platform: 'node', format: 'cjs', jsx: 'automatic', logLevel: 'silent',
       plugins: [{ name: 'ipc-boundary', setup(builder) {
-        builder.onResolve({ filter: /^(@tauri-apps\/api\/core|sonner|@\/locales|@\/store|@\/features\/conversations\/historyData|@\/lib\/nativeSurfaceOcclusion|@\/lib\/nativeBrowserOverlay)$/ }, ({ path }) => ({ path, namespace: 'fixture' }));
+        builder.onResolve({ filter: /^(@tauri-apps\/api\/core|sonner|@lobehub\/icons|@\/locales|@\/store|@\/features\/conversations\/historyData|@\/lib\/nativeSurfaceOcclusion|@\/lib\/nativeBrowserOverlay)$/ }, ({ path }) => ({ path, namespace: 'fixture' }));
         builder.onLoad({ filter: /.*/, namespace: 'fixture' }, ({ path }) => ({
-          contents: path === '@/lib/nativeSurfaceOcclusion' ? 'export const useNativeSurfaceOcclusion = open => open;'
+          contents: path === '@lobehub/icons' ? 'function Icon(){return null;} Icon.Color = Icon; export const Antigravity = Icon;'
+            : path === '@/lib/nativeSurfaceOcclusion' ? 'export const useNativeSurfaceOcclusion = open => open;'
             : path === '@/lib/nativeBrowserOverlay' ? 'export const useNativeBrowserOverlayRef = ref => ref;'
             : path === '@/store'
             ? 'export const useAppStore = { getState: () => ({ setInstalledSkills: (skills) => globalThis.__profileTest.skills = skills }) };'

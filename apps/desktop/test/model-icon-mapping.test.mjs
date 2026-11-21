@@ -27,6 +27,7 @@ async function importResolveIcon() {
   const sourcePath = path.join(desktopDir, 'src', 'components', 'history', 'ModelIcon.tsx');
   const source = await fs.readFile(sourcePath, 'utf8');
   const pureSource = `
+    const Antigravity = { title: 'Antigravity' };
     const Grok = { title: 'Grok' };
     const Claude = {};
     const Codex = {};
@@ -150,4 +151,18 @@ test('resolveEnvironmentIconHint prefers concrete grok model over tier alias', a
     }),
     'named-grok',
   );
+});
+
+test('resolveIcon maps antigravity and agy ids to Antigravity color icon', async () => {
+  const { resolveIcon } = await importResolveIcon();
+
+  const agy = resolveIcon('agy');
+  assert.ok(agy);
+  assert.equal(agy.icon.title, 'Antigravity');
+  assert.equal(agy.variant, 'color');
+
+  const antigravity = resolveIcon('Antigravity');
+  assert.ok(antigravity);
+  assert.equal(antigravity.icon.title, 'Antigravity');
+  assert.equal(antigravity.variant, 'color');
 });
