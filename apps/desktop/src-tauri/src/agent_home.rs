@@ -81,6 +81,30 @@ fn resolve_shared_codex_home(home: &Path, configured: Option<&str>, cwd: &Path) 
     }
 }
 
+pub fn agy_home() -> PathBuf {
+    resolve_agy_home(
+        &dirs::home_dir().unwrap_or_default(),
+        std::env::var("CCEM_AGY_HOME").ok().as_deref(),
+        &std::env::current_dir().unwrap_or_default(),
+    )
+}
+
+fn resolve_agy_home(home: &Path, configured: Option<&str>, cwd: &Path) -> PathBuf {
+    match configured.map(str::trim).filter(|value| !value.is_empty()) {
+        None => home.join(".gemini").join("antigravity-cli"),
+        Some("~") => home.to_path_buf(),
+        Some(value) if value.starts_with("~/") => home.join(&value[2..]),
+        Some(value) => {
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        }
+    }
+}
+
 fn read_profile_preferences(base: &Path) -> Result<serde_json::Value, String> {
     let path = base.join("profiles.json");
     validate_no_symlinks(&path)?;
