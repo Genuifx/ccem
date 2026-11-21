@@ -38,15 +38,16 @@ BASELINE_CLEAN -> CANDIDATE_ON_MAIN -> READY -> TAGGED -> DELIVERED
 
 ## 恢复已升版但未打 tag 的候选
 
-先完成 baseline 对账，再运行 `git fetch origin main --tags` 和 `node scripts/ci/resolve-release-candidate.mjs`。这个只读命令从当前 `origin/main` 的五处版本源解析稳定版候选，核对远端 SHA、baseline tag 和候选 tag 缺席；不会 bump、commit、push、打 tag 或证明 readiness 已通过。输出的 `sourceCommit` 才是本轮候选 SHA，不能用 `git log` 找到的最早 `chore: release` SHA 替代它。预发布版本应单独核对其通道，不套用稳定版恢复命令。
+先完成 baseline 对账，再运行 `pnpm release:resume`。命令统一 fetch 现有 `origin/main` / tags，复用 `resolve-release-candidate.mjs` 从当前 main 的五处版本源解析稳定版候选，并核对远端 SHA、baseline tag 和候选 tag 缺席。不会 bump、commit、push、打 tag 或正式发布。输出的 `sourceCommit` 才是本轮候选 SHA，不能用历史最早的 `chore: release` SHA 替代。预发布版本应单独核对通道，不套用稳定版恢复命令。
 
-自动触发只匹配 release commit message，普通修复提交上的 skipped run 不代表门禁成功。缺少当前 SHA 的成功证据时，使用输出中的精确 `sourceCommit` / `version` 调度两条非发布工作流：
+命令复用当前 SHA 的有效证据、等待已有 pending run，仅调度缺失的 CLI preflight / Desktop readiness，绑定精确 `expected_sha` 与 `expected_version`。完全 skipped 的自动 push 不算 readiness。按最新实质 attempt 选择证据，较新的 pending / failure 不能被旧绿灯掩盖；同一 run 的重跑须按 attempt 时间而非仅 run ID 排序。最后使用 `check-pretag-readiness-runs.mjs` 核验选定 run 的 main、SHA、工作流、事件与当前 attempt 的 required job，并在读取 jobs 后再次检查 attempt 没有变化。
 
-```bash
-gh workflow run release-cli.yml --ref main -f expected_sha="$CANDIDATE_SHA" -f expected_version="$VERSION"
-gh workflow run mode2-signed-readiness.yml --ref main -f expected_sha="$CANDIDATE_SHA" -f expected_version="$VERSION"
-```
+它只输出 `PRETAG_READINESS_VERIFIED`，同时明确 `baselineDelivery: NOT_CHECKED`、`releaseEligible: false`。独立 baseline 交付门禁未完成时，绝不能据此宣称 `READY` 或允许发布。现有独立 tag-time checker 的成功 run 查询入口保持兼容；resume 额外实行最新实质 attempt 选择。完整 CI 不新增为强制发布门禁。
 
-记录新 run ID，等待真实结论；同时验证 required job `Preflight npm Trusted Publisher` / `Confirm Desktop Release Readiness` 成功。复用 `scripts/ci/check-pretag-readiness-runs.mjs` 检查精确 SHA、工作流、main、push/dispatch 事件和当前 attempt 的 required job，不能只看 workflow 总体绿灯或借用其他 SHA 的结果。最终打 tag 前仍须重新证明远端 main 等于候选 SHA，候选 tag 在本地和远端均不存在。
+GitHub API 只读请求只对明确的临时网络/HTTP 错误做有限重试，包含响应体中断与异常 cause 链；无效 JSON、权限或证据失败立即停止。失败的工作流不自动重跑：按打印出的精确 run/attempt 用已认证的 `gh run view ... --log-failed` 看真实失败，不能仅凭日志出现 `ENOTFOUND` 就判断整个工作流可安全重跑。匿名日志接口的 403 不证明当前用户没有权限。
 
-失败时优先用已认证的 `gh run view <run-id> --log-failed` 读取日志；匿名日志接口的 403 不证明当前用户没有权限。若是证据上传 `ENOTFOUND` 等临时基础设施错误，在重新核对当前 SHA 后最多补跑一次非发布工作流；重复失败则保留候选并报告实际错误。main 前进后重新解析并验证新 SHA；本轮再次前进则报告竞态，不循环追逐 main，也不沿用旧 readiness。
+不确定 dispatch 只对账远端，不盲目重复 POST。发送前持久保存本地 intent，后续同 clone 的调用先对账它；没有新匹配 run 时保留 intent 并报告 `UNKNOWN_DISPATCH`。旧 SHA 未解决的 intent 也阻止新候选。共享 Git 元数据中的锁防止同 clone/worktree 并发；进程被杀后先核验锁内 host/PID 已结束，只清理锁，不能顺便删除 intent。独立 clone 或其他操作者不受本地锁约束。
+
+main 前进、tag 出现、确定失败或证据不明都停止；不会循环追逐 main，不再次 bump，也不沿用其他 SHA 的 readiness。两小时观察窗口结束仍 pending 时保留真实运行状态，稍后同命令可继续复用。最终任何独立获准的打 tag 动作之前，仍须重新证明远端 main 等于候选 SHA、候选 tag 在本地和远端均不存在，并完成 baseline 对账。
+
+参数、状态、重试边界、intent/锁处理与验证说明见 [非发布恢复命令](../../../docs/integrations/release-resume.md)。
