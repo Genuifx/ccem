@@ -18,6 +18,7 @@ mod index_cache;
 const SOURCE_CLAUDE: &str = "claude";
 const SOURCE_CODEX: &str = "codex";
 const SOURCE_OPENCODE: &str = "opencode";
+const SOURCE_AGY: &str = "agy";
 const SOURCE_DSH: &str = "dsh";
 const HISTORY_NEAR_DUPLICATE_WINDOW_MS: u64 = 1_500;
 const HISTORY_LIMIT_MAX: usize = 1_000;
@@ -560,6 +561,9 @@ fn load_legacy_history_sessions_filtered(
     if source_filter.is_none() || source_filter == Some(SOURCE_OPENCODE) {
         sessions.extend(load_opencode_history()?);
     }
+    if source_filter.is_none() || source_filter == Some(SOURCE_AGY) {
+        sessions.extend(load_agy_history()?);
+    }
 
     Ok(sessions)
 }
@@ -573,6 +577,7 @@ fn load_legacy_history_sessions(limit: Option<usize>) -> Result<Vec<HistorySessi
     sessions.extend(load_claude_history_limited(scan_limit)?);
     sessions.extend(load_codex_history_limited(scan_limit)?);
     sessions.extend(load_opencode_history()?);
+    sessions.extend(load_agy_history()?);
 
     sessions = dedupe_history_sessions(sessions);
     sessions.sort_by_key(|session| std::cmp::Reverse(session.timestamp));
@@ -2273,11 +2278,36 @@ fn dedupe_history_sessions(sessions: Vec<HistorySession>) -> Vec<HistorySession>
 }
 
 fn collect_history_provenance_records() -> Vec<session_provenance::SessionProvenanceRecord> {
-    [SOURCE_CLAUDE, SOURCE_CODEX, SOURCE_OPENCODE]
+    [SOURCE_CLAUDE, SOURCE_CODEX, SOURCE_OPENCODE, SOURCE_AGY]
         .into_iter()
         .filter_map(|source| session_provenance::list_records_by_client(source).ok())
         .flat_map(|records| records.into_values())
         .collect()
+}
+
+fn load_agy_history() -> Result<Vec<HistorySession>, String> {
+    let records = match session_provenance::list_records_by_client(SOURCE_AGY) {
+        Ok(records) => records,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut sessions = Vec::new();
+    for record in records.values() {
+        if let Some(mut session) = history_session_from_provenance_record(SOURCE_AGY, record) {
+            apply_provenance_to_history_session(&mut session, record);
+            sessions.push(session);
+        }
+    }
+    Ok(sessions)
+}
+
+fn has_agy_session(session_id: &str) -> bool {
+    let trimmed = session_id.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    session_provenance::list_records_by_client(SOURCE_AGY)
+        .map(|records| records.contains_key(trimmed))
+        .unwrap_or(false)
 }
 
 fn dedupe_history_sessions_with_provenance_records(
@@ -5252,12 +5282,12 @@ async fn load_dsh_conversation_detail_async(
     Ok((messages, segments, all_warnings))
 }
 
-/// Resume allowlist: only claude, codex, opencode are resumable.
+/// Resume allowlist: only claude, codex, opencode, and agy are resumable.
 /// DSH is explicitly excluded. Returns true if the source is allowed to resume.
 pub fn is_resumable_source(source: &str) -> bool {
     matches!(
         source.to_ascii_lowercase().as_str(),
-        SOURCE_CLAUDE | SOURCE_CODEX | SOURCE_OPENCODE
+        SOURCE_CLAUDE | SOURCE_CODEX | SOURCE_OPENCODE | SOURCE_AGY
     )
 }
 
@@ -5280,9 +5310,10 @@ fn normalize_history_source(source: Option<&str>) -> Result<Option<&'static str>
         SOURCE_CLAUDE => Ok(Some(SOURCE_CLAUDE)),
         SOURCE_CODEX => Ok(Some(SOURCE_CODEX)),
         SOURCE_OPENCODE => Ok(Some(SOURCE_OPENCODE)),
+        SOURCE_AGY => Ok(Some(SOURCE_AGY)),
         SOURCE_DSH => Ok(Some(SOURCE_DSH)),
         _ => Err(format!(
-            "Unsupported source '{}'. Use claude, codex, opencode, dsh, or all.",
+            "Unsupported source '{}'. Use claude, codex, opencode, agy, dsh, or all.",
             raw
         )),
     }
@@ -5303,6 +5334,7 @@ fn resolve_history_source_for_session(
         .and_then(|config| find_codex_session_file_with_config(session_id, &config))
         .is_some();
     let has_opencode = has_opencode_session(session_id);
+    let has_agy = has_agy_session(session_id);
 
     if has_claude {
         // Keep legacy behavior: if both exist, default to Claude unless caller passes source.
@@ -5315,6 +5347,10 @@ fn resolve_history_source_for_session(
 
     if has_opencode {
         return Some(SOURCE_OPENCODE);
+    }
+
+    if has_agy {
+        return Some(SOURCE_AGY);
     }
 
     None
@@ -8622,7 +8658,7 @@ pub fn orchestrate_history_detail(
 /// Returns the normalized lowercase client name or an error.
 pub fn validate_launch_client(client: Option<&str>) -> Result<String, String> {
     let name = client.unwrap_or("claude").to_lowercase();
-    if name != "claude" && name != "codex" && name != "opencode" {
+    if name != "claude" && name != "codex" && name != "opencode" && name != "agy" {
         return Err(format!("Unsupported client '{}'", name));
     }
     Ok(name)
@@ -9612,6 +9648,9 @@ mod dsh_integration_tests {
             validate_launch_client(Some("opencode")).unwrap(),
             "opencode"
         );
+        assert_eq!(validate_launch_client(Some("agy")).unwrap(), "agy");
         assert_eq!(validate_launch_client(None).unwrap(), "claude"); // default
+        assert!(is_resumable_source("agy"));
+        assert_eq!(normalize_history_source(Some("agy")).unwrap(), Some("agy"));
     }
 }

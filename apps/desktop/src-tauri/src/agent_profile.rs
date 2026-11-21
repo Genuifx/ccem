@@ -303,6 +303,13 @@ pub async fn login_agent_profile(
     provider: String,
     environment_mutations: tauri::State<'_, Arc<crate::config::EnvironmentMutationCoordinator>>,
 ) -> Result<(), String> {
+    if provider == "agy" {
+        return tauri::async_runtime::spawn_blocking(move || {
+            crate::terminal::open_agent_login("agy", false)
+        })
+        .await
+        .map_err(|e| format!("Agent login launch failed: {e}"))?;
+    }
     if !matches!(provider.as_str(), "claude" | "codex") {
         return Err("Unsupported agent provider".into());
     }
@@ -373,6 +380,22 @@ mod tests {
         let original = env.clone();
         apply_env("opencode", &mut env);
         assert_eq!(env, original);
+    }
+
+    #[test]
+    fn agy_keeps_native_google_login_environment_untouched() {
+        let mut env = HashMap::from([
+            ("HOME".into(), "/Users/tester".into()),
+            ("GOOGLE_CLOUD_PROJECT".into(), "demo-proj".into()),
+            ("GEMINI_API_KEY".into(), "keep-me".into()),
+            ("HTTPS_PROXY".into(), "http://127.0.0.1:7890".into()),
+        ]);
+        let original = env.clone();
+        prepare_env("agy", &mut env).expect("prepare_env for agy should succeed");
+        apply_env("agy", &mut env);
+        assert_eq!(env, original);
+        assert!(!env.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(!env.contains_key("CODEX_HOME"));
     }
 
     #[cfg(unix)]

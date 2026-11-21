@@ -627,7 +627,7 @@ async fn launch_claude_code(
         client_name, env_name, perm_mode, working_dir, resume_session_id
     );
 
-    if (client_name == "codex" || client_name == "opencode")
+    if (client_name == "codex" || client_name == "opencode" || client_name == "agy")
         && perm_mode
             .as_ref()
             .is_some_and(|mode| !mode.trim().is_empty())
@@ -649,6 +649,11 @@ async fn launch_claude_code(
         env_vars = resolved.env_vars;
     } else if client_name == "codex" {
         env_vars = system_proxy::resolve_codex_proxy_env();
+    } else if client_name == "agy" {
+        env_vars = system_proxy::resolve_codex_proxy_env();
+        if resolved_env_name.trim().is_empty() {
+            resolved_env_name = "Antigravity".to_string();
+        }
     } else if client_name == "opencode" {
         let resolved = resolve_opencode_runtime(&env_name)?;
         resolved_env_name = resolved.env_name;
@@ -667,8 +672,8 @@ async fn launch_claude_code(
         .then(|| agent_profile::codex_isolated_for_env(&env_vars));
 
     if proxy_state.is_enabled() {
-        if client_name == "opencode" {
-            println!("OpenCode launch ignores proxy debug routing");
+        if client_name == "opencode" || client_name == "agy" {
+            println!("{client_name} launch ignores proxy debug routing");
         } else {
             let upstream_base_url = if client_name == "claude" {
                 claude_upstream_base_url
@@ -855,8 +860,9 @@ fn parse_native_provider(provider: &str) -> Result<NativeProvider, String> {
     match provider.trim().to_lowercase().as_str() {
         "claude" => Ok(NativeProvider::Claude),
         "codex" => Ok(NativeProvider::Codex),
+        "agy" => Ok(NativeProvider::Agy),
         other => Err(format!(
-            "Unsupported native provider '{}'. Use claude or codex.",
+            "Unsupported native provider '{}'. Use claude, codex, or agy.",
             other
         )),
     }
@@ -1404,6 +1410,7 @@ async fn create_native_session(
     resume_router_from_runtime_id: Option<String>,
     codex_migration_proof_token: Option<String>,
     codex_isolated: Option<bool>,
+    model: Option<String>,
 ) -> Result<NativeSessionSummary, String> {
     let mutation_guard = environment_mutations.lock().map_err(native_create_rejection)?;
     let provider = parse_native_provider(&provider).map_err(native_create_rejection)?;
@@ -1515,6 +1522,7 @@ async fn create_native_session(
                 codex_path: None,
                 codex_base_url: None,
                 codex_api_key: None,
+                agy_path: None,
                 effort: effort.clone(),
                 router_launch_draft,
                 router_record: resumed_router_record,
@@ -1524,7 +1532,7 @@ async fn create_native_session(
             let resolved = resolve_codex_runtime(&env_name).map_err(native_create_rejection)?;
             let proxy_env_vars = system_proxy::resolve_codex_proxy_env();
             NativeSessionOptions {
-                model: None,
+                model,
                 provider,
                 codex_isolated,
                 env_name: if resolved.env_name.is_empty() {
@@ -1552,6 +1560,45 @@ async fn create_native_session(
                 codex_path: verified_codex_path.or_else(terminal::resolve_codex_path),
                 codex_base_url: None,
                 codex_api_key: None,
+                agy_path: None,
+                effort,
+                router_launch_draft: None,
+                router_record: None,
+            }
+        }
+        NativeProvider::Agy => {
+            let proxy_env_vars = system_proxy::resolve_codex_proxy_env();
+            let resolved_env_name = if env_name.trim().is_empty() {
+                "Antigravity".to_string()
+            } else {
+                env_name
+            };
+            NativeSessionOptions {
+                model,
+                provider,
+                codex_isolated: None,
+                env_name: resolved_env_name,
+                perm_mode: effective_perm_mode,
+                runtime_perm_mode: effective_runtime_perm_mode,
+                working_dir: effective_working_dir,
+                initial_prompt: Some(prepare_workspace_initial_prompt(
+                    &initial_prompt,
+                    false,
+                    provider_session_id.as_deref(),
+                )),
+                display_prompt: Some(user_visible_initial_prompt.clone()),
+                initial_images: initial_images.clone(),
+                initial_annotations: initial_annotations.clone(),
+                provider_session_id: provider_session_id.clone(),
+                fork_from_message_id: None,
+                seed_boundary_message_count,
+                helper_env_vars: proxy_env_vars.clone(),
+                terminal_env_vars: proxy_env_vars,
+                claude_path: None,
+                codex_path: None,
+                codex_base_url: None,
+                codex_api_key: None,
+                agy_path: terminal::resolve_agy_path(),
                 effort,
                 router_launch_draft: None,
                 router_record: None,
@@ -1950,6 +1997,10 @@ fn update_native_session_settings_blocking(
                     Some(system_proxy::resolve_codex_proxy_env()),
                 )
             }
+            NativeProvider::Agy => (
+                Some(name.trim().to_string()),
+                Some(system_proxy::resolve_codex_proxy_env()),
+            ),
         },
         _ => (None, None),
     };
@@ -2366,7 +2417,7 @@ async fn create_interactive_session(
         return Ok(session);
     }
 
-    if client_name == "codex" {
+    if client_name == "codex" || client_name == "agy" {
         return launch_claude_code(
             state,
             proxy_state,
@@ -3435,6 +3486,67 @@ fn check_codex_installed() -> bool {
 #[tauri::command]
 fn check_opencode_installed() -> bool {
     terminal::is_opencode_installed()
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct AgyRuntimeStatus {
+    installed: bool,
+    resolved_path: Option<String>,
+    custom_path: Option<String>,
+    default_home_dir: String,
+}
+
+fn build_agy_runtime_status(custom_path: Option<String>) -> AgyRuntimeStatus {
+    let custom_path = custom_path
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let resolved_path = terminal::resolve_agy_path_with_custom(custom_path.as_deref());
+    AgyRuntimeStatus {
+        installed: resolved_path.is_some(),
+        resolved_path,
+        custom_path,
+        default_home_dir: terminal::default_agy_home_dir(),
+    }
+}
+
+fn validate_agy_custom_path(path: Option<String>) -> Result<Option<String>, String> {
+    let Some(trimmed) = path
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let candidate = std::path::Path::new(&trimmed);
+    if !candidate.exists() {
+        return Err(format!("Antigravity binary path does not exist: {trimmed}"));
+    }
+    if !candidate.is_file() {
+        return Err(format!("Antigravity binary path is not a file: {trimmed}"));
+    }
+    Ok(Some(trimmed))
+}
+
+#[tauri::command]
+fn check_agy_installed() -> bool {
+    terminal::is_agy_installed()
+}
+
+#[tauri::command]
+fn get_agy_runtime_status() -> AgyRuntimeStatus {
+    let custom_path = config::read_settings()
+        .ok()
+        .and_then(|settings| settings.agy_path);
+    build_agy_runtime_status(custom_path)
+}
+
+#[tauri::command]
+fn set_agy_custom_path(path: Option<String>) -> Result<AgyRuntimeStatus, String> {
+    let validated = validate_agy_custom_path(path)?;
+    let updated = config::update_settings(|settings| {
+        settings.agy_path = validated.clone();
+    })?;
+    Ok(build_agy_runtime_status(updated.agy_path))
 }
 
 #[tauri::command]
@@ -6278,6 +6390,9 @@ pub fn run_desktop_app() -> i32 {
             cancel_claude_runtime_install,
             check_codex_installed,
             check_opencode_installed,
+            check_agy_installed,
+            get_agy_runtime_status,
+            set_agy_custom_path,
             check_tmux_installed,
             get_platform_capabilities,
             load_from_remote,
@@ -7176,5 +7291,47 @@ mod tests {
         assert_eq!(media_kind_for_extension("src/app.tsx"), None);
         assert_eq!(media_kind_for_extension("noext"), None);
         assert_eq!(media_kind_for_extension(""), None);
+    }
+
+    #[test]
+    fn parse_native_provider_accepts_agy_and_rejects_unknown() {
+        assert_eq!(
+            super::parse_native_provider("agy").unwrap(),
+            super::NativeProvider::Agy
+        );
+        assert_eq!(
+            super::parse_native_provider(" AGY ").unwrap(),
+            super::NativeProvider::Agy
+        );
+        assert!(super::parse_native_provider("unknown").is_err());
+    }
+
+    #[test]
+    fn validate_agy_custom_path_checks_existing_file_and_allows_reset() {
+        assert_eq!(super::validate_agy_custom_path(None).unwrap(), None);
+        assert_eq!(
+            super::validate_agy_custom_path(Some("   ".into())).unwrap(),
+            None
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "ccem-agy-custom-path-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(super::validate_agy_custom_path(Some(dir.to_string_lossy().to_string())).is_err());
+        assert!(super::validate_agy_custom_path(Some("/nonexistent/agy/bin".into())).is_err());
+
+        let file = dir.join("agy");
+        std::fs::write(&file, "#!/bin/sh\n").unwrap();
+        let file_str = file.to_string_lossy().to_string();
+        assert_eq!(
+            super::validate_agy_custom_path(Some(format!("  {file_str}  "))).unwrap(),
+            Some(file_str)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

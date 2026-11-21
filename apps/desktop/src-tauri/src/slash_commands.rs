@@ -302,6 +302,18 @@ fn list_workspace_commands_sync(
     provider: Option<String>,
     codex_isolated: Option<bool>,
 ) -> Result<Vec<WorkspaceCommand>, String> {
+    let normalized_provider = provider
+        .as_deref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+
+    if matches!(
+        normalized_provider.as_deref(),
+        Some("agy") | Some("antigravity")
+    ) {
+        return Ok(Vec::new());
+    }
+
     let codex_isolated = match codex_isolated { Some(mode) => mode, None => crate::agent_home::codex_isolation_preference()? };
     crate::agent_home::prepare_agent_homes_for_mode(codex_isolated)?;
     let codex_home = crate::agent_home::codex_home_for_mode(codex_isolated);
@@ -310,10 +322,6 @@ fn list_workspace_commands_sync(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from);
-    let normalized_provider = provider
-        .as_deref()
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| !value.is_empty());
 
     let mut commands = Vec::new();
     match normalized_provider.as_deref() {
@@ -449,6 +457,23 @@ mod tests {
             commands[1].path,
             profile.join("commands").join("ccem.md").to_string_lossy()
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agy_provider_does_not_fall_through_to_claude_or_codex_commands() {
+        let dir = temp_dir("agy-empty");
+        std::fs::create_dir_all(dir.join(".claude/commands")).unwrap();
+        std::fs::write(dir.join(".claude/commands/only-claude.md"), "hello").unwrap();
+
+        let commands = list_workspace_commands_sync(
+            Some(dir.to_string_lossy().to_string()),
+            Some("agy".to_string()),
+            None,
+        )
+        .expect("agy slash command scan should succeed");
+        assert!(commands.is_empty());
 
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -483,6 +483,7 @@ fn normalize_runtime_client(client: Option<&str>) -> String {
     match client {
         Some("codex") => "codex".to_string(),
         Some("opencode") => "opencode".to_string(),
+        Some("agy") => "agy".to_string(),
         _ => "claude".to_string(),
     }
 }
@@ -1075,5 +1076,13 @@ mod tests {
             decorations[0].attention_kind.as_deref(),
             Some("permission_required")
         );
+    }
+
+    #[test]
+    fn normalize_runtime_client_preserves_agy() {
+        assert_eq!(super::normalize_runtime_client(Some("agy")), "agy");
+        assert_eq!(super::normalize_runtime_client(Some("codex")), "codex");
+        assert_eq!(super::normalize_runtime_client(Some("opencode")), "opencode");
+        assert_eq!(super::normalize_runtime_client(None), "claude");
     }
 }

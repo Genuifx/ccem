@@ -526,10 +526,10 @@ pub fn start_session_monitor(app: AppHandle, manager: Arc<SessionManager>) {
                 let context = NotificationContext::new(
                     session.env_name.clone(),
                     session.working_dir.clone(),
-                    if session.client == "codex" {
-                        "Codex"
-                    } else {
-                        "Claude"
+                    match session.client.as_str() {
+                        "codex" => "Codex",
+                        "agy" => "Antigravity",
+                        _ => "Claude",
                     },
                 );
 

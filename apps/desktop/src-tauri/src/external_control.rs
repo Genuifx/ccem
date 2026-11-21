@@ -946,8 +946,10 @@ impl ExternalControlManager {
         }
         let env_name = params
             .env_name
-            .map(|value| value.trim().to_string())
+            .as_deref()
+            .map(str::trim)
             .filter(|value| !value.is_empty())
+            .map(str::to_string)
             .or_else(resolve_current_env)
             .unwrap_or_else(|| "official".to_string());
         let working_dir = resolve_working_dir(params.cwd)?;
@@ -988,6 +990,7 @@ impl ExternalControlManager {
                     codex_path: None,
                     codex_base_url: None,
                     codex_api_key: None,
+                    agy_path: None,
                     effort: params.effort,
                     model: params.model,
                     router_launch_draft,
@@ -1021,6 +1024,43 @@ impl ExternalControlManager {
                     codex_path: terminal::resolve_codex_path(),
                     codex_base_url: None,
                     codex_api_key: None,
+                    agy_path: None,
+                    effort: params.effort,
+                    model: params.model,
+                    router_launch_draft: None,
+                    router_record: None,
+                    fork_from_message_id: None,
+                }
+            }
+            NativeProvider::Agy => {
+                let proxy_env_vars = system_proxy::resolve_codex_proxy_env();
+                let agy_env_name = params
+                    .env_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "Antigravity".to_string());
+                NativeSessionOptions {
+                    provider,
+                    codex_isolated: None,
+                    env_name: agy_env_name,
+                    perm_mode,
+                    runtime_perm_mode,
+                    working_dir,
+                    initial_prompt: Some(params.prompt),
+                    display_prompt: None,
+                    initial_images: None,
+                    initial_annotations: None,
+                    provider_session_id: params.provider_session_id,
+                    seed_boundary_message_count: None,
+                    helper_env_vars: proxy_env_vars.clone(),
+                    terminal_env_vars: proxy_env_vars,
+                    claude_path: None,
+                    codex_path: None,
+                    codex_base_url: None,
+                    codex_api_key: None,
+                    agy_path: terminal::resolve_agy_path(),
                     effort: params.effort,
                     model: params.model,
                     router_launch_draft: None,
@@ -1977,8 +2017,9 @@ fn parse_native_provider(provider: &str) -> Result<NativeProvider, String> {
     match provider.trim().to_lowercase().as_str() {
         "claude" => Ok(NativeProvider::Claude),
         "codex" => Ok(NativeProvider::Codex),
+        "agy" => Ok(NativeProvider::Agy),
         other => Err(format!(
-            "Unsupported native provider '{}'. Use claude or codex.",
+            "Unsupported native provider '{}'. Use claude, codex, or agy.",
             other
         )),
     }
@@ -2078,7 +2119,7 @@ fn build_runtime_link(summary: &NativeSessionSummary) -> String {
 
 fn control_capabilities() -> Value {
     json!({
-        "taskModelSelection": { "version": 1, "providers": ["codex"] },
+        "taskModelSelection": { "version": 1, "providers": ["codex", "agy"] },
         "cron": { "version": 1, "actions": ["list", "trigger"] }
     })
 }
@@ -2790,7 +2831,7 @@ mod tests {
     #[test]
     fn task_model_capability_and_create_params_contract() {
         assert_eq!(control_capabilities(), json!({
-            "taskModelSelection": { "version": 1, "providers": ["codex"] },
+            "taskModelSelection": { "version": 1, "providers": ["codex", "agy"] },
             "cron": { "version": 1, "actions": ["list", "trigger"] }
         }));
         let legacy = create_session_params(json!({ "provider": "codex", "prompt": "start" }));

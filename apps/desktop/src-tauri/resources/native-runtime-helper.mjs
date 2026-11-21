@@ -27740,9 +27740,9 @@ var Codex = class {
 };
 
 // src/index.ts
-import { randomUUID as randomUUID7 } from "node:crypto";
+import { randomUUID as randomUUID8 } from "node:crypto";
 import { createInterface } from "node:readline";
-import process4 from "node:process";
+import process6 from "node:process";
 
 // ../core/src/agent-home.ts
 import fs5 from "node:fs";
@@ -29474,6 +29474,46 @@ function normalizeCodexSandboxMode(permMode) {
     approvalPolicy: "on-request",
     networkAccessEnabled: true
   };
+}
+function normalizeAgyPermissionMode(permMode) {
+  switch (permMode) {
+    case "yolo":
+    case "bypassPermissions":
+    case "danger-full-access":
+      return {
+        acpMode: "auto",
+        dangerouslySkipPermissions: true
+      };
+    case "plan":
+    case "readonly":
+    case "audit":
+    case "read-only":
+      return {
+        acpMode: "plan",
+        dangerouslySkipPermissions: false
+      };
+    case "dev":
+    case "acceptEdits":
+    case "accept-edits":
+      return {
+        acpMode: "accept-edits",
+        dangerouslySkipPermissions: false
+      };
+    case "auto":
+      return {
+        acpMode: "auto",
+        dangerouslySkipPermissions: false
+      };
+    case "safe":
+    case "ci":
+    case "default":
+    case "manual":
+    default:
+      return {
+        acpMode: "default",
+        dangerouslySkipPermissions: false
+      };
+  }
 }
 
 // src/claudePermissionControl.ts
@@ -50229,6 +50269,12 @@ function normalizeStatus(value, fallback = "pending") {
   if (value === "pending" || value === "in_progress" || value === "completed" || value === "failed") {
     return value;
   }
+  if (value === "in-progress") {
+    return "in_progress";
+  }
+  if (value === "done") {
+    return "completed";
+  }
   return fallback;
 }
 function parseResultObject(value) {
@@ -50272,10 +50318,16 @@ function isTodoSnapshotItemV1(value) {
 }
 function isTodoSnapshotV1(value) {
   const record3 = readObject2(value);
-  if (!record3 || record3.version !== 1 || record3.provider !== "claude" && record3.provider !== "codex" || typeof record3.revision !== "number" || !Number.isSafeInteger(record3.revision) || record3.revision < 0 || !Array.isArray(record3.items) || !record3.items.every(isTodoSnapshotItemV1)) {
+  if (!record3 || record3.version !== 1 || record3.provider !== "claude" && record3.provider !== "codex" && record3.provider !== "agy" || typeof record3.revision !== "number" || !Number.isSafeInteger(record3.revision) || record3.revision < 0 || !Array.isArray(record3.items) || !record3.items.every(isTodoSnapshotItemV1)) {
     return false;
   }
-  return record3.provider === "claude" ? ["TodoWrite", "TaskCreate", "TaskUpdate", "TaskList"].includes(String(record3.source)) : record3.source === "todo_list";
+  if (record3.provider === "claude") {
+    return ["TodoWrite", "TaskCreate", "TaskUpdate", "TaskList"].includes(String(record3.source));
+  }
+  if (record3.provider === "agy") {
+    return record3.source === "plan";
+  }
+  return record3.source === "todo_list";
 }
 function itemFromRecord(value, fallbackId) {
   const record3 = readObject2(value);
@@ -50302,6 +50354,19 @@ function snapshotFromCodexTodoList(item, revision = 1) {
     version: 1,
     provider: "codex",
     source: "todo_list",
+    revision,
+    items
+  };
+}
+function snapshotFromAgyPlan(entries, revision = 1) {
+  if (!Array.isArray(entries)) {
+    return void 0;
+  }
+  const items = entries.map((value, index) => itemFromRecord(value, `plan:${index}`)).filter((value) => Boolean(value));
+  return {
+    version: 1,
+    provider: "agy",
+    source: "plan",
     revision,
     items
   };
@@ -50419,6 +50484,14 @@ var TodoSnapshotTracker = class {
   }
   fromCodexTodoList(item) {
     const snapshot = snapshotFromCodexTodoList(item, this.revision + 1);
+    if (!snapshot) {
+      return void 0;
+    }
+    this.revision = snapshot.revision;
+    return snapshot;
+  }
+  fromAgyPlan(entries) {
+    const snapshot = snapshotFromAgyPlan(entries, this.revision + 1);
     if (!snapshot) {
       return void 0;
     }
@@ -51531,6 +51604,1124 @@ async function resolveCodexTurnUsage(sessionId, baseline, codexHome) {
   return null;
 }
 
+// src/agyRuntime.ts
+import { randomUUID as randomUUID7 } from "node:crypto";
+import process5 from "node:process";
+
+// src/agyAcpClient.ts
+import { spawn as spawn2 } from "node:child_process";
+import process4 from "node:process";
+var AGY_AUTH_REQUIRED_PREFIX = "AGY_AUTH_REQUIRED: Antigravity is not signed in. Sign in with Google to continue.";
+var MIN_RECOMMENDED_AGY_VERSION = [1, 5, 5];
+var DEFAULT_CONTROL_TIMEOUT_MS = 3e4;
+var SESSION_CLOSE_TIMEOUT_MS = 800;
+var EOF_EXIT_GRACE_MS = 1500;
+var SIGTERM_EXIT_GRACE_MS = 1500;
+var AcpJsonRpcError = class extends Error {
+  code;
+  data;
+  constructor(code, message, data) {
+    super(message);
+    this.name = "AcpJsonRpcError";
+    this.code = code;
+    this.data = data;
+  }
+};
+function isAgyAuthRequiredError(error62) {
+  if (error62 instanceof AcpJsonRpcError && error62.code === -32e3) {
+    return true;
+  }
+  const message = error62 instanceof Error ? error62.message : String(error62 ?? "");
+  return /authentication required/i.test(message);
+}
+function formatAgyAuthRequiredError(error62) {
+  const detail = error62 instanceof Error ? error62.message.trim() : String(error62 ?? "").trim();
+  if (!detail || /^authentication required$/i.test(detail)) {
+    return AGY_AUTH_REQUIRED_PREFIX;
+  }
+  if (detail.startsWith(AGY_AUTH_REQUIRED_PREFIX)) {
+    return detail;
+  }
+  return `${AGY_AUTH_REQUIRED_PREFIX} (${detail})`;
+}
+function parseSemverTuple(version2) {
+  if (!version2 || typeof version2 !== "string") {
+    return null;
+  }
+  const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(version2.trim());
+  if (!match) {
+    return null;
+  }
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+function isAgyVersionBelowRecommended(version2) {
+  const parsed = parseSemverTuple(version2);
+  if (!parsed) {
+    return false;
+  }
+  for (let i = 0; i < 3; i += 1) {
+    if (parsed[i] < MIN_RECOMMENDED_AGY_VERSION[i]) {
+      return true;
+    }
+    if (parsed[i] > MIN_RECOMMENDED_AGY_VERSION[i]) {
+      return false;
+    }
+  }
+  return false;
+}
+var AGY_STRIPPED_ENV_KEYS = /* @__PURE__ */ new Set([
+  "CLAUDE_CONFIG_DIR",
+  "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+  "CLAUDE_CODE_PLUGIN_CACHE_DIR",
+  "CODEX_HOME",
+  "CODEX_SQLITE_HOME",
+  "CCEM_CODEX_ISOLATED"
+]);
+function isDisallowedAgyEnvKey(key) {
+  return key.startsWith("ANTHROPIC_") || AGY_STRIPPED_ENV_KEYS.has(key);
+}
+function buildAgyProcessEnv(baseEnv = process4.env, extraEnvVars) {
+  const env = {};
+  for (const [key, value] of Object.entries(baseEnv)) {
+    if (value === void 0 || isDisallowedAgyEnvKey(key)) {
+      continue;
+    }
+    env[key] = value;
+  }
+  if (extraEnvVars) {
+    for (const [key, value] of Object.entries(extraEnvVars)) {
+      if (typeof value !== "string") {
+        continue;
+      }
+      if (key === "HOME" && baseEnv.HOME) {
+        continue;
+      }
+      if (isDisallowedAgyEnvKey(key)) {
+        continue;
+      }
+      env[key] = value;
+    }
+  }
+  return env;
+}
+function readObject3(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value;
+}
+var AgyAcpClient = class {
+  constructor(options) {
+    this.options = options;
+  }
+  child = null;
+  nextRequestId = 1;
+  pendingRequests = /* @__PURE__ */ new Map();
+  stdoutBuffer = "";
+  stderrBuffer = "";
+  closed = false;
+  closePromise = null;
+  exitPromise = null;
+  resolveExit = null;
+  initializedResult = null;
+  activeSessionId = null;
+  get isAlive() {
+    return Boolean(this.child && !this.closed && this.child.exitCode === null && this.child.signalCode === null);
+  }
+  get initializeResult() {
+    return this.initializedResult;
+  }
+  get currentSessionId() {
+    return this.activeSessionId;
+  }
+  start() {
+    if (this.child) {
+      return;
+    }
+    this.closed = false;
+    const args = [
+      "acp",
+      ...this.options.dangerouslySkipPermissions ? ["--dangerously-skip-permissions"] : []
+    ];
+    const child = spawn2(this.options.agyPath, args, {
+      cwd: this.options.cwd,
+      env: this.options.env,
+      stdio: ["pipe", "pipe", "pipe"]
+    });
+    this.child = child;
+    this.exitPromise = new Promise((resolve2) => {
+      this.resolveExit = resolve2;
+    });
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      this.handleStdoutChunk(chunk);
+    });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      this.handleStderrChunk(chunk);
+    });
+    child.stdin.on("error", () => {
+    });
+    child.on("error", (error62) => {
+      this.failAllPendingRequests(
+        new Error(`Antigravity ACP process error: ${error62.message}`)
+      );
+      this.resolveExit?.();
+      this.resolveExit = null;
+    });
+    child.on("exit", (code, signal) => {
+      this.flushStderrBuffer();
+      const reason = signal ? `Antigravity ACP process exited with signal ${signal}.` : `Antigravity ACP process exited with code ${code ?? "unknown"}.`;
+      this.failAllPendingRequests(new Error(reason));
+      this.child = null;
+      this.resolveExit?.();
+      this.resolveExit = null;
+      this.options.onExit?.({ code, signal });
+    });
+  }
+  async initialize() {
+    this.start();
+    const result = await this.sendRequest("initialize", {
+      protocolVersion: 1,
+      clientInfo: {
+        name: "ccem-desktop",
+        version: "1.0.0"
+      },
+      clientCapabilities: {
+        fs: {
+          readTextFile: false,
+          writeTextFile: false
+        },
+        terminal: false,
+        auth: {
+          terminal: true
+        }
+      }
+    });
+    this.initializedResult = result;
+    const version2 = result.agentInfo?.version;
+    if (isAgyVersionBelowRecommended(version2)) {
+      this.options.onWarning?.(
+        `Antigravity CLI version ${version2} is below recommended 1.5.5; permission handling may be unstable. Consider running "agy update".`
+      );
+    }
+    return result;
+  }
+  async sessionNew(cwd, mcpServers = []) {
+    const result = await this.sendRequest("session/new", {
+      cwd,
+      mcpServers
+    });
+    if (typeof result?.sessionId === "string" && result.sessionId.trim()) {
+      this.activeSessionId = result.sessionId.trim();
+    }
+    return result;
+  }
+  async sessionResumeOrLoad(sessionId, cwd, mcpServers = []) {
+    const caps = this.initializedResult?.agentCapabilities;
+    const sessionCaps = caps?.sessionCapabilities ?? caps?.session_capabilities;
+    const canResume = sessionCaps ? sessionCaps.resume !== void 0 : true;
+    const canLoad = Boolean(
+      caps?.loadSession || caps?.load_session || sessionCaps?.load !== void 0
+    );
+    const normalizeResult = (raw) => {
+      const record3 = readObject3(raw) ?? {};
+      const resolvedId = typeof record3.sessionId === "string" && record3.sessionId.trim() ? record3.sessionId.trim() : sessionId;
+      this.activeSessionId = resolvedId;
+      return {
+        ...record3,
+        sessionId: resolvedId
+      };
+    };
+    if (canResume) {
+      try {
+        const resumed = await this.sendRequest("session/resume", {
+          sessionId,
+          cwd,
+          mcpServers
+        });
+        return normalizeResult(resumed);
+      } catch (error62) {
+        if (isAgyAuthRequiredError(error62) || !canLoad) {
+          throw error62;
+        }
+      }
+    }
+    const loaded = await this.sendRequest("session/load", {
+      sessionId,
+      cwd,
+      mcpServers
+    });
+    return normalizeResult(loaded);
+  }
+  async sessionSetMode(sessionId, modeId) {
+    return this.sendRequest("session/set_mode", {
+      sessionId,
+      modeId
+    });
+  }
+  async sessionSetConfigOption(sessionId, configId, value) {
+    return this.sendRequest("session/set_config_option", {
+      sessionId,
+      configId,
+      value
+    });
+  }
+  async sessionPrompt(sessionId, prompt) {
+    return this.sendRequest(
+      "session/prompt",
+      {
+        sessionId,
+        prompt
+      },
+      { timeoutMs: 0 }
+    );
+  }
+  sessionCancel(sessionId) {
+    this.sendNotification("session/cancel", { sessionId });
+  }
+  async sessionClose(sessionId) {
+    if (!this.isAlive) {
+      return;
+    }
+    try {
+      await this.sendRequest("session/close", { sessionId }, { timeoutMs: SESSION_CLOSE_TIMEOUT_MS });
+    } catch {
+    }
+  }
+  async close() {
+    if (this.closePromise) {
+      return this.closePromise;
+    }
+    this.closePromise = (async () => {
+      const child = this.child;
+      if (!child) {
+        this.closed = true;
+        return;
+      }
+      const sessionId = this.activeSessionId;
+      this.activeSessionId = null;
+      if (sessionId && this.isAlive) {
+        await this.sessionClose(sessionId);
+      }
+      this.closed = true;
+      this.failAllPendingRequests(new Error("Antigravity ACP client closed."));
+      try {
+        if (!child.stdin.destroyed && !child.stdin.writableEnded) {
+          child.stdin.end();
+        }
+      } catch {
+      }
+      const exitedAfterEof = await this.waitForExit(EOF_EXIT_GRACE_MS);
+      if (exitedAfterEof || child.exitCode !== null || child.signalCode !== null) {
+        return;
+      }
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        return;
+      }
+      const exitedAfterTerm = await this.waitForExit(SIGTERM_EXIT_GRACE_MS);
+      if (exitedAfterTerm || child.exitCode !== null || child.signalCode !== null) {
+        return;
+      }
+      try {
+        child.kill("SIGKILL");
+      } catch {
+      }
+      await this.waitForExit(500);
+    })();
+    return this.closePromise;
+  }
+  waitForExit(timeoutMs) {
+    if (!this.child || !this.exitPromise) {
+      return Promise.resolve(true);
+    }
+    return new Promise((resolve2) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          resolve2(false);
+        }
+      }, timeoutMs);
+      timer.unref?.();
+      void this.exitPromise.then(() => {
+        clearTimeout(timer);
+        if (!settled) {
+          settled = true;
+          resolve2(true);
+        }
+      });
+    });
+  }
+  sendRequest(method, params, options) {
+    if (!this.child || !this.isAlive) {
+      return Promise.reject(new Error(`Cannot send "${method}": Antigravity ACP server is not running.`));
+    }
+    const id = this.nextRequestId++;
+    const timeoutMs = options?.timeoutMs ?? this.options.requestTimeoutMs ?? DEFAULT_CONTROL_TIMEOUT_MS;
+    return new Promise((resolve2, reject) => {
+      const pending = {
+        method,
+        resolve: resolve2,
+        reject
+      };
+      if (timeoutMs > 0) {
+        pending.timer = setTimeout(() => {
+          this.pendingRequests.delete(id);
+          reject(new Error(`ACP request "${method}" timed out after ${timeoutMs}ms.`));
+        }, timeoutMs);
+        pending.timer.unref?.();
+      }
+      this.pendingRequests.set(id, pending);
+      try {
+        this.writeJsonLine({
+          jsonrpc: "2.0",
+          id,
+          method,
+          ...params !== void 0 ? { params } : {}
+        });
+      } catch (error62) {
+        if (pending.timer) {
+          clearTimeout(pending.timer);
+        }
+        this.pendingRequests.delete(id);
+        reject(error62 instanceof Error ? error62 : new Error(String(error62)));
+      }
+    });
+  }
+  sendNotification(method, params) {
+    if (!this.child || !this.isAlive) {
+      return;
+    }
+    try {
+      this.writeJsonLine({
+        jsonrpc: "2.0",
+        method,
+        ...params !== void 0 ? { params } : {}
+      });
+    } catch {
+    }
+  }
+  sendResponse(id, result) {
+    if (!this.child || !this.isAlive) {
+      return;
+    }
+    try {
+      this.writeJsonLine({
+        jsonrpc: "2.0",
+        id,
+        result
+      });
+    } catch {
+    }
+  }
+  sendErrorResponse(id, code, message) {
+    if (!this.child || !this.isAlive) {
+      return;
+    }
+    try {
+      this.writeJsonLine({
+        jsonrpc: "2.0",
+        id,
+        error: { code, message }
+      });
+    } catch {
+    }
+  }
+  writeJsonLine(payload) {
+    if (!this.child || this.child.stdin.destroyed || this.child.stdin.writableEnded) {
+      throw new Error("Antigravity ACP stdin is not writable.");
+    }
+    this.child.stdin.write(`${JSON.stringify(payload)}
+`);
+  }
+  handleStdoutChunk(chunk) {
+    this.stdoutBuffer += chunk;
+    for (; ; ) {
+      const newlineIndex = this.stdoutBuffer.indexOf("\n");
+      if (newlineIndex < 0) {
+        break;
+      }
+      const line = this.stdoutBuffer.slice(0, newlineIndex).replace(/\r$/, "");
+      this.stdoutBuffer = this.stdoutBuffer.slice(newlineIndex + 1);
+      const trimmed = line.trim();
+      if (!trimmed) {
+        continue;
+      }
+      this.handleStdoutLine(trimmed);
+    }
+  }
+  handleStdoutLine(line) {
+    let parsed;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      this.options.onStderrLine?.(`[agy acp stdout] ${line}`);
+      return;
+    }
+    const message = readObject3(parsed);
+    if (!message) {
+      return;
+    }
+    const hasId = message.id !== void 0 && message.id !== null;
+    const method = typeof message.method === "string" ? message.method : null;
+    if (hasId && !method && ("result" in message || "error" in message)) {
+      const pending = this.pendingRequests.get(message.id);
+      if (!pending) {
+        return;
+      }
+      this.pendingRequests.delete(message.id);
+      if (pending.timer) {
+        clearTimeout(pending.timer);
+      }
+      const errorRecord = readObject3(message.error);
+      if (errorRecord) {
+        const code = typeof errorRecord.code === "number" ? errorRecord.code : -32e3;
+        const errMessage = typeof errorRecord.message === "string" ? errorRecord.message : `ACP request "${pending.method}" failed with code ${code}`;
+        pending.reject(new AcpJsonRpcError(code, errMessage, errorRecord.data));
+      } else {
+        pending.resolve(message.result);
+      }
+      return;
+    }
+    if (hasId && method) {
+      void this.handleServerRequest(message.id, method, message.params);
+      return;
+    }
+    if (method) {
+      if (method === "session/update") {
+        const params = readObject3(message.params);
+        if (params) {
+          this.options.onSessionUpdate?.(params);
+        }
+      }
+    }
+  }
+  async handleServerRequest(id, method, params) {
+    if (method === "session/request_permission") {
+      if (!this.options.onRequestPermission) {
+        this.sendResponse(id, { outcome: { outcome: "cancelled" } });
+        return;
+      }
+      try {
+        const response = await this.options.onRequestPermission(
+          readObject3(params) ?? {}
+        );
+        this.sendResponse(id, response);
+      } catch (error62) {
+        this.sendErrorResponse(
+          id,
+          -32603,
+          error62 instanceof Error ? error62.message : String(error62)
+        );
+      }
+      return;
+    }
+    this.sendErrorResponse(id, -32601, `Unsupported client method: ${method}`);
+  }
+  handleStderrChunk(chunk) {
+    this.stderrBuffer += chunk;
+    for (; ; ) {
+      const newlineIndex = this.stderrBuffer.indexOf("\n");
+      if (newlineIndex < 0) {
+        break;
+      }
+      const line = this.stderrBuffer.slice(0, newlineIndex).replace(/\r$/, "");
+      this.stderrBuffer = this.stderrBuffer.slice(newlineIndex + 1);
+      if (line.trim()) {
+        this.options.onStderrLine?.(line);
+      }
+    }
+  }
+  flushStderrBuffer() {
+    const remaining = this.stderrBuffer.trim();
+    this.stderrBuffer = "";
+    if (remaining) {
+      this.options.onStderrLine?.(remaining);
+    }
+  }
+  failAllPendingRequests(error62) {
+    for (const pending of this.pendingRequests.values()) {
+      if (pending.timer) {
+        clearTimeout(pending.timer);
+      }
+      pending.reject(error62);
+    }
+    this.pendingRequests.clear();
+  }
+};
+
+// src/agyRuntime.ts
+function readObject4(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value;
+}
+function readString2(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : void 0;
+}
+function readFiniteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : void 0;
+}
+function extractTextFromContent(content) {
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content.map(extractTextFromContent).filter(Boolean).join("");
+  }
+  const record3 = readObject4(content);
+  if (!record3) {
+    return "";
+  }
+  if (typeof record3.text === "string") {
+    return record3.text;
+  }
+  if (record3.content !== void 0) {
+    return extractTextFromContent(record3.content);
+  }
+  return "";
+}
+function summarizeValue(value) {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value == null) {
+    return "";
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+function classifyAgyToolCategory(kind, name) {
+  const normalizedKind = (kind ?? "").toLowerCase();
+  const normalizedName = (name ?? "").toLowerCase();
+  if (normalizedKind === "execute" || normalizedKind === "terminal" || normalizedKind === "command" || /(run_command|bash|shell|exec|terminal|command)/.test(normalizedName)) {
+    return "execution";
+  }
+  if (normalizedKind === "read" || normalizedKind === "edit" || normalizedKind === "write" || normalizedKind === "delete" || normalizedKind === "move" || /(read_file|write_file|edit_file|replace_file|create_file|delete_file|file)/.test(normalizedName)) {
+    return "file_op";
+  }
+  if (normalizedKind === "search" || normalizedKind === "fetch" || /(search|grep|glob|find|web|fetch)/.test(normalizedName)) {
+    return "search";
+  }
+  if (normalizedKind === "plan" || normalizedKind === "think" || /(todo|plan|task)/.test(normalizedName)) {
+    return "task_mgmt";
+  }
+  return "unknown";
+}
+function buildAgyPromptBlocks(text, images) {
+  const parts = buildPromptContentParts(text, images);
+  const blocks = [];
+  for (const part of parts) {
+    if (part.type === "text") {
+      blocks.push({ type: "text", text: part.text });
+    } else if (part.type === "image") {
+      blocks.push({
+        type: "image",
+        mimeType: part.image.mediaType,
+        data: part.image.base64Data
+      });
+    }
+  }
+  return blocks;
+}
+function selectAgyPermissionOutcome(approved, options) {
+  const list = Array.isArray(options) ? options : [];
+  if (list.length === 0) {
+    return { outcome: { outcome: "cancelled" } };
+  }
+  if (approved) {
+    const allowOnce = list.find((option) => option.kind === "allow_once");
+    const allowAlways = list.find((option) => option.kind === "allow_always");
+    const chosen2 = allowOnce ?? allowAlways ?? list[0];
+    return {
+      outcome: {
+        outcome: "selected",
+        optionId: chosen2.optionId
+      }
+    };
+  }
+  const rejectOnce = list.find((option) => option.kind === "reject_once");
+  const rejectAlways = list.find((option) => option.kind === "reject_always");
+  const chosen = rejectOnce ?? rejectAlways;
+  if (!chosen) {
+    return { outcome: { outcome: "cancelled" } };
+  }
+  return {
+    outcome: {
+      outcome: "selected",
+      optionId: chosen.optionId
+    }
+  };
+}
+function getConfigOptionId(option) {
+  return readString2(option.configId) ?? readString2(option.id);
+}
+var AgyRuntime = class {
+  constructor(callbacks) {
+    this.callbacks = callbacks;
+  }
+  client = null;
+  sessionId = null;
+  configOptions = [];
+  activeOperation = null;
+  activeDangerouslySkipPermissions = false;
+  startedTools = /* @__PURE__ */ new Map();
+  completedTools = /* @__PURE__ */ new Set();
+  activePermissions = /* @__PURE__ */ new Map();
+  turnCancelled = false;
+  get hasLiveSession() {
+    return Boolean(this.client?.isAlive && this.sessionId);
+  }
+  async ensureSession() {
+    const config2 = this.callbacks.getInitConfig();
+    if (!config2) {
+      throw new Error("Native runtime helper not initialized");
+    }
+    const normalizedPerm = normalizeAgyPermissionMode(config2.permMode);
+    if (this.client?.isAlive && this.sessionId && this.activeDangerouslySkipPermissions === normalizedPerm.dangerouslySkipPermissions) {
+      return { client: this.client, sessionId: this.sessionId };
+    }
+    if (this.client) {
+      await this.teardown();
+    }
+    const agyPath = config2.agyPath?.trim() || "agy";
+    const env = buildAgyProcessEnv(process5.env, config2.envVars);
+    this.activeDangerouslySkipPermissions = normalizedPerm.dangerouslySkipPermissions;
+    const client = new AgyAcpClient({
+      agyPath,
+      cwd: config2.workingDir,
+      env,
+      dangerouslySkipPermissions: normalizedPerm.dangerouslySkipPermissions,
+      onSessionUpdate: (params) => this.handleSessionUpdate(params),
+      onRequestPermission: (params) => this.handleRequestPermission(params),
+      onStderrLine: (line) => {
+        this.callbacks.emitEvent({ type: "stderr_line", line });
+      },
+      onWarning: (message) => {
+        this.callbacks.emitEvent({ type: "stderr_line", line: message });
+      },
+      onExit: () => {
+        this.cancelPendingPermissions("runtime_exit");
+        if (this.client === client) {
+          this.client = null;
+          this.sessionId = null;
+        }
+      }
+    });
+    this.client = client;
+    try {
+      await client.initialize();
+      const resumeSessionId = this.callbacks.getCurrentProviderSessionId()?.trim() || null;
+      const sessionResult = resumeSessionId ? await client.sessionResumeOrLoad(resumeSessionId, config2.workingDir) : await client.sessionNew(config2.workingDir);
+      const resolvedSessionId = sessionResult.sessionId?.trim();
+      if (!resolvedSessionId) {
+        throw new Error("Antigravity ACP did not return a sessionId.");
+      }
+      this.sessionId = resolvedSessionId;
+      if (Array.isArray(sessionResult.configOptions)) {
+        this.configOptions = sessionResult.configOptions;
+      }
+      this.callbacks.emitSessionMeta(resolvedSessionId);
+      await this.applySessionConfig(client, resolvedSessionId, {
+        permMode: config2.permMode,
+        effort: config2.effort ?? void 0,
+        model: config2.model ?? void 0
+      });
+      return { client, sessionId: resolvedSessionId };
+    } catch (error62) {
+      await this.teardown();
+      if (isAgyAuthRequiredError(error62)) {
+        throw new Error(formatAgyAuthRequiredError(error62));
+      }
+      throw error62;
+    }
+  }
+  async runTurn(text, images, abortController, operation) {
+    this.turnCancelled = false;
+    const { client, sessionId } = await this.ensureSession();
+    abortController.signal.throwIfAborted();
+    const promptBlocks = buildAgyPromptBlocks(text, images);
+    if (promptBlocks.length === 0) {
+      return;
+    }
+    this.activeOperation = operation ?? null;
+    this.startedTools.clear();
+    this.completedTools.clear();
+    const onAbort = () => {
+      this.turnCancelled = true;
+      this.cancelPendingPermissions("turn_interrupted");
+      if (this.client === client && client.isAlive) {
+        client.sessionCancel(sessionId);
+      }
+    };
+    abortController.signal.addEventListener("abort", onAbort, { once: true });
+    operation?.observe("started", "Antigravity ACP started the turn.");
+    operation?.markResponseStart();
+    this.callbacks.emitEvent({
+      type: "lifecycle",
+      stage: "turn_started",
+      detail: "Antigravity is thinking\u2026"
+    });
+    try {
+      const result = await client.sessionPrompt(sessionId, promptBlocks);
+      const stopReason = readString2(result?.stopReason) ?? "end_turn";
+      const usage2 = readObject4(result?.usage);
+      if (usage2) {
+        this.emitUsagePayload(usage2);
+      }
+      if (stopReason === "cancelled" || this.turnCancelled || abortController.signal.aborted) {
+        operation?.observe("unknown", "Antigravity turn interrupted.");
+        const abortError = new Error("Antigravity turn interrupted.");
+        abortError.name = "AbortError";
+        throw abortError;
+      }
+      operation?.observe("completed", `Antigravity ACP completed the turn (${stopReason}).`);
+      this.callbacks.emitEvent({
+        type: "lifecycle",
+        stage: "turn_completed",
+        detail: "Turn completed"
+      });
+    } catch (error62) {
+      if (this.turnCancelled || abortController.signal.aborted) {
+        const abortError = new Error("Antigravity turn interrupted.");
+        abortError.name = "AbortError";
+        throw abortError;
+      }
+      if (isAgyAuthRequiredError(error62)) {
+        const authMessage = formatAgyAuthRequiredError(error62);
+        operation?.observe("failed", authMessage);
+        throw new Error(authMessage);
+      }
+      const message = error62 instanceof Error ? error62.message : String(error62);
+      operation?.observe("failed", message);
+      throw error62;
+    } finally {
+      abortController.signal.removeEventListener("abort", onAbort);
+      this.cancelPendingPermissions("turn_settled");
+      if (this.activeOperation === operation) {
+        this.activeOperation = null;
+      }
+    }
+  }
+  async applyLiveSettings(patch) {
+    const config2 = this.callbacks.getInitConfig();
+    if (!config2) {
+      return;
+    }
+    const nextPerm = normalizeAgyPermissionMode(config2.permMode);
+    const needsRespawn = Boolean(patch.envVarsChanged) || this.client !== null && this.activeDangerouslySkipPermissions !== nextPerm.dangerouslySkipPermissions;
+    if (needsRespawn) {
+      await this.teardown();
+      return;
+    }
+    if (!this.client?.isAlive || !this.sessionId) {
+      return;
+    }
+    await this.applySessionConfig(this.client, this.sessionId, {
+      ...patch.permMode !== void 0 ? { permMode: patch.permMode } : {},
+      ...patch.effort !== void 0 ? { effort: patch.effort } : {}
+    });
+  }
+  interruptTurn() {
+    this.turnCancelled = true;
+    this.cancelPendingPermissions("turn_interrupted");
+    if (this.client?.isAlive && this.sessionId) {
+      this.client.sessionCancel(this.sessionId);
+    }
+  }
+  async teardown() {
+    this.cancelPendingPermissions("runtime_stopped");
+    const client = this.client;
+    this.client = null;
+    this.sessionId = null;
+    this.configOptions = [];
+    this.startedTools.clear();
+    this.completedTools.clear();
+    if (client) {
+      await client.close();
+    }
+  }
+  async applySessionConfig(client, sessionId, patch) {
+    if (patch.permMode !== void 0) {
+      const normalized = normalizeAgyPermissionMode(patch.permMode);
+      const modeOption = this.findConfigOption("mode", ["mode"]);
+      let updatedViaConfig = false;
+      if (modeOption) {
+        const configId = getConfigOptionId(modeOption) ?? "mode";
+        updatedViaConfig = await this.trySetConfigOption(client, sessionId, configId, normalized.acpMode);
+      }
+      if (!updatedViaConfig) {
+        try {
+          await client.sessionSetMode(sessionId, normalized.acpMode);
+        } catch {
+        }
+      }
+    }
+    if (patch.model !== void 0 && patch.model.trim()) {
+      const modelOption = this.findConfigOption("model", ["model"]);
+      const configId = (modelOption ? getConfigOptionId(modelOption) : void 0) ?? "model";
+      await this.trySetConfigOption(client, sessionId, configId, patch.model.trim());
+    }
+    if (patch.effort !== void 0 && patch.effort.trim()) {
+      const effortOption = this.findConfigOption("thought_level", [
+        "thought_level",
+        "effort",
+        "thinking_level"
+      ]);
+      const configId = (effortOption ? getConfigOptionId(effortOption) : void 0) ?? "thought_level";
+      await this.trySetConfigOption(client, sessionId, configId, patch.effort.trim());
+    }
+  }
+  findConfigOption(category, fallbackIds) {
+    const byCategory = this.configOptions.find((option) => option.category === category);
+    if (byCategory) {
+      return byCategory;
+    }
+    return this.configOptions.find((option) => {
+      const id = getConfigOptionId(option);
+      return id ? fallbackIds.includes(id) : false;
+    });
+  }
+  async trySetConfigOption(client, sessionId, configId, value) {
+    try {
+      const result = await client.sessionSetConfigOption(sessionId, configId, value);
+      const record3 = readObject4(result);
+      if (Array.isArray(record3?.configOptions)) {
+        this.configOptions = record3.configOptions;
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  handleSessionUpdate(params) {
+    const update = readObject4(params.update);
+    if (!update) {
+      return;
+    }
+    const kind = readString2(update.sessionUpdate) ?? readString2(update.type);
+    if (!kind) {
+      return;
+    }
+    if (kind === "agent_message_chunk") {
+      const text = extractTextFromContent(update.content ?? update.text);
+      if (text) {
+        this.activeOperation?.markOutputDelta(text);
+        this.callbacks.emitEvent({
+          type: "assistant_chunk",
+          text
+        });
+      }
+      return;
+    }
+    if (kind === "agent_thought_chunk") {
+      const text = extractTextFromContent(update.content ?? update.text);
+      if (text) {
+        this.activeOperation?.markOutputDelta(text);
+        this.callbacks.emitEvent({
+          type: "system_message",
+          message: text
+        });
+      }
+      return;
+    }
+    if (kind === "tool_call") {
+      const toolCallId = readString2(update.toolCallId) ?? `agy-tool-${Date.now()}`;
+      const rawName = readString2(update.title) ?? readString2(update.name) ?? readString2(update.kind) ?? "tool_call";
+      const category = classifyAgyToolCategory(readString2(update.kind), rawName);
+      const inputSummary = summarizeValue(
+        update.rawInput ?? update.input ?? update.title ?? rawName
+      );
+      this.startedTools.set(toolCallId, { rawName, category });
+      this.callbacks.emitEvent({
+        type: "tool_use_started",
+        tool_use_id: toolCallId,
+        category: {
+          category,
+          raw_name: rawName
+        },
+        raw_name: rawName,
+        input_summary: inputSummary,
+        needs_response: false
+      });
+      return;
+    }
+    if (kind === "tool_call_update") {
+      const toolCallId = readString2(update.toolCallId) ?? `agy-tool-${Date.now()}`;
+      const status = (readString2(update.status) ?? "").toLowerCase();
+      const existing = this.startedTools.get(toolCallId);
+      const rawName = existing?.rawName ?? readString2(update.title) ?? readString2(update.name) ?? readString2(update.kind) ?? "tool_call";
+      if (status === "completed" || status === "failed" || status === "error" || status === "cancelled") {
+        if (this.completedTools.has(toolCallId)) {
+          return;
+        }
+        this.completedTools.add(toolCallId);
+        const resultText = extractTextFromContent(update.content) || summarizeValue(update.rawOutput ?? update.result ?? update.title ?? status);
+        this.callbacks.emitEvent({
+          type: "tool_use_completed",
+          tool_use_id: toolCallId,
+          raw_name: rawName,
+          result_summary: resultText,
+          success: status === "completed"
+        });
+        return;
+      }
+      if (!existing) {
+        const category = classifyAgyToolCategory(readString2(update.kind), rawName);
+        this.startedTools.set(toolCallId, { rawName, category });
+        this.callbacks.emitEvent({
+          type: "tool_use_started",
+          tool_use_id: toolCallId,
+          category: {
+            category,
+            raw_name: rawName
+          },
+          raw_name: rawName,
+          input_summary: summarizeValue(update.rawInput ?? update.title ?? rawName),
+          needs_response: false
+        });
+      } else {
+        const progressText = extractTextFromContent(update.content) || readString2(update.title);
+        if (progressText) {
+          this.callbacks.emitEvent({
+            type: "lifecycle",
+            stage: "tool_progress",
+            detail: `${rawName}: ${progressText}`
+          });
+        }
+      }
+      return;
+    }
+    if (kind === "plan") {
+      const entries = update.entries ?? update.plan ?? update.items;
+      const snapshot = this.callbacks.todoSnapshotTracker.fromAgyPlan(entries);
+      if (snapshot) {
+        this.callbacks.emitEvent({
+          type: "tool_use_started",
+          tool_use_id: `agy-plan-${snapshot.revision}`,
+          category: {
+            category: "task_mgmt",
+            raw_name: "plan"
+          },
+          raw_name: "plan",
+          input_summary: JSON.stringify({
+            type: "plan",
+            items: snapshot.items
+          }),
+          needs_response: false,
+          todo_snapshot: snapshot
+        });
+      }
+      return;
+    }
+    if (kind === "usage_update") {
+      this.emitUsagePayload(update);
+      return;
+    }
+    if (kind === "config_option_update") {
+      if (Array.isArray(update.configOptions)) {
+        this.configOptions = update.configOptions;
+      }
+      return;
+    }
+  }
+  emitUsagePayload(record3) {
+    const usageRecord = readObject4(record3.usage) ?? record3;
+    const inputTokens = readFiniteNumber(usageRecord.inputTokens) ?? readFiniteNumber(usageRecord.input_tokens) ?? readFiniteNumber(usageRecord.used) ?? 0;
+    const outputTokens = readFiniteNumber(usageRecord.outputTokens) ?? readFiniteNumber(usageRecord.output_tokens) ?? 0;
+    const cacheReadTokens = readFiniteNumber(usageRecord.cachedReadTokens) ?? readFiniteNumber(usageRecord.cacheReadTokens) ?? readFiniteNumber(usageRecord.cache_read_tokens) ?? 0;
+    const cacheCreationTokens = readFiniteNumber(usageRecord.cachedWriteTokens) ?? readFiniteNumber(usageRecord.cacheCreationTokens) ?? readFiniteNumber(usageRecord.cache_creation_tokens) ?? 0;
+    const costRecord = readObject4(record3.cost) ?? readObject4(usageRecord.cost);
+    const totalCostUsd = readFiniteNumber(costRecord?.amount) ?? readFiniteNumber(usageRecord.totalCostUsd) ?? readFiniteNumber(usageRecord.total_cost_usd) ?? null;
+    if (outputTokens > 0) {
+      this.activeOperation?.recordOutputTokens(Math.trunc(outputTokens));
+    }
+    this.callbacks.emitEvent({
+      type: "token_usage",
+      provider: "agy",
+      ...this.activeOperation ? { operation_id: this.activeOperation.id } : {},
+      input_tokens: Math.trunc(inputTokens),
+      output_tokens: Math.trunc(outputTokens),
+      cache_read_tokens: Math.trunc(cacheReadTokens),
+      cache_creation_tokens: Math.trunc(cacheCreationTokens),
+      ...totalCostUsd !== null ? { total_cost_usd: totalCostUsd } : {},
+      scope: "turn_total"
+    });
+  }
+  async handleRequestPermission(params) {
+    const toolCall = readObject4(params.toolCall);
+    const toolUseId = readString2(toolCall?.toolCallId) ?? `agy-perm-${randomUUID7()}`;
+    const rawName = readString2(toolCall?.title) ?? readString2(toolCall?.kind) ?? "Antigravity tool";
+    const rawSummary = summarizeValue(toolCall?.rawInput ?? toolCall?.title ?? rawName);
+    const requestId = randomUUID7();
+    const options = Array.isArray(params.options) ? params.options : [];
+    if (!this.startedTools.has(toolUseId)) {
+      const category = classifyAgyToolCategory(readString2(toolCall?.kind), rawName);
+      this.startedTools.set(toolUseId, { rawName, category });
+      this.callbacks.emitEvent({
+        type: "tool_use_started",
+        tool_use_id: toolUseId,
+        category: {
+          category,
+          raw_name: rawName
+        },
+        raw_name: rawName,
+        input_summary: formatPermissionPreview(rawSummary, 160),
+        needs_response: false
+      });
+    }
+    this.callbacks.emitEvent({
+      type: "permission_required",
+      request_id: requestId,
+      tool_use_id: toolUseId,
+      tool_name: formatPermissionPreview(rawName, 80),
+      input_summary: formatPermissionPreview(rawSummary, 160)
+    });
+    return new Promise((resolve2) => {
+      let settled = false;
+      const finish = (response, approved, responder) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        this.activePermissions.delete(requestId);
+        this.callbacks.unregisterPermission(requestId);
+        this.callbacks.emitEvent({
+          type: "permission_responded",
+          request_id: requestId,
+          tool_use_id: toolUseId,
+          approved,
+          responder
+        });
+        resolve2(response);
+      };
+      this.activePermissions.set(requestId, {
+        requestId,
+        toolUseId,
+        cancel: () => {
+          finish({ outcome: { outcome: "cancelled" } }, false, "cancelled");
+        }
+      });
+      this.callbacks.registerPermission(requestId, (approved) => {
+        finish(selectAgyPermissionOutcome(approved, options), approved, "desktop");
+      });
+    });
+  }
+  cancelPendingPermissions(_reason) {
+    const pending = Array.from(this.activePermissions.values());
+    for (const waiter of pending) {
+      waiter.cancel();
+    }
+  }
+};
+
 // src/index.ts
 var DEFAULT_CLAUDE_IDLE_TTL_MS = 10 * 60 * 1e3;
 var CLAUDE_INCOMPLETE_RESPONSE_REASON = "Claude response ended before a final result. Partial output was preserved; send the next prompt to retry.";
@@ -51612,6 +52803,26 @@ var claudeBackgroundTasks = new ClaudeBackgroundTaskTracker();
 var claudeTaskProgressEmittedAt = /* @__PURE__ */ new Map();
 var claudeBackgroundSnapshotKey = "";
 var todoSnapshotTracker = new TodoSnapshotTracker();
+var agyRuntime = new AgyRuntime({
+  emitEvent: (payload) => emitEvent(payload),
+  emitSessionMeta: (providerSessionId) => emitSessionMeta(providerSessionId),
+  todoSnapshotTracker,
+  registerPermission: (requestId, resolve2) => {
+    pendingPermissions.set(requestId, { resolve: resolve2 });
+  },
+  unregisterPermission: (requestId) => {
+    pendingPermissions.delete(requestId);
+  },
+  getCurrentProviderSessionId: () => currentProviderSessionId,
+  getInitConfig: () => initCommand && initCommand.provider === "agy" ? {
+    workingDir: initCommand.working_dir,
+    permMode: initCommand.perm_mode,
+    agyPath: initCommand.agy_path,
+    envVars: initCommand.env_vars,
+    model: initCommand.model,
+    effort: initCommand.effort
+  } : null
+});
 var browserToolBridge = createBrowserToolBridge(
   (request) => emit(request),
   BROWSER_TOOL_BRIDGE_TIMEOUT_MS,
@@ -51660,7 +52871,7 @@ var AsyncMessageQueue = class {
   }
 };
 function writeOutput(output2) {
-  process4.stdout.write(`${JSON.stringify(output2)}
+  process6.stdout.write(`${JSON.stringify(output2)}
 `);
 }
 var streamEventCoalescer = createStreamEventCoalescer((payload) => {
@@ -51724,7 +52935,7 @@ var CLAUDE_SDK_TERMINAL_STATES = /* @__PURE__ */ new Set([
 ]);
 var MAX_PRE_INIT_LIFECYCLE_FRAMES = 64;
 function claudeLifecycleTerminalTimeoutMs() {
-  const raw = Number(process4.env.CCEM_NATIVE_LIFECYCLE_TERMINAL_TIMEOUT_MS);
+  const raw = Number(process6.env.CCEM_NATIVE_LIFECYCLE_TERMINAL_TIMEOUT_MS);
   return Number.isFinite(raw) && raw > 0 ? raw : 1e4;
 }
 function clearClaudeLifecycleTerminalTimer() {
@@ -52145,7 +53356,7 @@ function isForegroundClaudeResult(message) {
   return claudeForegroundPromptAccepted;
 }
 function resolveClaudeIdleTtlMs() {
-  const raw = process4.env.CCEM_NATIVE_CLAUDE_IDLE_TTL_MS;
+  const raw = process6.env.CCEM_NATIVE_CLAUDE_IDLE_TTL_MS;
   if (raw == null || raw.trim() === "") {
     return DEFAULT_CLAUDE_IDLE_TTL_MS;
   }
@@ -52181,7 +53392,7 @@ function claudeQueuedInterruptAdapter(claudeQuery) {
 }
 async function interruptClaudeWithTimeout(claudeQuery) {
   const timeoutMs = resolveClaudeInterruptTimeoutMs(
-    process4.env.CCEM_NATIVE_CLAUDE_INTERRUPT_TIMEOUT_MS
+    process6.env.CCEM_NATIVE_CLAUDE_INTERRUPT_TIMEOUT_MS
   );
   const parent = claudeForegroundPromptUuid;
   const adapter = parent && claudeSteering.hasPending(parent) ? claudeQueuedInterruptAdapter(claudeQuery) : null;
@@ -53100,7 +54311,7 @@ function handleClaudeCompactBoundary(message) {
   void emitClaudeSessionUsage();
 }
 function claudeUsageDeadlineMs() {
-  const raw = Number(process4.env.CCEM_NATIVE_USAGE_DEADLINE_MS);
+  const raw = Number(process6.env.CCEM_NATIVE_USAGE_DEADLINE_MS);
   return Number.isFinite(raw) && raw > 0 ? raw : 1e4;
 }
 function withUsageDeadline(work, label) {
@@ -53345,7 +54556,7 @@ async function waitForClaudeInterruptToSettle() {
 function finishClaudeRuntimeTeardown() {
   queueMicrotask(() => {
     rl2.close();
-    process4.stdin.destroy();
+    process6.stdin.destroy();
   });
 }
 async function emitCodexContextUsageFromSessionFile(providerSessionId, retries = 0, delayMs = 80) {
@@ -53518,7 +54729,7 @@ function hasRetainedClaudeRuntime() {
 }
 function canApplySettingsImmediately() {
   if (!initCommand) return false;
-  if (initCommand.provider === "codex") {
+  if (initCommand.provider === "codex" || initCommand.provider === "agy") {
     return !activeTurn;
   }
   return !hasRetainedClaudeRuntime();
@@ -54380,7 +55591,7 @@ function enqueueClaudePrompt(text, images, commandId, legacyReplayMessageId, ope
     throw new Error("Claude streaming input queue is not ready");
   }
   const coordinatorStamped = Boolean(commandId);
-  const messageUuid = commandId ?? legacyReplayMessageId ?? randomUUID7();
+  const messageUuid = commandId ?? legacyReplayMessageId ?? randomUUID8();
   pendingClaudePromptReplay = {
     text,
     images,
@@ -54689,7 +55900,7 @@ async function ensureCodexThread() {
     throw new Error("Native runtime helper not initialized");
   }
   if (!codexClient) {
-    const env = buildIsolatedAgentEnv(process4.env, initCommand.env_vars);
+    const env = buildIsolatedAgentEnv(process6.env, initCommand.env_vars);
     codexClient = new Codex({
       codexPathOverride: initCommand.codex_path ?? void 0,
       baseUrl: initCommand.codex_base_url ?? void 0,
@@ -54901,13 +56112,19 @@ async function runQueuedTurns() {
   if (!nextPrompt) {
     return;
   }
+  const isAgy = initCommand.provider === "agy";
+  const providerLabel = isAgy ? "Antigravity" : "Codex";
   activeTurn = true;
   const abortController = new AbortController();
   currentAbortController = abortController;
-  emitStatus("processing", "Codex is processing a turn.");
+  emitStatus("processing", `${providerLabel} is processing a turn.`);
   try {
-    await runCodexTurn(nextPrompt.text, nextPrompt.images, abortController, nextPrompt.operation);
-    nextPrompt.operation?.observe("unknown", "Codex stream ended without a turn terminal.");
+    if (isAgy) {
+      await agyRuntime.runTurn(nextPrompt.text, nextPrompt.images, abortController, nextPrompt.operation);
+    } else {
+      await runCodexTurn(nextPrompt.text, nextPrompt.images, abortController, nextPrompt.operation);
+    }
+    nextPrompt.operation?.observe("unknown", `${providerLabel} stream ended without a turn terminal.`);
     if (!stopped) {
       emitStatus("ready", "Ready for the next prompt.");
     }
@@ -54935,13 +56152,25 @@ async function runQueuedTurns() {
       currentAbortController = null;
     }
     if (pendingSettings && !stopped) {
-      const hadEnvVars = pendingSettings.envVars !== void 0;
+      const patch = pendingSettings;
+      const hadEnvVars = patch.envVars !== void 0;
       applyPendingSettingsToInitCommand();
-      teardownCodexSession(hadEnvVars);
+      if (isAgy) {
+        await agyRuntime.applyLiveSettings({
+          permMode: patch.permMode,
+          effort: patch.effort,
+          envVarsChanged: hadEnvVars
+        });
+      } else {
+        teardownCodexSession(hadEnvVars);
+      }
       emitStatus("ready", "Settings applied.");
     }
     if (stopped) {
-      emitStatus("closed_idle", "Codex runtime stopped.");
+      if (isAgy) {
+        await agyRuntime.teardown();
+      }
+      emitStatus("closed_idle", `${providerLabel} runtime stopped.`);
       finishClaudeRuntimeTeardown();
     } else {
       void runQueuedTurns();
@@ -55036,10 +56265,11 @@ async function prepareNativeRuntimeStop(requestId, requireIdle = false, forceBac
       }
     }
   } else if (requireIdle && activeTurn) {
+    const providerLabel = initCommand?.provider === "agy" ? "Antigravity" : "Codex";
     emitTeardownPrepared(
       normalizedRequestId,
       false,
-      "Codex foreground turn must finish before terminal handoff."
+      `${providerLabel} foreground turn must finish before terminal handoff.`
     );
     return;
   }
@@ -55055,10 +56285,12 @@ async function handleCommand(command) {
     return;
   }
   if (command.type === "init") {
-    Object.assign(process4.env, getCcemAgentEnv());
+    if (command.provider !== "agy") {
+      Object.assign(process6.env, getCcemAgentEnv());
+    }
     if (command.model != null) {
-      if (command.provider !== "codex") {
-        throw new Error("MODEL_PROVIDER_UNSUPPORTED: task model selection is only available for Codex sessions.");
+      if (command.provider !== "codex" && command.provider !== "agy") {
+        throw new Error("MODEL_PROVIDER_UNSUPPORTED: task model selection is only available for Codex and Antigravity sessions.");
       }
       if (typeof command.model !== "string" || command.model !== command.model.trim() || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(command.model)) {
         throw new Error("MODEL_INVALID: expected a model identifier (1-256 ASCII characters, starting with a letter or digit; no whitespace).");
@@ -55143,7 +56375,7 @@ async function handleCommand(command) {
         promptQueue.push({
           text: initialText,
           images: initialImages,
-          operation: new InputOperation("codex", [], emitEvent, command.initial_command_id ?? void 0)
+          operation: new InputOperation(command.provider, [], emitEvent, command.initial_command_id ?? void 0)
         });
         await runQueuedTurns();
       }
@@ -55452,16 +56684,23 @@ async function handleCommand(command) {
         applySettingsCommand(command);
         if (initCommand.provider === "codex") {
           teardownCodexSession(command.env_vars !== void 0 || command.effort !== void 0);
+        } else if (initCommand.provider === "agy") {
+          await agyRuntime.applyLiveSettings({
+            permMode: command.perm_mode,
+            effort: command.effort,
+            envVarsChanged: command.env_vars !== void 0
+          });
         }
         emitStatus("ready", "Settings applied.");
         emitSettingsUpdateResult(command.request_id, "applied");
       } else {
         queuePendingSettings(command);
+        const providerLabel = initCommand.provider === "agy" ? "Antigravity" : "Codex";
         emitStatus("processing", "Settings will apply after the current turn.");
         emitSettingsUpdateResult(
           command.request_id,
           "deferred",
-          "Settings require the current Codex turn to finish."
+          `Settings require the current ${providerLabel} turn to finish.`
         );
       }
     });
@@ -55477,7 +56716,7 @@ async function handleCommand(command) {
       return;
     }
     if (initCommand?.provider === "claude" && command.client_message_ids?.length && !command.command_id) {
-      command.command_id = randomUUID7();
+      command.command_id = randomUUID8();
     }
     const operation = new InputOperation(initCommand?.provider ?? "codex", command.client_message_ids, emitEvent, command.command_id);
     promptInputOperations.set(command, operation);
@@ -55830,6 +57069,23 @@ async function handleCommand(command) {
       }
       return;
     }
+    if (initCommand?.provider === "agy") {
+      if (runtimeTeardown) {
+        agyRuntime.interruptTurn();
+        currentAbortController?.abort();
+        if (!activeTurn) {
+          await agyRuntime.teardown();
+          emitStatus("closed_idle", "Antigravity runtime stopped.");
+          finishClaudeRuntimeTeardown();
+        }
+      } else {
+        stopped = false;
+        agyRuntime.interruptTurn();
+        currentAbortController?.abort();
+        emitStatus(activeTurn ? "processing" : "ready", activeTurn ? "Waiting for interrupted Antigravity turn to settle." : "Turn interrupted. Ready for the next prompt.");
+      }
+      return;
+    }
     currentAbortController?.abort();
     teardownCodexSession(false);
     if (runtimeTeardown) {
@@ -55845,7 +57101,7 @@ async function handleCommand(command) {
   }
 }
 var rl2 = createInterface({
-  input: process4.stdin,
+  input: process6.stdin,
   crlfDelay: Infinity
 });
 rl2.on("line", (line) => {
@@ -55900,7 +57156,8 @@ rl2.on("close", () => {
   }
   closeClaudeQueryForRecovery();
   teardownCodexSession(false);
-  setTimeout(() => process4.exit(0), 250);
+  void agyRuntime.teardown();
+  setTimeout(() => process6.exit(0), 250);
 });
 /*! Bundled license information:
 

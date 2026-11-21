@@ -890,6 +890,55 @@ pub fn resolve_opencode_path() -> Option<String> {
     resolve_binary_path("opencode", &candidates)
 }
 
+/// Default Antigravity CLI state directory (`~/.gemini/antigravity-cli`).
+pub fn default_agy_home_dir() -> String {
+    dirs::home_dir()
+        .map(|home| {
+            home.join(".gemini")
+                .join("antigravity-cli")
+                .to_string_lossy()
+                .to_string()
+        })
+        .unwrap_or_else(|| "~/.gemini/antigravity-cli".to_string())
+}
+
+/// Resolve the full path to the `agy` binary, preferring a valid custom path if provided.
+pub fn resolve_agy_path_with_custom(custom_path: Option<&str>) -> Option<String> {
+    if let Some(custom) = custom_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if std::path::Path::new(custom).is_file() {
+            return Some(custom.to_string());
+        }
+    }
+
+    let home = dirs::home_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut candidates = windows_cli_candidates("agy");
+    candidates.extend([
+        format!("{}/.local/bin/agy", home),
+        format!("{}/.npm-global/bin/agy", home),
+        "/usr/local/bin/agy".to_string(),
+        "/opt/homebrew/bin/agy".to_string(),
+    ]);
+    resolve_binary_path("agy", &candidates)
+}
+
+/// Resolve the full path to the `agy` binary using saved DesktopSettings.agyPath first.
+pub fn resolve_agy_path() -> Option<String> {
+    let custom = crate::config::read_settings()
+        .ok()
+        .and_then(|settings| settings.agy_path);
+    resolve_agy_path_with_custom(custom.as_deref())
+}
+
+/// Returns whether Antigravity (`agy`) is installed (live check so custom path changes apply immediately).
+pub fn is_agy_installed() -> bool {
+    resolve_agy_path().is_some()
+}
+
 /// Resolve the full path to the `tmux` binary.
 pub fn resolve_tmux_path() -> Option<String> {
     if !tmux_supported_on_current_platform() {
@@ -1038,9 +1087,21 @@ pub fn open_agent_login(client: &str, codex_isolated: bool) -> Result<(), String
     if !external_terminal_launch_supported() {
         return Err(format!("Use `ccem auth {client}` in a terminal on this platform."));
     }
-    let mut env = HashMap::from([("CCEM_CODEX_ISOLATED".into(), if codex_isolated { "1" } else { "0" }.into())]);
-    crate::agent_profile::apply_env(client, &mut env);
-    let codex_options = codex_sqlite_option(&env);
+    let mut env = if client == "agy" {
+        crate::system_proxy::resolve_codex_proxy_env()
+    } else {
+        let mut map = HashMap::from([(
+            "CCEM_CODEX_ISOLATED".into(),
+            if codex_isolated { "1" } else { "0" }.into(),
+        )]);
+        crate::agent_profile::apply_env(client, &mut map);
+        map
+    };
+    let codex_options = if client == "codex" {
+        codex_sqlite_option(&env)
+    } else {
+        String::new()
+    };
     let (binary, args) = match client {
         "claude" => {
             let runtime = crate::claude_runtime::shared().resolve_for_launch()?;
@@ -1048,9 +1109,18 @@ pub fn open_agent_login(client: &str, codex_isolated: bool) -> Result<(), String
             (runtime.path, "auth login".to_string())
         },
         "codex" => (resolve_codex_path().ok_or("Codex is not installed")?, format!("{codex_options}login")),
+        "agy" => (
+            resolve_agy_path().ok_or("Antigravity CLI (agy) is not installed")?,
+            "acp --login".to_string(),
+        ),
         _ => return Err("Unsupported agent provider".into()),
     };
-    let command = format!("( {}; unset CLAUDECODE; {} {} )", shell_environment(env), quote_posix_shell_word(&binary), args);
+    let env_prefix = shell_environment(env);
+    let command = if env_prefix.is_empty() {
+        format!("( unset CLAUDECODE; {} {} )", quote_posix_shell_word(&binary), args)
+    } else {
+        format!("( {}; unset CLAUDECODE; {} {} )", env_prefix, quote_posix_shell_word(&binary), args)
+    };
     let terminal = get_preferred_terminal();
     let script = match terminal {
         TerminalType::TerminalApp => terminal_app_script(&command),
@@ -1217,6 +1287,47 @@ fn build_codex_shell_command(
     parts.push(format!(
         "{}; echo $? > ~/.ccem/sessions/'{}'.exit",
         codex_cmd, escaped_session_id
+    ));
+
+    format!("( {} )", parts.join(" && "))
+}
+
+fn build_agy_shell_command(
+    env_vars: &HashMap<String, String>,
+    working_dir: &str,
+    session_id: &str,
+    resume_session_id: Option<&str>,
+) -> String {
+    let mut parts = Vec::new();
+    parts.push("mkdir -p ~/.ccem/sessions".to_string());
+
+    let quoted_dir = quote_posix_shell_word(working_dir);
+    parts.push(format!("cd {}", quoted_dir));
+    parts.push("unset CLAUDECODE".to_string());
+
+    let mut env_entries = env_vars.iter().collect::<Vec<_>>();
+    env_entries.sort_by(|left, right| left.0.cmp(right.0));
+    for (key, value) in env_entries {
+        if value.is_empty() {
+            continue;
+        }
+        parts.push(format!("export {}={}", key, quote_posix_shell_word(value)));
+    }
+
+    let agy_path = resolve_agy_path().unwrap_or_else(|| "agy".to_string());
+    let quoted_agy = quote_posix_shell_word(&agy_path);
+    let escaped_session_id = session_id.replace("'", "'\\''");
+    let agy_cmd = if let Some(resume_id) = resume_session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        format!("{} --conversation {}", quoted_agy, quote_posix_shell_word(resume_id))
+    } else {
+        quoted_agy
+    };
+    parts.push(format!(
+        "{}; echo $? > ~/.ccem/sessions/'{}'.exit",
+        agy_cmd, escaped_session_id
     ));
 
     format!("( {} )", parts.join(" && "))
@@ -1530,6 +1641,8 @@ pub fn launch_in_terminal(
 
     let shell_command = if client == "codex" {
         build_codex_shell_command(&env_vars, working_dir, session_id, resume_session_id)
+    } else if client == "agy" {
+        build_agy_shell_command(&env_vars, working_dir, session_id, resume_session_id)
     } else if client == "opencode" {
         let (safe_env_vars, secret_path) = split_opencode_secret_env(env_vars, session_id)?;
         build_opencode_shell_command(
@@ -3025,5 +3138,49 @@ mod tests {
         assert!(script.contains("close aWindow"));
         assert!(script.contains("\"101\""));
         assert!(script.contains("\"202\""));
+    }
+
+    #[test]
+    fn test_resolve_agy_path_prefers_existing_custom_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "ccem-agy-path-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake_agy = dir.join("agy");
+        std::fs::write(&fake_agy, "#!/bin/sh\n").unwrap();
+
+        let custom = fake_agy.to_string_lossy().to_string();
+        assert_eq!(
+            resolve_agy_path_with_custom(Some(&custom)).as_deref(),
+            Some(custom.as_str())
+        );
+        // Missing custom path does not return the bogus path
+        assert_ne!(
+            resolve_agy_path_with_custom(Some("/nonexistent/path/to/agy")).as_deref(),
+            Some("/nonexistent/path/to/agy")
+        );
+        assert!(default_agy_home_dir().ends_with(".gemini/antigravity-cli")
+            || default_agy_home_dir().ends_with(".gemini\\antigravity-cli"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_build_agy_shell_command_preserves_env_and_supports_resume() {
+        let env = HashMap::from([("HTTPS_PROXY".to_string(), "http://127.0.0.1:7890".to_string())]);
+        let fresh = build_agy_shell_command(&env, "/tmp/my proj", "sess-1", None);
+        assert!(fresh.contains("cd '/tmp/my proj'"));
+        assert!(fresh.contains("unset CLAUDECODE"));
+        assert!(fresh.contains("export HTTPS_PROXY='http://127.0.0.1:7890'"));
+        assert!(!fresh.contains("CLAUDE_CONFIG_DIR"));
+        assert!(!fresh.contains("CODEX_HOME"));
+        assert!(!fresh.contains("--conversation"));
+
+        let resumed = build_agy_shell_command(&env, "/tmp/my proj", "sess-1", Some("conv-42"));
+        assert!(resumed.contains("--conversation 'conv-42'"));
     }
 }
