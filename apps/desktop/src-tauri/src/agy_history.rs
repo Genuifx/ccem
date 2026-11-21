@@ -259,21 +259,30 @@ pub(crate) fn load_agy_history_from_home(agy_home: &Path) -> Result<Vec<HistoryS
             continue;
         }
 
-        let transcript_scan = transcript_path
-            .as_deref()
-            .map(quick_scan_transcript)
-            .unwrap_or_default();
         let transcript_mtime = transcript_path
             .as_deref()
             .map(file_modified_millis)
             .unwrap_or(0);
 
-        let display = resolve_session_display(row, &transcript_scan);
+        // Fast path: SQLite already stores title/preview and timestamps.
+        // Only peek the transcript head when both title and preview are empty,
+        // avoiding O(total transcript bytes) I/O as session history grows.
+        let mut display = resolve_summary_display_without_transcript(row);
+        let mut fallback_ts = 0u64;
+        if display.is_empty() {
+            if let Some(path) = transcript_path.as_deref() {
+                let (_, first_prompt, first_ts) = peek_first_user_input(path);
+                if let Some(prompt) = first_prompt {
+                    display = clean_single_line_title(&prompt);
+                }
+                fallback_ts = first_ts;
+            }
+        }
         let timestamp = row
             .last_modified_ms
             .max(row.last_user_input_ms)
-            .max(transcript_scan.last_timestamp_ms)
-            .max(transcript_mtime);
+            .max(transcript_mtime)
+            .max(fallback_ts);
         let project = row.workspace_path.clone();
         let project_name = derive_project_name(&project);
         let cwd = (!project.is_empty()).then(|| project.clone());
@@ -312,16 +321,15 @@ pub(crate) fn load_agy_history_from_home(agy_home: &Path) -> Result<Vec<HistoryS
         if seen_ids.contains(&id) || !is_safe_agy_conversation_id(&id) {
             continue;
         }
-        let scan = quick_scan_transcript(&path);
+        let (has_user_input, first_user_prompt, first_ts) = peek_first_user_input(&path);
         // Any conversation missing from conversation_summaries.db without a
         // direct USER_INPUT step is an unindexed/background subagent transcript;
         // never leak it into the top-level history list.
-        if !scan.has_user_input {
+        if !has_user_input {
             continue;
         }
-        let timestamp = scan.last_timestamp_ms.max(file_modified_millis(&path));
-        let display = scan
-            .first_user_prompt
+        let timestamp = first_ts.max(file_modified_millis(&path));
+        let display = first_user_prompt
             .as_deref()
             .map(clean_single_line_title)
             .unwrap_or_default();
@@ -834,7 +842,9 @@ fn resolve_subagent_status(row: &AgySummaryRow, scan: &AgyTranscriptQuickScan) -
     "completed".to_string()
 }
 
-fn resolve_session_display(row: &AgySummaryRow, scan: &AgyTranscriptQuickScan) -> String {
+const PEEK_MAX_LINES: usize = 64;
+
+fn resolve_summary_display_without_transcript(row: &AgySummaryRow) -> String {
     let title = clean_single_line_title(&row.title);
     if !title.is_empty() {
         return title;
@@ -845,6 +855,14 @@ fn resolve_session_display(row: &AgySummaryRow, scan: &AgyTranscriptQuickScan) -
             return cleaned;
         }
     }
+    String::new()
+}
+
+fn resolve_session_display(row: &AgySummaryRow, scan: &AgyTranscriptQuickScan) -> String {
+    let from_summary = resolve_summary_display_without_transcript(row);
+    if !from_summary.is_empty() {
+        return from_summary;
+    }
     if let Some(first_prompt) = scan.first_user_prompt.as_deref() {
         let cleaned = clean_single_line_title(first_prompt);
         if !cleaned.is_empty() {
@@ -852,6 +870,39 @@ fn resolve_session_display(row: &AgySummaryRow, scan: &AgyTranscriptQuickScan) -
         }
     }
     String::new()
+}
+
+/// Bounded head-only peek for the first `USER_INPUT` step so listing history
+/// never reads multi-megabyte transcripts end-to-end.
+fn peek_first_user_input(path: &Path) -> (bool, Option<String>, u64) {
+    let Ok(file) = fs::File::open(path) else {
+        return (false, None, 0);
+    };
+    let reader = BufReader::new(file);
+    let mut first_ts = 0u64;
+
+    for line in reader.lines().take(PEEK_MAX_LINES).map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(step) = serde_json::from_str::<AgyTranscriptLine>(&line) else {
+            continue;
+        };
+        if first_ts == 0 {
+            if let Some(ts) = step.created_at.as_deref().map(parse_agy_timestamp_millis) {
+                first_ts = ts;
+            }
+        }
+        if step.step_type.as_deref() == Some("USER_INPUT") {
+            let prompt = step
+                .content
+                .as_deref()
+                .and_then(extract_agy_user_visible_text);
+            return (true, prompt, first_ts);
+        }
+    }
+
+    (false, None, first_ts)
 }
 
 fn quick_scan_transcript(path: &Path) -> AgyTranscriptQuickScan {
