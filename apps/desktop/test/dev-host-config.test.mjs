@@ -17,10 +17,12 @@ const {
   prepareMacosCefDevelopmentRuntime,
 } = await import(pathToFileURL(launcherPath).href);
 
-async function createCefDevelopmentFixture(t, architecture = 'aarch64') {
+async function createCefDevelopmentFixture(t, architecture = 'aarch64', options = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ccem-cef-dev-launcher-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
-  const outDir = path.join(root, 'target', 'debug', 'build', 'cef-dll-sys-current', 'out');
+  const outDir = options.nestedBuildLayout
+    ? path.join(root, 'target', 'debug', 'build', 'cef-dll-sys', 'f039477940444721', 'out')
+    : path.join(root, 'target', 'debug', 'build', 'cef-dll-sys-current', 'out');
   const frameworkRoot = path.join(
     outDir,
     `cef_macos_${architecture}`,
@@ -179,6 +181,21 @@ test('macOS launcher builds the sibling helper and injects only the emitted CEF 
     ),
     'updated-gles-runtime',
   );
+});
+
+test('macOS launcher supports Cargo 1.100 nested build-script OUT_DIR layout', {
+  skip: process.platform === 'win32' ? 'requires POSIX executable-mode semantics' : false,
+}, async (t) => {
+  const fixture = await createCefDevelopmentFixture(t, 'aarch64', { nestedBuildLayout: true });
+  const result = await prepareMacosCefDevelopmentRuntime({
+    environment: {},
+    platform: 'darwin',
+    architecture: 'arm64',
+    cargoRunner: () => ({ status: 0, stdout: cefCargoOutput(fixture.outDir) }),
+  });
+
+  assert.equal(result.source, 'Cargo OUT_DIR');
+  assert.equal(result.frameworkPath, await fs.realpath(fixture.framework));
 });
 
 test('macOS launcher preserves a valid explicit CEF override and rejects an invalid one', {

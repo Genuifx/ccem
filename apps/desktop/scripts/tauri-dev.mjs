@@ -481,8 +481,14 @@ export async function prepareMacosCefDevelopmentRuntime({
     parseCefOutDirFromCargoJson(build.stdout),
     'cef-dll-sys OUT_DIR',
   );
-  const buildDirectory = path.dirname(path.dirname(outDir));
-  if (path.basename(buildDirectory) !== 'build') {
+  // Cargo < 1.100 uses `<profile>/build/cef-dll-sys-<hash>/out`;
+  // Cargo >= 1.100 uses `<profile>/build/cef-dll-sys/<hash>/out`.
+  const twoUp = path.dirname(path.dirname(outDir));
+  const threeUp = path.dirname(twoUp);
+  const buildDirectory = path.basename(twoUp) === 'build'
+    ? twoUp
+    : (path.basename(threeUp) === 'build' ? threeUp : null);
+  if (!buildDirectory) {
     throw new Error(`cef-dll-sys OUT_DIR is outside the expected Cargo profile layout: ${outDir}`);
   }
   const profileDirectory = path.dirname(buildDirectory);
