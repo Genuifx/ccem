@@ -1,5 +1,11 @@
 # ccem
 
+## 2.112.0
+
+### Minor Changes
+
+- Release v2.112.0: Antigravity (agy) ACP provider integration across helper runtime, desktop backend, and UI.
+
 ## 2.111.0
 
 ### Minor Changes
