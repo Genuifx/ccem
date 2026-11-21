@@ -184,6 +184,8 @@
   },
   "workspace": {
     "turnAverageSpeed": "本轮平均 {speed} tok/s",
+    "turnTtft": "首字 {ttft}",
+    "turnSpeedTtft": "首字延迟 {ttft}",
     "turnSpeedCalculation": "{tokens} 输出 token ÷ {seconds} 秒",
     "turnSpeedScope": "主会话输出，包含推理，不含输入和缓存；耗时包含首字延迟、工具执行和等待。",
     "turnSpeedGenerationCalculation": "{tokens} 输出 token ÷ {seconds} 秒生成时间",

@@ -1249,6 +1249,17 @@ mod tests {
         let observer = NativeEventLog::new(db_path.clone());
         let page = observer.replay_page("metrics-runtime", None, None, 10).expect("replay");
         assert_eq!(serde_json::to_value(&page.events[0].payload).unwrap(), payload);
+
+        let agy_payload = serde_json::json!({
+            "type": "turn_metrics", "operation_id": "turn-agy", "provider": "agy",
+            "output_tokens": 9104, "elapsed_ms": 143362, "generation_ms": 91290, "ttft_ms": 10396,
+        });
+        log.append(&SessionEventRecord {
+            runtime_id: "metrics-runtime".into(), seq: 2, occurred_at: Utc::now(),
+            payload: serde_json::from_value(agy_payload.clone()).expect("agy metric wire format"),
+        }).expect("append agy metric");
+        let page = observer.replay_page("metrics-runtime", None, None, 10).expect("replay agy");
+        assert_eq!(serde_json::to_value(&page.events[1].payload).unwrap(), agy_payload);
         drop(observer);
         drop(log);
         let _ = std::fs::remove_file(db_path);

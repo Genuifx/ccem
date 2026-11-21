@@ -292,6 +292,120 @@ rl.on('line', async (line) => {
       return;
     }
 
+    if (scenario === 'multi_step_metrics') {
+      const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      // Initial zero context snapshot right after prompt starts (mirrors real agy acp)
+      send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: activeSessionId,
+          update: { sessionUpdate: 'usage_update', used: 0, size: 1000000 },
+        },
+      });
+      // Step 1 TTFT
+      await wait(110);
+      send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: activeSessionId,
+          update: {
+            sessionUpdate: 'agent_thought_chunk',
+            content: { type: 'text', text: 'Planning step 1' },
+          },
+        },
+      });
+      await wait(45);
+      send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: activeSessionId,
+          update: { sessionUpdate: 'usage_update', used: 9337, size: 1000000 },
+        },
+      });
+      send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: activeSessionId,
+          update: {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'call-metrics-1',
+            title: 'run_command',
+            kind: 'execute',
+            rawInput: { command: 'sleep 0.2' },
+          },
+        },
+      });
+      // Tool execution delay (must be excluded from generation_ms)
+      await wait(240);
+      send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: activeSessionId,
+          update: {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: 'call-metrics-1',
+            status: 'completed',
+            content: [{ type: 'text', text: 'ok' }],
+          },
+        },
+      });
+      // Step 2 TTFT (must also be excluded from generation_ms)
+      await wait(120);
+      send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: activeSessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'Final answer part 1. ' },
+          },
+        },
+      });
+      await wait(60);
+      send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: activeSessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: 'Final answer part 2.' },
+          },
+        },
+      });
+      await wait(15);
+      send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: activeSessionId,
+          update: { sessionUpdate: 'usage_update', used: 24500, size: 1000000 },
+        },
+      });
+      activePromptId = null;
+      send({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: {
+          stopReason: 'end_turn',
+          usage: {
+            inputTokens: 12000,
+            outputTokens: 450,
+            cachedReadTokens: 8000,
+            cachedWriteTokens: 0,
+            totalTokens: 20450,
+          },
+        },
+      });
+      return;
+    }
+
     // Default rich streaming turn
     send({
       jsonrpc: '2.0',

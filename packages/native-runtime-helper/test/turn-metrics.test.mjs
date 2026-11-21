@@ -187,3 +187,73 @@ test('a settled response calibrates later estimates to the provider tokenizer', 
   next.recordResponseOutputTokens(100); // restore scale 1 for any later test
   next.markResponseStart();
 });
+
+test('agy InputOperation records ttft_ms and closes per-step generation segments while claude/codex omit ttft_ms', () => {
+  // 1. agy multi-step turn: TTFT anchored at first delta, tool wait & step-2 TTFT excluded from generation_ms.
+  let now = 1_000;
+  const agyEvents = [];
+  const agyOp = new InputOperation('agy', ['user-1'], (e) => agyEvents.push(e), undefined, () => now);
+  agyOp.observe('started', 'start');
+  agyOp.markResponseStart();
+  now = 3_200; // 2200ms TTFT
+  agyOp.markOutputDelta('thinking step 1');
+  now = 3_500; // 300ms tail to usage_update / tool_call
+  agyOp.markResponseEnd({ extendToNow: true });
+  now = 15_500; // 12s tool execution + step-2 TTFT — must NOT enter generation_ms
+  agyOp.markOutputDelta('answer chunk 1');
+  now = 16_200; // 700ms streaming in step 2
+  agyOp.markOutputDelta('answer chunk 2');
+  now = 16_300; // 100ms tail to usage_update
+  agyOp.markResponseEnd({ extendToNow: true });
+  now = 16_400;
+  agyOp.recordOutputTokens(500);
+  agyOp.observe('completed', 'done');
+
+  const agyProgress = progress(agyEvents);
+  assert.ok(agyProgress.length >= 2);
+  assert.ok(agyProgress.every((e) => e.ttft_ms === 2_200), 'agy live progress carries locked ttft_ms');
+  assert.deepEqual(metrics(agyEvents), [{
+    type: 'turn_metrics',
+    operation_id: agyOp.id,
+    provider: 'agy',
+    output_tokens: 500,
+    elapsed_ms: 15_400,
+    generation_ms: 1_100, // 300ms (step 1) + 800ms (step 2); excludes 2.2s TTFT and 12s tool/wait
+    ttft_ms: 2_200,
+  }]);
+
+  // 2. agy tool-first turn (no text/thought delta before step-1 tool_call): markFirstResponse anchors ttft_ms.
+  now = 100;
+  const toolFirstEvents = [];
+  const toolFirstOp = new InputOperation('agy', ['user-2'], (e) => toolFirstEvents.push(e), undefined, () => now);
+  toolFirstOp.observe('started', 'start');
+  now = 950; // 850ms to first tool_call
+  toolFirstOp.markFirstResponse();
+  toolFirstOp.markResponseEnd({ extendToNow: true });
+  now = 5_000;
+  toolFirstOp.markOutputDelta('final answer');
+  now = 5_400;
+  toolFirstOp.markOutputDelta(' done');
+  now = 5_500;
+  toolFirstOp.recordOutputTokens(80);
+  toolFirstOp.observe('completed', 'done');
+  assert.equal(metrics(toolFirstEvents)[0].ttft_ms, 850);
+  assert.equal(metrics(toolFirstEvents)[0].generation_ms, 400);
+
+  // 3. Claude and Codex must NEVER emit ttft_ms.
+  for (const provider of ['claude', 'codex']) {
+    now = 0;
+    const otherEvents = [];
+    const otherOp = new InputOperation(provider, ['u'], (e) => otherEvents.push(e), undefined, () => now);
+    otherOp.observe('started', 'start');
+    now = 500;
+    otherOp.markOutputDelta('hello');
+    now = 1_000;
+    otherOp.markOutputDelta(' world');
+    otherOp.markFirstResponse();
+    otherOp.recordOutputTokens(20);
+    otherOp.observe('completed', 'done');
+    assert.ok(progress(otherEvents).every((e) => !('ttft_ms' in e)), `${provider} turn_progress must omit ttft_ms`);
+    assert.equal('ttft_ms' in metrics(otherEvents)[0], false, `${provider} turn_metrics must omit ttft_ms`);
+  }
+});

@@ -1689,3 +1689,34 @@ test('steer_failed renders an error while the original operation and processing 
   assert.equal(shouldTreatNativeSessionAsProcessing('processing', events,
     Date.parse('2026-05-01T00:00:08.000Z')), true, 'a failed attached input is not a root terminal');
 });
+
+test('agy turn_progress and turn_metrics preserve ttftMs across streaming append, replay, and ref stabilization', async () => {
+  const { deriveTranscriptReset, deriveTranscriptAppend, finalizeTranscriptMessages,
+    stabilizeMessageRefs } = await importWorkspaceEventTranscript();
+  const events = [
+    event(1, { type: 'input_operation', operation_id: 'agy-op', client_message_ids: ['u1'],
+      provider: 'agy', stage: 'started', detail: '' }),
+    event(2, { type: 'turn_progress', provider: 'agy', operation_id: 'agy-op',
+      output_tokens: 18, generation_ms: 600, ttft_ms: 1450 }),
+    event(3, { type: 'assistant_chunk', text: 'Agy response' }),
+    event(4, { type: 'input_operation', operation_id: 'agy-op', client_message_ids: ['u1'],
+      provider: 'agy', stage: 'completed', detail: '' }),
+    event(5, { type: 'turn_metrics', provider: 'agy', operation_id: 'agy-op',
+      output_tokens: 450, elapsed_ms: 6500, generation_ms: 2500, ttft_ms: 1450 }),
+  ];
+
+  const live = deriveTranscriptReset([], [], events.slice(0, 3));
+  assert.deepEqual(live.liveProgress, {
+    operationId: 'agy-op', outputTokens: 18, generationMs: 600, ttftMs: 1450,
+  });
+  const beforeMetrics = finalizeTranscriptMessages(live);
+
+  const done = deriveTranscriptAppend(live, events.slice(3));
+  assert.equal(done.liveProgress, undefined);
+  const afterMetrics = finalizeTranscriptMessages(done);
+  assert.deepEqual(afterMetrics[0].turnMetrics, {
+    outputTokens: 450, elapsedMs: 6500, generationMs: 2500, ttftMs: 1450,
+  });
+  assert.notEqual(stabilizeMessageRefs(afterMetrics, beforeMetrics)[0], beforeMetrics[0]);
+  assert.deepEqual(finalizeTranscriptMessages(deriveTranscriptReset([], [], events)), afterMetrics);
+});

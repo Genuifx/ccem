@@ -184,6 +184,8 @@
   },
   "workspace": {
     "turnAverageSpeed": "Turn average {speed} tok/s",
+    "turnTtft": "TTFT {ttft}",
+    "turnSpeedTtft": "First token {ttft}",
     "turnSpeedCalculation": "{tokens} output tokens ÷ {seconds} seconds",
     "turnSpeedScope": "Main-agent output, including reasoning, excluding input and cache. Time includes first-token latency, tools and waiting.",
     "turnSpeedGenerationCalculation": "{tokens} output tokens ÷ {seconds}s of generation",

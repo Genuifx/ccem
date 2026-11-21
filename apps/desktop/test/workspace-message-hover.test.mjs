@@ -183,8 +183,30 @@ test('completed turn renders speed once, immediately before its timestamp', asyn
     const badges = dom.window.document.querySelectorAll('[data-turn-speed]');
     assert.equal(badges.length, 1);
     assert.match(badges[0].textContent, /本轮平均 5.2 tok\/s/);
+    assert.equal(badges[0].getAttribute('data-turn-ttft'), null);
+    assert.doesNotMatch(badges[0].textContent, /首字/);
     assert.equal(badges[0].nextElementSibling.textContent,
       new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    dom.window.close();
+  }
+
+  // Agy turns carry ttftMs and render TTFT alongside generation speed.
+  for (const [ttftMs, expectedTtft] of [[1460, '首字 1.5s'], [420, '首字 420ms']]) {
+    const html = renderTranscript([{
+      msgType: 'assistant',
+      uuid: `agy-${ttftMs}`,
+      segmentIndex: 0,
+      timestamp,
+      isCompactBoundary: false,
+      content: [{ type: 'text', text: 'Agy reply' }],
+      turnMetrics: { outputTokens: 900, elapsedMs: 18_000, generationMs: 10_000, ttftMs },
+    }]);
+    const dom = new JSDOM(html);
+    const badge = dom.window.document.querySelector('[data-turn-speed]');
+    assert.ok(badge);
+    assert.equal(badge.getAttribute('data-turn-ttft'), String(ttftMs));
+    assert.equal(badge.getAttribute('data-turn-speed'), '90.0');
+    assert.match(badge.textContent, new RegExp(`${expectedTtft} · 本轮平均 90\\.0 tok/s`));
     dom.window.close();
   }
 });
