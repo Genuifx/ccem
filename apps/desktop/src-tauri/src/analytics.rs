@@ -26,6 +26,7 @@ mod claude_profiles;
 const SOURCE_CLAUDE: &str = "claude";
 const SOURCE_CODEX: &str = "codex";
 const SOURCE_OPENCODE: &str = "opencode";
+const SOURCE_AGY: &str = "agy";
 const SOURCE_DSH: &str = "dsh";
 // Version 7 stores compact per-source rollups plus one materialized global
 // rollup. Unchanged history is therefore never folded row-by-row when an
@@ -2938,8 +2939,9 @@ fn normalize_usage_source(source: Option<&str>) -> Result<Option<&'static str>, 
         SOURCE_CODEX => Ok(Some(SOURCE_CODEX)),
         SOURCE_OPENCODE => Ok(Some(SOURCE_OPENCODE)),
         SOURCE_DSH => Ok(Some(SOURCE_DSH)),
+        SOURCE_AGY => Ok(Some(SOURCE_AGY)),
         _ => Err(format!(
-            "Unsupported source '{}'. Use claude, codex, opencode, dsh, or all.",
+            "Unsupported source '{}'. Use claude, codex, opencode, dsh, agy, or all.",
             raw
         )),
     }
@@ -6050,5 +6052,11 @@ mod tests {
         let entry = &all_model_entries[0];
         assert_eq!(entry.unpriced_tokens, 300);
         assert!(entry.cost_incomplete);
+    }
+
+    #[test]
+    fn normalize_usage_source_accepts_agy() {
+        assert_eq!(normalize_usage_source(Some("agy")).unwrap(), Some("agy"));
+        assert_eq!(normalize_usage_source(Some("AGY")).unwrap(), Some("agy"));
     }
 }

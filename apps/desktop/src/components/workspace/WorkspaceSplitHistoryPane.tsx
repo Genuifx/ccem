@@ -60,7 +60,7 @@ export const WorkspaceSplitHistoryPane = memo(function WorkspaceSplitHistoryPane
   const [envName, setEnvName] = useState(initialControls.envName);
   const [permMode, setPermMode] = useState<PermissionModeName>(initialControls.permMode);
   const [effort, setEffort] = useState<EffortLevel>(initialControls.effort);
-  const provider = session.source === 'codex' ? 'codex' : 'claude';
+  const provider = session.source === 'codex' ? 'codex' : session.source === 'agy' ? 'agy' : 'claude';
 
   useEffect(() => {
     let cancelled = false;

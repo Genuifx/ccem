@@ -68,8 +68,9 @@ import { createStreamEventCoalescer } from './streamEventCoalescer';
 import { InputOperation } from './inputOperation';
 import { ClaudeSteering } from './claudeSteering';
 import { captureCodexUsageBaseline, resolveCodexTurnUsage } from './codexTurnUsage';
+import { AgyRuntime } from './agyRuntime';
 
-type NativeProvider = 'claude' | 'codex';
+type NativeProvider = 'claude' | 'codex' | 'agy';
 
 type InitCommand = {
   type: 'init';
@@ -87,6 +88,7 @@ type InitCommand = {
   fork_at_message_id?: string | null;
   claude_path?: string | null;
   codex_path?: string | null;
+  agy_path?: string | null;
   codex_base_url?: string | null;
   codex_api_key?: string | null;
   model?: string | null;
@@ -408,6 +410,28 @@ const claudeBackgroundTasks = new ClaudeBackgroundTaskTracker();
 const claudeTaskProgressEmittedAt = new Map<string, number>();
 let claudeBackgroundSnapshotKey = '';
 const todoSnapshotTracker = new TodoSnapshotTracker();
+const agyRuntime = new AgyRuntime({
+  emitEvent: (payload) => emitEvent(payload),
+  emitSessionMeta: (providerSessionId) => emitSessionMeta(providerSessionId),
+  todoSnapshotTracker,
+  registerPermission: (requestId, resolve) => {
+    pendingPermissions.set(requestId, { resolve });
+  },
+  unregisterPermission: (requestId) => {
+    pendingPermissions.delete(requestId);
+  },
+  getCurrentProviderSessionId: () => currentProviderSessionId,
+  getInitConfig: () => (initCommand && initCommand.provider === 'agy'
+    ? {
+        workingDir: initCommand.working_dir,
+        permMode: initCommand.perm_mode,
+        agyPath: initCommand.agy_path,
+        envVars: initCommand.env_vars,
+        model: initCommand.model,
+        effort: initCommand.effort,
+      }
+    : null),
+});
 const browserToolBridge = createBrowserToolBridge(
   (request) => emit(request),
   BROWSER_TOOL_BRIDGE_TIMEOUT_MS,
@@ -3020,7 +3044,7 @@ function hasRetainedClaudeRuntime() {
 
 function canApplySettingsImmediately() {
   if (!initCommand) return false;
-  if (initCommand.provider === 'codex') {
+  if (initCommand.provider === 'codex' || initCommand.provider === 'agy') {
     return !activeTurn;
   }
   return !hasRetainedClaudeRuntime();
@@ -4702,13 +4726,20 @@ async function runQueuedTurns() {
     return;
   }
 
+  const isAgy = initCommand.provider === 'agy';
+  const providerLabel = isAgy ? 'Antigravity' : 'Codex';
+
   activeTurn = true;
   const abortController = new AbortController();
   currentAbortController = abortController;
-  emitStatus('processing', 'Codex is processing a turn.');
+  emitStatus('processing', `${providerLabel} is processing a turn.`);
   try {
-    await runCodexTurn(nextPrompt.text, nextPrompt.images, abortController, nextPrompt.operation);
-    nextPrompt.operation?.observe('unknown', 'Codex stream ended without a turn terminal.');
+    if (isAgy) {
+      await agyRuntime.runTurn(nextPrompt.text, nextPrompt.images, abortController, nextPrompt.operation);
+    } else {
+      await runCodexTurn(nextPrompt.text, nextPrompt.images, abortController, nextPrompt.operation);
+    }
+    nextPrompt.operation?.observe('unknown', `${providerLabel} stream ended without a turn terminal.`);
     if (!stopped) {
       emitStatus('ready', 'Ready for the next prompt.');
     }
@@ -4736,13 +4767,25 @@ async function runQueuedTurns() {
       currentAbortController = null;
     }
     if (pendingSettings && !stopped) {
-      const hadEnvVars = pendingSettings.envVars !== undefined;
+      const patch = pendingSettings;
+      const hadEnvVars = patch.envVars !== undefined;
       applyPendingSettingsToInitCommand();
-      teardownCodexSession(hadEnvVars);
+      if (isAgy) {
+        await agyRuntime.applyLiveSettings({
+          permMode: patch.permMode,
+          effort: patch.effort,
+          envVarsChanged: hadEnvVars,
+        });
+      } else {
+        teardownCodexSession(hadEnvVars);
+      }
       emitStatus('ready', 'Settings applied.');
     }
     if (stopped) {
-      emitStatus('closed_idle', 'Codex runtime stopped.');
+      if (isAgy) {
+        await agyRuntime.teardown();
+      }
+      emitStatus('closed_idle', `${providerLabel} runtime stopped.`);
       finishClaudeRuntimeTeardown();
     } else {
       void runQueuedTurns();
@@ -4869,10 +4912,11 @@ async function prepareNativeRuntimeStop(
       }
     }
   } else if (requireIdle && activeTurn) {
+    const providerLabel = initCommand?.provider === 'agy' ? 'Antigravity' : 'Codex';
     emitTeardownPrepared(
       normalizedRequestId,
       false,
-      'Codex foreground turn must finish before terminal handoff.',
+      `${providerLabel} foreground turn must finish before terminal handoff.`,
     );
     return;
   }
@@ -4893,10 +4937,13 @@ async function handleCommand(command: InputCommand) {
 
   if (command.type === 'init') {
     // Keep this helper's storage mode stable if preferences change while it is alive.
-    Object.assign(process.env, getCcemAgentEnv());
+    // Antigravity reuses ~/.gemini/antigravity-cli natively and must not inherit Claude/Codex agent profile overrides.
+    if (command.provider !== 'agy') {
+      Object.assign(process.env, getCcemAgentEnv());
+    }
     if (command.model != null) {
-      if (command.provider !== 'codex') {
-        throw new Error('MODEL_PROVIDER_UNSUPPORTED: task model selection is only available for Codex sessions.');
+      if (command.provider !== 'codex' && command.provider !== 'agy') {
+        throw new Error('MODEL_PROVIDER_UNSUPPORTED: task model selection is only available for Codex and Antigravity sessions.');
       }
       if (typeof command.model !== 'string' || command.model !== command.model.trim() || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(command.model)) {
         throw new Error('MODEL_INVALID: expected a model identifier (1-256 ASCII characters, starting with a letter or digit; no whitespace).');
@@ -5002,7 +5049,7 @@ async function handleCommand(command: InputCommand) {
           emitStatus('ready', 'Native runtime helper initialized.');
         }
         promptQueue.push({ text: initialText, images: initialImages,
-          operation: new InputOperation('codex', [], emitEvent, command.initial_command_id ?? undefined) });
+          operation: new InputOperation(command.provider, [], emitEvent, command.initial_command_id ?? undefined) });
         await runQueuedTurns();
       }
     } else if (command.provider === 'claude') {
@@ -5348,16 +5395,23 @@ async function handleCommand(command: InputCommand) {
         applySettingsCommand(command);
         if (initCommand.provider === 'codex') {
           teardownCodexSession(command.env_vars !== undefined || command.effort !== undefined);
+        } else if (initCommand.provider === 'agy') {
+          await agyRuntime.applyLiveSettings({
+            permMode: command.perm_mode,
+            effort: command.effort,
+            envVarsChanged: command.env_vars !== undefined,
+          });
         }
         emitStatus('ready', 'Settings applied.');
         emitSettingsUpdateResult(command.request_id, 'applied');
       } else {
         queuePendingSettings(command);
+        const providerLabel = initCommand.provider === 'agy' ? 'Antigravity' : 'Codex';
         emitStatus('processing', 'Settings will apply after the current turn.');
         emitSettingsUpdateResult(
           command.request_id,
           'deferred',
-          'Settings require the current Codex turn to finish.',
+          `Settings require the current ${providerLabel} turn to finish.`,
         );
       }
     });
@@ -5768,6 +5822,26 @@ async function handleCommand(command: InputCommand) {
       return;
     }
 
+    if (initCommand?.provider === 'agy') {
+      if (runtimeTeardown) {
+        agyRuntime.interruptTurn();
+        currentAbortController?.abort();
+        if (!activeTurn) {
+          await agyRuntime.teardown();
+          emitStatus('closed_idle', 'Antigravity runtime stopped.');
+          finishClaudeRuntimeTeardown();
+        }
+      } else {
+        stopped = false;
+        agyRuntime.interruptTurn();
+        currentAbortController?.abort();
+        emitStatus(activeTurn ? 'processing' : 'ready', activeTurn
+          ? 'Waiting for interrupted Antigravity turn to settle.'
+          : 'Turn interrupted. Ready for the next prompt.');
+      }
+      return;
+    }
+
     currentAbortController?.abort();
 
     // Tear down sessions so the next prompt starts a fresh turn.
@@ -5861,6 +5935,7 @@ rl.on('close', () => {
   }
   closeClaudeQueryForRecovery();
   teardownCodexSession(false);
+  void agyRuntime.teardown();
   // The host has closed our stdin (app exit or session close).
   // Give the status write and teardown a moment, then exit regardless of
   // remaining handles.

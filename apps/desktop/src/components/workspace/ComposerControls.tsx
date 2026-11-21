@@ -14,6 +14,7 @@ import {
   Sparkles,
   Zap,
 } from '@/lib/lucide-react';
+import { Antigravity } from '@lobehub/icons';
 import { ModelIcon } from '@/components/history/ModelIcon';
 import {
   Select,
@@ -49,6 +50,7 @@ export const normalizePermissionModeName = normalizeWorkspacePermissionModeName;
 
 const CLAUDE_EFFORT_LEVELS: EffortLevel[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 const CODEX_EFFORT_LEVELS: EffortLevel[] = ['minimal', 'low', 'medium', 'high', 'xhigh'];
+const AGY_EFFORT_LEVELS: EffortLevel[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 const EFFORT_I18N_KEYS: Record<EffortLevel, string> = {
   minimal: 'workspace.effortMinimal',
@@ -282,6 +284,7 @@ function EffortSlider({
 
 export function providerDisplayName(client: string) {
   if (client === 'codex') return 'Codex';
+  if (client === 'agy') return 'Antigravity';
   if (client === 'opencode') return 'OpenCode';
   return 'Claude';
 }
@@ -438,6 +441,7 @@ function ComposerControlsView({
   const currentEnvironmentIconHint = resolveEnvironmentIconHint(currentEnvironment);
   const currentModel = currentEnvironment ? environmentOpusModelLabel(currentEnvironment) : null;
   const isCodexProvider = provider === 'codex';
+  const isAgyProvider = provider === 'agy';
   const isEnvironmentLocked = isCodexProvider || environmentLocked;
   const environmentLockedBadge = isCodexProvider
     ? t('workspace.codexModelSelectorDisabledBadge')
@@ -450,7 +454,11 @@ function ComposerControlsView({
     detail: t(`environments.permMode_${permissionPreviewMode}_detail`),
   };
 
-  const effortLevels = isCodexProvider ? CODEX_EFFORT_LEVELS : CLAUDE_EFFORT_LEVELS;
+  const effortLevels = isCodexProvider
+    ? CODEX_EFFORT_LEVELS
+    : isAgyProvider
+      ? AGY_EFFORT_LEVELS
+      : CLAUDE_EFFORT_LEVELS;
 
   return (
     <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2">
@@ -482,14 +490,18 @@ function ComposerControlsView({
             <span
               className={cn(
                 'flex min-w-0 items-center gap-2',
-                isEnvironmentLocked && 'text-muted-foreground/65',
+                !isAgyProvider && isEnvironmentLocked && 'text-muted-foreground/65',
               )}
             >
-              <span className={cn('flex shrink-0', isEnvironmentLocked && 'opacity-45 grayscale')}>
-                <EnvironmentLobeIcon hint={currentEnvironmentIconHint} />
+              <span className={cn('flex shrink-0', !isAgyProvider && isEnvironmentLocked && 'opacity-45 grayscale')}>
+                {isAgyProvider
+                  ? <Antigravity.Color size={14} className="shrink-0" />
+                  : <EnvironmentLobeIcon hint={currentEnvironmentIconHint} />}
               </span>
-              <span className="min-w-0 max-w-[120px] truncate max-[760px]:hidden group-data-[compact]/composer-footer:hidden">{envName}</span>
-              {isEnvironmentLocked && (
+              <span className="min-w-0 max-w-[120px] truncate max-[760px]:hidden group-data-[compact]/composer-footer:hidden">
+                {isAgyProvider ? 'Antigravity' : envName}
+              </span>
+              {!isAgyProvider && isEnvironmentLocked && (
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-muted/50 text-muted-foreground">
@@ -520,7 +532,7 @@ function ComposerControlsView({
           // menu can't spill past the window edge; the env list absorbs it.
           className="flex max-h-[min(480px,var(--radix-dropdown-menu-content-available-height))] w-[340px] flex-col overflow-visible p-0"
         >
-          <div className="shrink-0 px-3 pt-2.5 pb-1">
+          <div className={cn('shrink-0 px-3 pt-2.5', isAgyProvider ? 'pb-2.5' : 'pb-1')}>
             <div className="px-0.5 leading-4 text-2xs uppercase tracking-wider font-medium text-muted-foreground/70">
               {t('workspace.effortLabel')}
             </div>
@@ -532,102 +544,106 @@ function ComposerControlsView({
               ariaLabel={t('workspace.effortLabel')}
             />
           </div>
-          <DropdownMenuSeparator className="my-1 shrink-0" />
-          <div className="flex shrink-0 items-center justify-between gap-3 px-3 py-1.5 text-2xs uppercase tracking-wider font-medium text-muted-foreground/70">
-            <span>{t('workspace.environmentLabel')}</span>
-            {isEnvironmentLocked && (
-              <span className="inline-flex items-center gap-1 rounded-full border border-border/60 bg-muted/35 px-1.5 py-0.5 normal-case tracking-normal text-muted-foreground">
-                <Lock className="h-2.5 w-2.5" />
-                {environmentLockedBadge}
-              </span>
-            )}
-          </div>
-          {isEnvironmentLocked && (
-            <p className="mx-2.5 mb-1.5 shrink-0 rounded-lg border border-border/60 bg-muted/25 px-2.5 py-2 text-[11px] leading-4 text-muted-foreground">
-              {environmentLockedHint}
-            </p>
+          {!isAgyProvider && (
+            <>
+              <DropdownMenuSeparator className="my-1 shrink-0" />
+              <div className="flex shrink-0 items-center justify-between gap-3 px-3 py-1.5 text-2xs uppercase tracking-wider font-medium text-muted-foreground/70">
+                <span>{t('workspace.environmentLabel')}</span>
+                {isEnvironmentLocked && (
+                  <span className="inline-flex items-center gap-1 rounded-full border border-border/60 bg-muted/35 px-1.5 py-0.5 normal-case tracking-normal text-muted-foreground">
+                    <Lock className="h-2.5 w-2.5" />
+                    {environmentLockedBadge}
+                  </span>
+                )}
+              </div>
+              {isEnvironmentLocked && (
+                <p className="mx-2.5 mb-1.5 shrink-0 rounded-lg border border-border/60 bg-muted/25 px-2.5 py-2 text-[11px] leading-4 text-muted-foreground">
+                  {environmentLockedHint}
+                </p>
+              )}
+              <ScrollArea
+                type="always"
+                data-ccem-composer-environment-scroll
+                // Flex chain (content → root → viewport) lets the list shrink to
+                // whatever height the effort header leaves, then scroll.
+                className="ccem-overlay-scroll flex min-h-0 max-h-[320px] flex-1 flex-col"
+                viewportClassName="min-h-0 flex-1"
+                // The anchored panel can't follow a scrolling row; drop it instead.
+                onScrollCapture={() => {
+                  if (envPanel) {
+                    clearEnvPanelSwitch();
+                    setEnvPanel(null);
+                  }
+                }}
+              >
+                <div className="px-1.5 pb-1.5">
+                  {groupedEnvironments.map((group) => {
+                    const isCurrentGroup = currentModel === group.model;
+                    const groupIconEnv = group.envs.find((e) => e.name === envName) || group.envs[0];
+                    const isPanelOpen = envPanel?.model === group.model;
+                    const openPanel = (row: HTMLElement) => {
+                      clearEnvPanelSwitch();
+                      setEnvPanel({ model: group.model, row });
+                      focusEnvPanel();
+                    };
+                    // Every model row opens the shared env panel, even with a single
+                    // env, so the list stays one uniform column of models.
+                    return (
+                      <DropdownMenuItem
+                        key={group.model}
+                        data-current-env-group={isCurrentGroup || undefined}
+                        data-env-group-row={group.model}
+                        aria-haspopup="menu"
+                        aria-expanded={isPanelOpen}
+                        onFocus={(event) => {
+                          scheduleEnvPanel({ model: group.model, row: event.currentTarget });
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key === 'ArrowRight') {
+                            event.preventDefault();
+                            openPanel(event.currentTarget);
+                          }
+                        }}
+                        onSelect={(event) => {
+                          event.preventDefault();
+                          openPanel(event.currentTarget as HTMLElement);
+                        }}
+                        className={cn(
+                          'h-8 cursor-pointer gap-2.5 rounded-lg px-2 text-[12.5px] leading-none',
+                          'text-foreground/85 transition-colors',
+                          'hover:bg-foreground/[0.05] focus:bg-foreground/[0.05] data-[highlighted]:bg-foreground/[0.05]',
+                          isCurrentGroup && 'bg-primary/[0.07] hover:bg-primary/[0.1] focus:bg-primary/[0.1] data-[highlighted]:bg-primary/[0.1]',
+                          isPanelOpen && !isCurrentGroup && 'bg-foreground/[0.06]',
+                          isEnvironmentLocked && 'opacity-70',
+                        )}
+                      >
+                        <span className="flex h-5 w-5 shrink-0 items-center justify-center">
+                          <EnvironmentLobeIcon
+                            hint={resolveEnvironmentIconHint(groupIconEnv)}
+                            size={16}
+                          />
+                        </span>
+                        <span
+                          className={cn(
+                            'min-w-0 flex-1 truncate',
+                            isCurrentGroup && 'font-medium text-primary',
+                          )}
+                        >
+                          {group.model}
+                        </span>
+                        <ChevronRight
+                          className={cn(
+                            'h-3.5 w-3.5 shrink-0 transition-colors',
+                            isPanelOpen ? 'text-foreground/70' : 'text-muted-foreground/40',
+                          )}
+                        />
+                      </DropdownMenuItem>
+                    );
+                  })}
+                </div>
+              </ScrollArea>
+            </>
           )}
-          <ScrollArea
-            type="always"
-            data-ccem-composer-environment-scroll
-            // Flex chain (content → root → viewport) lets the list shrink to
-            // whatever height the effort header leaves, then scroll.
-            className="ccem-overlay-scroll flex min-h-0 max-h-[320px] flex-1 flex-col"
-            viewportClassName="min-h-0 flex-1"
-            // The anchored panel can't follow a scrolling row; drop it instead.
-            onScrollCapture={() => {
-              if (envPanel) {
-                clearEnvPanelSwitch();
-                setEnvPanel(null);
-              }
-            }}
-          >
-            <div className="px-1.5 pb-1.5">
-              {groupedEnvironments.map((group) => {
-                const isCurrentGroup = currentModel === group.model;
-                const groupIconEnv = group.envs.find((e) => e.name === envName) || group.envs[0];
-                const isPanelOpen = envPanel?.model === group.model;
-                const openPanel = (row: HTMLElement) => {
-                  clearEnvPanelSwitch();
-                  setEnvPanel({ model: group.model, row });
-                  focusEnvPanel();
-                };
-                // Every model row opens the shared env panel, even with a single
-                // env, so the list stays one uniform column of models.
-                return (
-                  <DropdownMenuItem
-                    key={group.model}
-                    data-current-env-group={isCurrentGroup || undefined}
-                    data-env-group-row={group.model}
-                    aria-haspopup="menu"
-                    aria-expanded={isPanelOpen}
-                    onFocus={(event) => {
-                      scheduleEnvPanel({ model: group.model, row: event.currentTarget });
-                    }}
-                    onKeyDown={(event) => {
-                      if (event.key === 'ArrowRight') {
-                        event.preventDefault();
-                        openPanel(event.currentTarget);
-                      }
-                    }}
-                    onSelect={(event) => {
-                      event.preventDefault();
-                      openPanel(event.currentTarget as HTMLElement);
-                    }}
-                    className={cn(
-                      'h-8 cursor-pointer gap-2.5 rounded-lg px-2 text-[12.5px] leading-none',
-                      'text-foreground/85 transition-colors',
-                      'hover:bg-foreground/[0.05] focus:bg-foreground/[0.05] data-[highlighted]:bg-foreground/[0.05]',
-                      isCurrentGroup && 'bg-primary/[0.07] hover:bg-primary/[0.1] focus:bg-primary/[0.1] data-[highlighted]:bg-primary/[0.1]',
-                      isPanelOpen && !isCurrentGroup && 'bg-foreground/[0.06]',
-                      isEnvironmentLocked && 'opacity-70',
-                    )}
-                  >
-                    <span className="flex h-5 w-5 shrink-0 items-center justify-center">
-                      <EnvironmentLobeIcon
-                        hint={resolveEnvironmentIconHint(groupIconEnv)}
-                        size={16}
-                      />
-                    </span>
-                    <span
-                      className={cn(
-                        'min-w-0 flex-1 truncate',
-                        isCurrentGroup && 'font-medium text-primary',
-                      )}
-                    >
-                      {group.model}
-                    </span>
-                    <ChevronRight
-                      className={cn(
-                        'h-3.5 w-3.5 shrink-0 transition-colors',
-                        isPanelOpen ? 'text-foreground/70' : 'text-muted-foreground/40',
-                      )}
-                    />
-                  </DropdownMenuItem>
-                );
-              })}
-            </div>
-          </ScrollArea>
           {(() => {
             const group = envPanel
               ? groupedEnvironments.find((candidate) => candidate.model === envPanel.model)

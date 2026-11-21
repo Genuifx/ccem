@@ -14,6 +14,7 @@ const DEFAULT_EFFORT: EffortLevel = 'max';
 const PERMISSION_MODES = new Set(['yolo', 'auto', 'dev', 'readonly', 'safe']);
 const CLAUDE_EFFORT_LEVELS = new Set<EffortLevel>(['low', 'medium', 'high', 'xhigh', 'max']);
 const CODEX_EFFORT_LEVELS = new Set<EffortLevel>(['minimal', 'low', 'medium', 'high', 'xhigh']);
+const AGY_EFFORT_LEVELS = new Set<EffortLevel>(['low', 'medium', 'high', 'xhigh', 'max']);
 
 function resolvePermissionMode(value: string | undefined): PermissionModeName | null {
   // Retired modes: "ci" became "safe", "audit" became "readonly".
@@ -28,6 +29,7 @@ function isEffortLevel(value: string | null | undefined): value is EffortLevel {
       && (
         CLAUDE_EFFORT_LEVELS.has(value as EffortLevel)
         || CODEX_EFFORT_LEVELS.has(value as EffortLevel)
+        || AGY_EFFORT_LEVELS.has(value as EffortLevel)
       ),
   );
 }
@@ -41,7 +43,7 @@ export function normalizeEffortForProvider(
   provider: HistorySource | string | null | undefined,
 ): EffortLevel {
   if (!isEffortLevel(effort)) {
-    if (provider === 'codex') return 'high';
+    if (provider === 'codex' || provider === 'agy') return 'high';
     return DEFAULT_EFFORT;
   }
 
@@ -49,7 +51,11 @@ export function normalizeEffortForProvider(
     return 'high';
   }
 
-  if (provider !== 'codex' && !CLAUDE_EFFORT_LEVELS.has(effort)) {
+  if (provider === 'agy' && !AGY_EFFORT_LEVELS.has(effort)) {
+    return 'high';
+  }
+
+  if (provider !== 'codex' && provider !== 'agy' && !CLAUDE_EFFORT_LEVELS.has(effort)) {
     return DEFAULT_EFFORT;
   }
 

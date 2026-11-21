@@ -57,6 +57,7 @@ interface InstallStatusState {
   ccem: boolean | null;
   claude: boolean | null;
   codex: boolean | null;
+  agy: boolean | null;
   opencode: boolean | null;
   tmux: boolean | null;
 }
@@ -136,6 +137,7 @@ export function Settings() {
     ccem: null,
     claude: null,
     codex: null,
+    agy: null,
     opencode: null,
     tmux: null,
   });
@@ -160,10 +162,11 @@ export function Settings() {
     let cancelled = false;
 
     const loadInstallStatus = async () => {
-      const [ccem, claude, codex, opencode, platform] = await Promise.allSettled([
+      const [ccem, claude, codex, agy, opencode, platform] = await Promise.allSettled([
         invoke<boolean>('check_ccem_installed'),
         invoke<boolean>('check_claude_installed'),
         invoke<boolean>('check_codex_installed'),
+        invoke<boolean>('check_agy_installed'),
         invoke<boolean>('check_opencode_installed'),
         invoke<PlatformCapabilities>('get_platform_capabilities'),
       ]);
@@ -178,6 +181,7 @@ export function Settings() {
         ccem: ccem.status === 'fulfilled' ? ccem.value : false,
         claude: claude.status === 'fulfilled' ? claude.value : false,
         codex: codex.status === 'fulfilled' ? codex.value : false,
+        agy: agy.status === 'fulfilled' ? agy.value : false,
         opencode: opencode.status === 'fulfilled' ? opencode.value : false,
         tmux: nextPlatformCapabilities?.tmuxSupported === false
           ? null
@@ -871,6 +875,12 @@ export function Settings() {
           {t('settings.codexStatus')}
         </span>
         <InstallStatusBadge status={installStatus.codex} />
+      </div>
+      <div className="flex items-center justify-between">
+        <span className="text-sm text-muted-foreground">
+          {t('settings.agyStatus')}
+        </span>
+        <InstallStatusBadge status={installStatus.agy} />
       </div>
       <div className="flex items-center justify-between">
         <span className="text-sm text-muted-foreground">

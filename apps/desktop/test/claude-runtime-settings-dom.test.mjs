@@ -83,9 +83,10 @@ test.before(async () => {
       }`, loader: 'tsx', resolveDir: desktop },
     outfile, bundle: true, platform: 'node', format: 'cjs', jsx: 'automatic', logLevel: 'silent',
     plugins: [{ name: 'runtime-boundaries', setup(builder) {
-      builder.onResolve({ filter: /^(@tauri-apps\/api\/core|@\/locales|@\/lib\/nativeSurfaceOcclusion|@\/lib\/nativeBrowserOverlay|sonner|@\/store|@\/features\/conversations\/historyData)$/ }, ({ path }) => ({ path, namespace: 'fixture' }));
+      builder.onResolve({ filter: /^(@tauri-apps\/api\/core|@lobehub\/icons|@\/locales|@\/lib\/nativeSurfaceOcclusion|@\/lib\/nativeBrowserOverlay|sonner|@\/store|@\/features\/conversations\/historyData)$/ }, ({ path }) => ({ path, namespace: 'fixture' }));
       builder.onLoad({ filter: /.*/, namespace: 'fixture' }, ({ path }) => ({ loader: 'js', contents:
-        path === 'sonner' ? 'export const toast={success:text=>globalThis.__runtimeToasts.push(text),error:text=>globalThis.__runtimeToasts.push(text)};'
+        path === '@lobehub/icons' ? 'function Icon(){return null;} Icon.Color = Icon; export const Antigravity = Icon;'
+          : path === 'sonner' ? 'export const toast={success:text=>globalThis.__runtimeToasts.push(text),error:text=>globalThis.__runtimeToasts.push(text)};'
           : path === '@/store' ? 'export const useAppStore={getState:()=>({setInstalledSkills(){}})};'
             : path === '@/features/conversations/historyData' ? 'export const invalidateHistoryCache=()=>{};'
         : path === '@/locales' ? 'export function useLocale(){return {t:(key,params={})=>key+Object.values(params).map(value=>" "+value).join("")};}'
@@ -102,6 +103,9 @@ test.beforeEach(() => {
   current = snapshot(); calls = []; intervals = [];
   globalThis.__runtimeToasts = [];
   handler = async (name, args) => {
+    if (name === 'get_agy_runtime_status') {
+      return { installed: true, resolvedPath: '/usr/local/bin/agy', customPath: null, defaultHomeDir: '/fixture/home/.gemini/antigravity-cli' };
+    }
     if (name === 'set_claude_runtime_source') {
       current.preference = args.source;
       current.selected = args.source === 'managed' ? null : selection();

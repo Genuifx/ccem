@@ -126,3 +126,51 @@ export function normalizeCodexSandboxMode(permMode: string) {
     networkAccessEnabled: true,
   };
 }
+
+export type AgyAcpMode = 'default' | 'accept-edits' | 'plan' | 'auto';
+
+export type AgyPermissionSettings = {
+  acpMode: AgyAcpMode;
+  dangerouslySkipPermissions: boolean;
+};
+
+export function normalizeAgyPermissionMode(permMode: string): AgyPermissionSettings {
+  switch (permMode) {
+    case 'yolo':
+    case 'bypassPermissions':
+    case 'danger-full-access':
+      return {
+        acpMode: 'auto',
+        dangerouslySkipPermissions: true,
+      };
+    case 'plan':
+    case 'readonly':
+    case 'audit':
+    case 'read-only':
+      return {
+        acpMode: 'plan',
+        dangerouslySkipPermissions: false,
+      };
+    case 'dev':
+    case 'acceptEdits':
+    case 'accept-edits':
+      return {
+        acpMode: 'accept-edits',
+        dangerouslySkipPermissions: false,
+      };
+    case 'auto':
+      return {
+        acpMode: 'auto',
+        dangerouslySkipPermissions: false,
+      };
+    case 'safe':
+    case 'ci':
+    case 'default':
+    case 'manual':
+    default:
+      return {
+        acpMode: 'default',
+        dangerouslySkipPermissions: false,
+      };
+  }
+}

@@ -1,4 +1,4 @@
-import { Claude, Codex, OpenCode } from '@lobehub/icons';
+import { Antigravity, Claude, Codex, OpenCode } from '@lobehub/icons';
 import { ChevronDown } from '@/lib/lucide-react';
 import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
@@ -14,13 +14,16 @@ interface AgentLaunchSplitButtonProps {
   newSessionLabel: string;
   claudeLabel: string;
   codexLabel: string;
+  agyLabel?: string;
   opencodeLabel: string;
   codexUnavailableLabel: string;
   codexInstalled?: boolean;
+  agyInstalled?: boolean;
   opencodeInstalled?: boolean;
   className?: string;
   onLaunchClaude: () => void;
   onLaunchCodex: () => void;
+  onLaunchAgy?: () => void;
   onLaunchOpenCode: () => void;
 }
 
@@ -28,13 +31,16 @@ export function AgentLaunchSplitButton({
   newSessionLabel,
   claudeLabel,
   codexLabel,
+  agyLabel = 'Antigravity',
   opencodeLabel,
   codexUnavailableLabel,
   codexInstalled = false,
+  agyInstalled = false,
   opencodeInstalled = false,
   className,
   onLaunchClaude,
   onLaunchCodex,
+  onLaunchAgy,
   onLaunchOpenCode,
 }: AgentLaunchSplitButtonProps) {
   return (
@@ -87,6 +93,30 @@ export function AgentLaunchSplitButton({
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="min-w-[180px]">
+            {onLaunchAgy && (
+              <DropdownMenuItem
+                data-testid="workspace-launch-agy"
+                disabled={!agyInstalled}
+                onSelect={() => {
+                  if (agyInstalled) {
+                    onLaunchAgy();
+                  }
+                }}
+                aria-label={
+                  agyInstalled
+                    ? `${newSessionLabel}: ${agyLabel}`
+                    : `${agyLabel} ${codexUnavailableLabel}`
+                }
+              >
+                <Antigravity.Color className="mr-2 h-4 w-4" size={16} />
+                <span>{agyLabel}</span>
+                {!agyInstalled && (
+                  <span className="ml-auto text-2xs text-muted-foreground">
+                    {codexUnavailableLabel}
+                  </span>
+                )}
+              </DropdownMenuItem>
+            )}
             <DropdownMenuItem
               data-testid="workspace-launch-opencode"
               disabled={!opencodeInstalled}

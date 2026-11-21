@@ -182,7 +182,7 @@ test('one command can be interrupted once while a changed command can be interru
 
 test('unmanaged provider Escape uses runtime interrupt only while processing', async () => {
   const { decideWorkspaceEscape } = await importWorkspaceEscape();
-  for (const provider of ['codex', 'opencode']) {
+  for (const provider of ['codex', 'opencode', 'agy']) {
     const input = activeInput({ provider, activeCommandId: null, isProviderProcessing: true });
     assert.deepEqual(decideWorkspaceEscape(input), { kind: 'stop', runtimeId: 'runtime-1', commandId: null });
     assert.deepEqual(decideWorkspaceEscape({ ...input, repeat: true }), { kind: 'ignore' });

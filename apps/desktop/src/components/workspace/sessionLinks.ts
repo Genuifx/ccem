@@ -1,6 +1,6 @@
 import type { HistorySessionItem, HistorySource } from '@/features/conversations/types';
 
-export type CcemSessionLinkSource = Extract<HistorySource, 'claude' | 'codex' | 'opencode'>;
+export type CcemSessionLinkSource = Extract<HistorySource, 'claude' | 'codex' | 'opencode' | 'agy'>;
 
 export type CcemSessionLinkIdKind = 'runtime' | 'provider';
 export type CcemSessionLinkFocus = 'events' | 'history' | 'live';
@@ -38,6 +38,7 @@ function toLinkSource(source: string): CcemSessionLinkSource | null {
     case 'claude': return 'claude';
     case 'codex': return 'codex';
     case 'opencode': return 'opencode';
+    case 'agy': return 'agy';
     default: return null; // dsh, unknown — fail closed
   }
 }

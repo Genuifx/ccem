@@ -4,7 +4,7 @@ export function resolveWorkspaceRuntimePlanMode(
   provider: WorkspaceDispatchProvider,
   planModeEnabled: boolean,
 ) {
-  if (provider !== 'claude') {
+  if (provider !== 'claude' && provider !== 'agy') {
     return null;
   }
   return planModeEnabled ? 'plan' : null;

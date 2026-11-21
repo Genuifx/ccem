@@ -362,8 +362,8 @@ export function History() {
     >
       <div className="w-[300px] shrink-0 flex flex-col glass-subtle glass-noise border-r border-white/[0.06]">
         <div className="border-b border-white/[0.06] px-4 pt-3 pb-1">
-          <div className="flex items-center gap-4">
-            {(['all', 'claude', 'codex'] as HistorySourceFilter[]).map((source) => (
+          <div className="flex items-center gap-3">
+            {(['all', 'claude', 'codex', 'agy'] as HistorySourceFilter[]).map((source) => (
               <button
                 key={source}
                 data-testid={`history-filter-${source}`}
@@ -380,6 +380,7 @@ export function History() {
                 {source === 'all' && t('history.sourceAll')}
                 {source === 'claude' && t('history.sourceClaude')}
                 {source === 'codex' && t('history.sourceCodex')}
+                {source === 'agy' && t('history.sourceAgy')}
               </button>
             ))}
             <DropdownMenu>

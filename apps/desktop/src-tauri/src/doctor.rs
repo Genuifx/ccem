@@ -220,7 +220,7 @@ fn collect_system_load() -> DoctorSystem {
 /// Matches the executable name only; argument paths such as a
 /// `claude-code-env-manager` checkout must not count as agents.
 fn summarize_agent_processes(ps_output: &str) -> (u64, u64) {
-    const AGENT_EXECUTABLES: [&str; 4] = ["claude", "codex", "opencode", "ccem-node"];
+    const AGENT_EXECUTABLES: [&str; 5] = ["claude", "codex", "opencode", "agy", "ccem-node"];
     ps_output
         .lines()
         .filter_map(|line| line.trim_start().split_once(' '))
@@ -401,6 +401,7 @@ fn collect_command_statuses(user_path: &str) -> Vec<DoctorCommandStatus> {
         doctor_command("claude", terminal::resolve_claude_path(), user_path),
         doctor_command("codex", terminal::resolve_codex_path(), user_path),
         doctor_command("opencode", terminal::resolve_opencode_path(), user_path),
+        doctor_command("agy", terminal::resolve_agy_path(), user_path),
     ];
 
     if cfg!(any(target_os = "macos", target_os = "linux")) {

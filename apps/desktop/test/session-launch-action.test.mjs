@@ -74,6 +74,16 @@ test('uses an explicit launch client when supplied', async () => {
 
   assert.deepEqual(result, { launched: true, workingDir: '/tmp/project' });
   assert.deepEqual(calls, [['onLaunchWithDir', '/tmp/project', 'opencode']]);
+
+  const agyResult = await launchSingleSession({
+    selectedWorkingDir: '/tmp/project',
+    client: 'agy',
+    onLaunch: async () => { calls.push('onLaunch'); },
+    onLaunchWithDir: async (dir, client) => { calls.push(['onLaunchWithDir', dir, client]); },
+  });
+
+  assert.deepEqual(agyResult, { launched: true, workingDir: '/tmp/project' });
+  assert.deepEqual(calls.at(-1), ['onLaunchWithDir', '/tmp/project', 'agy']);
 });
 
 test('rejects when onLaunch rejects, without calling onLaunchWithDir', async () => {

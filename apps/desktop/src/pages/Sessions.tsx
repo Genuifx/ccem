@@ -149,7 +149,9 @@ function unifiedToLegacySession(u: UnifiedSession): Session {
         ? 'codex'
         : u.client?.toLowerCase() === 'opencode'
           ? 'opencode'
-          : 'claude'
+          : u.client?.toLowerCase() === 'agy'
+            ? 'agy'
+            : 'claude'
     ) as Session['client'],
     envName: u.envName,
     workingDir: u.projectDir,

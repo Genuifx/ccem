@@ -59,9 +59,11 @@ function sessionRuntimeId(session: PetNotificationSourceSession): string {
   return isNativeSession(session) ? session.runtime_id : session.id;
 }
 
-function sessionProvider(session: PetNotificationSourceSession): 'claude' | 'codex' {
+function sessionProvider(session: PetNotificationSourceSession): 'claude' | 'codex' | 'agy' {
   const provider = isNativeSession(session) ? session.provider : session.client;
-  return provider === 'codex' ? 'codex' : 'claude';
+  if (provider === 'codex') return 'codex';
+  if (provider === 'agy') return 'agy';
+  return 'claude';
 }
 
 function sessionProviderSessionId(session: PetNotificationSourceSession): string | null {
@@ -173,7 +175,7 @@ export function buildPetDisplayFromEvents(
 }
 
 export function buildPetNotificationId(
-  provider: 'claude' | 'codex',
+  provider: 'claude' | 'codex' | 'agy',
   runtimeId: string,
   status: string,
 ): string {

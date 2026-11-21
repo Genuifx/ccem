@@ -805,10 +805,10 @@ impl InteractiveRuntimeManager {
         }
 
         if state == ClaudeTerminalState::WaitingApproval {
-            let client_name = if client_name == "codex" {
-                "Codex"
-            } else {
-                "Claude"
+            let client_name = match client_name.as_str() {
+                "codex" => "Codex",
+                "agy" => "Antigravity",
+                _ => "Claude",
             };
             let record = store.append(SessionEventPayload::TerminalPromptRequired {
                 prompt_kind: TerminalPromptKind::Permission,
@@ -940,10 +940,10 @@ fn maybe_notify_interactive_session_event(
             &NotificationContext::new(
                 session.env_name.clone(),
                 session.working_dir.clone(),
-                if session.client == "codex" {
-                    "Codex"
-                } else {
-                    "Claude"
+                match session.client.as_str() {
+                    "codex" => "Codex",
+                    "agy" => "Antigravity",
+                    _ => "Claude",
                 },
             ),
             payload,
@@ -961,6 +961,15 @@ fn build_client_args(
         let mut args = Vec::new();
         if let Some(resume_session_id) = resume_session_id {
             args.push("resume".to_string());
+            args.push(resume_session_id.to_string());
+        }
+        return args;
+    }
+
+    if client == "agy" {
+        let mut args = Vec::new();
+        if let Some(resume_session_id) = resume_session_id {
+            args.push("--conversation".to_string());
             args.push(resume_session_id.to_string());
         }
         return args;
@@ -1104,5 +1113,14 @@ mod tests {
             tmp.to_string_lossy().as_ref(),
             private_tmp.to_string_lossy().as_ref()
         ));
+    }
+
+    #[test]
+    fn agy_client_args_uses_conversation_flag_on_resume() {
+        assert!(build_client_args("agy", "dev", None, None).is_empty());
+        assert_eq!(
+            build_client_args("agy", "yolo", Some("conv-123"), None),
+            vec!["--conversation", "conv-123"]
+        );
     }
 }

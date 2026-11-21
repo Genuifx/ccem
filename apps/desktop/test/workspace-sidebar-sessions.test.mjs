@@ -592,3 +592,29 @@ test('live summary refreshes keep sidebar rows and tree state identities when no
   assert.equal(stoppedTree.canonicalKeyBySessionKey, firstTree.canonicalKeyBySessionKey);
   assert.equal(stoppedTree.activeSessionKeys.size, 0);
 });
+
+test('maps agy live native sessions with agy source and Antigravity fallback label', async () => {
+  const {
+    buildWorkspaceSidebarSessions,
+    findLiveEntryForSidebarSession,
+    liveSessionSidebarKey,
+  } = await importWorkspaceSidebarSessions();
+
+  const entry = {
+    session: nativeSession({
+      runtime_id: 'native-agy-1',
+      provider: 'agy',
+      provider_session_id: 'agy-conv-1',
+      env_name: 'Antigravity',
+      initial_user_prompt: null,
+      display_title: null,
+    }),
+  };
+
+  assert.equal(liveSessionSidebarKey(entry), 'agy:agy-conv-1');
+  const rows = buildWorkspaceSidebarSessions([], [entry]);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].source, 'agy');
+  assert.equal(rows[0].display, 'Antigravity workspace session');
+  assert.equal(findLiveEntryForSidebarSession([entry], rows[0]), entry);
+});

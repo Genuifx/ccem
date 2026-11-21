@@ -1,6 +1,6 @@
 import { memo } from 'react';
 import { Bot } from '@/lib/lucide-react';
-import { Claude, Codex, OpenAI, DeepSeek, Grok, Minimax, Moonshot, Zhipu, Gemini, Ollama, OpenRouter as OpenRouterIcon, Qwen, XiaomiMiMo } from '@lobehub/icons';
+import { Antigravity, Claude, Codex, OpenAI, DeepSeek, Grok, Minimax, Moonshot, Zhipu, Gemini, Ollama, OpenRouter as OpenRouterIcon, Qwen, XiaomiMiMo } from '@lobehub/icons';
 
 interface ModelIconProps {
   model?: string;
@@ -26,6 +26,7 @@ export function resolveIcon(model: string | undefined): IconEntry | null {
   if (!model) return null;
   const m = model.toLowerCase();
 
+  if (m.includes('antigravity') || m === 'agy') return { icon: Antigravity, variant: 'color' };
   if (m.includes('codex')) return { icon: Codex, variant: 'color' };
   if (m.includes('grok') || m.includes('xai')) return { icon: Grok, color: '#000', needsContrastBg: true };
   if (m.includes('claude') || m.includes('anthropic') || m.includes('opus') || m.includes('sonnet') || m.includes('haiku')) return { icon: Claude, color: '#D97757' };

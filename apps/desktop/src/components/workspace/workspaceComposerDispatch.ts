@@ -1,6 +1,6 @@
 import { normalizeWorkspacePermissionModeName } from '@/components/workspace/workspacePermissionModes';
 
-export type WorkspaceDispatchProvider = 'claude' | 'codex';
+export type WorkspaceDispatchProvider = 'claude' | 'codex' | 'agy';
 
 export interface WorkspaceComposerDispatchOptions {
   provider: WorkspaceDispatchProvider;
@@ -28,7 +28,7 @@ export function resolveComposerDispatch(
     };
   }
 
-  if (options.provider === 'claude') {
+  if (options.provider === 'claude' || options.provider === 'agy') {
     return {
       prompt: trimmedPrompt,
       permMode: permissionMode,

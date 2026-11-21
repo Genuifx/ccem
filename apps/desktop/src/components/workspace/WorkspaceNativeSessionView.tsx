@@ -27,6 +27,7 @@ import {
 } from 'react';
 import { toast } from 'sonner';
 import { isRecoveringWebcontent, registerWebcontentSessionSample } from '@/lib/webcontentRecovery';
+import { isAgyAuthRequiredError, loginAgyAccount } from '@/lib/agy-runtime';
 import { readRecoveryDraft, recoveryDraftKey } from '@/lib/recoveryDrafts';
 import { Button } from '@/components/ui/button';
 import {
@@ -321,6 +322,7 @@ interface WorkspaceNativeSessionViewProps {
   onSessionUpdate: (session: NativeSessionSummary) => void;
   onStartNew: () => void;
   codexInstalled?: boolean;
+  agyInstalled?: boolean;
   opencodeInstalled?: boolean;
   onLaunchNewSession?: (client: LaunchClient) => void;
   /** suggestion id -> child session keys, for next-step cards. */
@@ -1508,6 +1510,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
   onSessionUpdate,
   onStartNew,
   codexInstalled = false,
+  agyInstalled = false,
   opencodeInstalled = false,
   onLaunchNewSession,
   onForkTurnRequest,
@@ -3656,7 +3659,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
       };
     },
   ) => {
-    if (session.provider !== 'claude') {
+    if (session.provider !== 'claude' && session.provider !== 'agy') {
       setComposerPlanModeEnabled(enabled);
       return true;
     }
@@ -4789,8 +4792,31 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
           ? t('workspace.composerPlanModeHintClaudeLocked')
           : undefined}
         codexInstalled={codexInstalled}
+        agyInstalled={agyInstalled}
         opencodeInstalled={opencodeInstalled}
         onLaunchNewSession={onLaunchNewSession}
+        aboveTextarea={session.provider === 'agy' && isAgyAuthRequiredError(session.last_error) ? (
+          <div
+            role="alert"
+            data-testid="agy-session-auth-banner"
+            className="flex items-center justify-between gap-3 rounded-lg border border-border/60 bg-muted/35 px-3 py-2 text-xs"
+          >
+            <span className="text-muted-foreground">{t('workspace.agyAuthRequiredInline')}</span>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="h-7 shrink-0"
+              onClick={() => {
+                void loginAgyAccount()
+                  .then(() => toast.success(t('agentProfiles.loginOpened')))
+                  .catch((error) => toast.error(String(error)));
+              }}
+            >
+              {t('agentProfiles.loginAgy')}
+            </Button>
+          </div>
+        ) : undefined}
         queuedMessages={composerQueuedMessages}
         onFlushQueuedMessages={() => void flushQueuedMessages(true)}
         onRemoveQueuedMessage={handleRemoveQueuedMessage}
@@ -4926,22 +4952,26 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
                   <HermesBotIcon className="h-4 w-4 shrink-0" />
                   <span>{t('workspace.hermesHandoffTitle')}</span>
                 </DropdownMenuItem>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  className="gap-2.5"
-                  disabled={isHandingOff || isHandoffPending || isProcessingTurn}
-                  onSelect={() => {
-                    closeExternalActionsMenu();
-                    void handleHandoff();
-                  }}
-                >
-                  {isHandingOff || isHandoffPending ? (
-                    <LoaderCircle className="h-4 w-4 shrink-0 animate-spin" />
-                  ) : (
-                    <Terminal className="h-4 w-4 shrink-0" />
-                  )}
-                  <span>{t('workspace.nativeOpenTerminal')}</span>
-                </DropdownMenuItem>
+                {session.can_handoff_to_terminal ? (
+                  <>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      className="gap-2.5"
+                      disabled={isHandingOff || isHandoffPending || isProcessingTurn}
+                      onSelect={() => {
+                        closeExternalActionsMenu();
+                        void handleHandoff();
+                      }}
+                    >
+                      {isHandingOff || isHandoffPending ? (
+                        <LoaderCircle className="h-4 w-4 shrink-0 animate-spin" />
+                      ) : (
+                        <Terminal className="h-4 w-4 shrink-0" />
+                      )}
+                      <span>{t('workspace.nativeOpenTerminal')}</span>
+                    </DropdownMenuItem>
+                  </>
+                ) : null}
               </DropdownMenuContent>
             </DropdownMenu>
           </>

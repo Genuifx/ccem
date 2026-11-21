@@ -1258,6 +1258,8 @@ pub struct DesktopSettings {
         skip_serializing_if = "Option::is_none"
     )]
     pub enabled_environments: Option<Vec<String>>,
+    #[serde(rename = "agyPath", default, skip_serializing_if = "Option::is_none")]
+    pub agy_path: Option<String>,
 }
 
 fn default_theme() -> String {
@@ -1313,6 +1315,7 @@ impl Default for DesktopSettings {
             ai_enhanced: false,
             ai_env_name: None,
             enabled_environments: None,
+            agy_path: None,
         }
     }
 }

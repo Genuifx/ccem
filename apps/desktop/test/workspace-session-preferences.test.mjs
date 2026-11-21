@@ -77,4 +77,7 @@ test('normalizes unsupported effort levels for the selected provider', async () 
   assert.equal(normalizeEffortForProvider('max', 'codex'), 'high');
   assert.equal(normalizeEffortForProvider('max', 'claude'), 'max');
   assert.equal(normalizeEffortForProvider(null, 'claude'), 'max');
+  assert.equal(normalizeEffortForProvider(null, 'agy'), 'high');
+  assert.equal(normalizeEffortForProvider('minimal', 'agy'), 'high');
+  assert.equal(normalizeEffortForProvider('max', 'agy'), 'max');
 });

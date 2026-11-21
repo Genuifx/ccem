@@ -8,6 +8,7 @@ import type { AgentProfileStatus } from '@/lib/tauri-ipc';
 import { invalidateHistoryCache } from '@/features/conversations/historyData';
 import { useAppStore } from '@/store';
 import { ClaudeRuntimeRequiredDialog, ClaudeRuntimeSettings } from '@/components/ClaudeRuntimeSettings';
+import { AgyRuntimeCard } from '@/components/AgyRuntimeCard';
 import { isClaudeRuntimeLoginRequiredError } from '@/lib/claude-runtime';
 
 export function AgentProfilesSettings() {
@@ -101,6 +102,7 @@ export function AgentProfilesSettings() {
           </div>}
         </div>
       ))}
+      {!loading && !error && <AgyRuntimeCard disabled={launching !== null || saving} />}
       <p className="text-xs text-muted-foreground">{t('agentProfiles.loginHint')}</p>
       <ClaudeRuntimeRequiredDialog open={runtimeRequired} onOpenChange={setRuntimeRequired} context="login" />
     </div>

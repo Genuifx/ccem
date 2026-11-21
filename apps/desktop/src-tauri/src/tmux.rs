@@ -1,7 +1,7 @@
 use crate::config::MANAGED_CLAUDE_ENV_KEYS;
 use crate::diagnostic_log;
 use crate::terminal::{
-    get_user_path, resolve_codex_path, resolve_opencode_path,
+    get_user_path, resolve_agy_path, resolve_codex_path, resolve_opencode_path,
     resolve_tmux_path,
 };
 use serde::Serialize;
@@ -116,6 +116,7 @@ impl TmuxManager {
         let client_binary = match client {
             "codex" => resolve_codex_path().unwrap_or_else(|| "codex".to_string()),
             "opencode" => resolve_opencode_path().unwrap_or_else(|| "opencode".to_string()),
+            "agy" => resolve_agy_path().unwrap_or_else(|| "agy".to_string()),
             _ => crate::terminal::prepare_claude_runtime_env(&mut prepared_env)?,
         };
         if matches!(client, "claude" | "codex") {
@@ -3068,5 +3069,29 @@ mod tests {
         assert!(right.contains("ccem"));
         assert!(!right.contains("#("));
         assert!(!right.contains("@ccem_subagent"));
+    }
+
+    #[test]
+    fn agy_tmux_launch_spec_does_not_inject_claude_or_codex_profile_env() {
+        let env = HashMap::from([("HTTPS_PROXY".to_string(), "http://127.0.0.1:7890".to_string())]);
+        let spec = build_tmux_launch_spec(
+            "agy",
+            &["--conversation".to_string(), "conv-99".to_string()],
+            &env,
+            "ccem:0",
+            "tmux",
+            "/usr/local/bin/agy",
+        );
+        assert!(spec
+            .command
+            .contains("exec '/usr/local/bin/agy' '--conversation' 'conv-99'"));
+        assert!(!spec
+            .environment
+            .iter()
+            .any(|entry| entry.starts_with("CLAUDE_CONFIG_DIR=") || entry.starts_with("CODEX_HOME=")));
+        assert!(spec
+            .environment
+            .iter()
+            .any(|entry| entry == "HTTPS_PROXY=http://127.0.0.1:7890"));
     }
 }

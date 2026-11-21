@@ -33,7 +33,7 @@ use crate::router::{
 use crate::secure_fs::write_private_atomic;
 use crate::session_provenance::bind_source_session_id;
 use crate::system_proxy::resolve_codex_proxy_env;
-use crate::terminal::{self, resolve_codex_path, TerminalType};
+use crate::terminal::{self, resolve_agy_path, resolve_codex_path, TerminalType};
 use crate::workspace_decorations::AttentionSummary;
 use chrono::{DateTime, Utc};
 use rand::{rngs::OsRng, RngCore};
@@ -137,6 +137,7 @@ fn unix_descendant_process_ids(root_pid: u32, process_table: &str) -> Vec<u32> {
 pub enum NativeProvider {
     Claude,
     Codex,
+    Agy,
 }
 
 impl NativeProvider {
@@ -144,6 +145,7 @@ impl NativeProvider {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Agy => "agy",
         }
     }
 }
@@ -485,6 +487,7 @@ pub struct NativeSessionOptions {
     pub codex_path: Option<String>,
     pub codex_base_url: Option<String>,
     pub codex_api_key: Option<String>,
+    pub agy_path: Option<String>,
     pub effort: Option<String>,
     pub model: Option<String>,
     pub router_launch_draft: Option<RouterLaunchDraft>,
@@ -493,8 +496,8 @@ pub struct NativeSessionOptions {
 
 pub(crate) fn validate_task_model(provider: NativeProvider, model: Option<&str>) -> Result<(), String> {
     let Some(model) = model else { return Ok(()); };
-    if provider != NativeProvider::Codex {
-        return Err("MODEL_PROVIDER_UNSUPPORTED: task model selection is only available for Codex sessions.".into());
+    if !matches!(provider, NativeProvider::Codex | NativeProvider::Agy) {
+        return Err("MODEL_PROVIDER_UNSUPPORTED: task model selection is only available for Codex and Antigravity sessions.".into());
     }
     if model.is_empty() || model.len() > 256
         || !model.as_bytes()[0].is_ascii_alphanumeric()
@@ -680,6 +683,8 @@ enum HelperInputCommand<'a> {
         codex_base_url: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         codex_api_key: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agy_path: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         model: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1093,7 +1098,7 @@ fn stage_runtime_settings_update(
             }
             record.pending_settings_request_id = Some(request_id.to_string());
         }
-        NativeProvider::Codex => {
+        NativeProvider::Codex | NativeProvider::Agy => {
             if let Some(name) = env_name {
                 record.env_name = name.to_string();
             }
@@ -2042,6 +2047,7 @@ struct NativeSessionHandle {
     codex_path: Option<String>,
     codex_base_url: Option<String>,
     codex_api_key: Option<String>,
+    agy_path: Option<String>,
     permission_quarantined: AtomicBool,
     alive: AtomicBool,
 }
@@ -2478,21 +2484,23 @@ impl NativeRuntimeManager {
         if options.provider == NativeProvider::Claude && options.claude_path.is_none() {
             options.claude_path = Some(crate::claude_runtime::shared().resolve_for_launch()?.path);
         }
-        let codex_isolated = if options.provider == NativeProvider::Codex {
-            let mode = match options.codex_isolated {
-                Some(mode) => mode,
-                None => match self.codex_profile_for_resume(options.provider_session_id.as_deref(), &options.working_dir)? {
+        if options.provider != NativeProvider::Agy {
+            let codex_isolated = if options.provider == NativeProvider::Codex {
+                let mode = match options.codex_isolated {
                     Some(mode) => mode,
-                    None => crate::agent_home::codex_isolation_preference()?,
-                },
+                    None => match self.codex_profile_for_resume(options.provider_session_id.as_deref(), &options.working_dir)? {
+                        Some(mode) => mode,
+                        None => crate::agent_home::codex_isolation_preference()?,
+                    },
+                };
+                options.codex_isolated = Some(mode);
+                mode
+            } else {
+                crate::agent_home::codex_isolation_preference()?
             };
-            options.codex_isolated = Some(mode);
-            mode
-        } else {
-            crate::agent_home::codex_isolation_preference()?
-        };
-        crate::agent_home::prepare_agent_homes_for_mode(codex_isolated)?;
-        let client = match options.provider { NativeProvider::Claude => "claude", NativeProvider::Codex => "codex" };
+            crate::agent_home::prepare_agent_homes_for_mode(codex_isolated)?;
+        }
+        let client = options.provider.as_str();
         pin_codex_profile(options.provider, options.codex_isolated, &mut options.helper_env_vars);
         pin_codex_profile(options.provider, options.codex_isolated, &mut options.terminal_env_vars);
         crate::agent_profile::apply_env(client, &mut options.helper_env_vars);
@@ -2592,6 +2600,7 @@ impl NativeRuntimeManager {
             codex_path: options.codex_path.clone(),
             codex_base_url: options.codex_base_url.clone(),
             codex_api_key: options.codex_api_key.clone(),
+            agy_path: options.agy_path.clone(),
             permission_quarantined: AtomicBool::new(false),
             alive: AtomicBool::new(true),
         });
@@ -6751,6 +6760,43 @@ impl NativeRuntimeManager {
             };
         }
 
+        if provider == NativeProvider::Agy && !self.app_termination_in_progress.load(Ordering::SeqCst) {
+            if let Some(handle) = stop_handle {
+                match self.write_to_live_child_outcome(
+                    &handle,
+                    &HelperInputCommand::InterruptTurn {
+                        expected_command_id: None,
+                    },
+                ) {
+                    LiveWriteOutcome::Written => {
+                        if let Err(error) = self.append_lifecycle_event(
+                            runtime_id,
+                            "interrupt_written",
+                            format!(
+                                "Native helper generation {} accepted foreground interrupt command. expected_command_id=-",
+                                handle.generation,
+                            ),
+                        ) {
+                            errors.push(error);
+                        }
+                    }
+                    LiveWriteOutcome::NotStarted(error) => errors.push(error),
+                    LiveWriteOutcome::StartedUnknown(error) => errors.push(format!(
+                        "INTERRUPT_DELIVERY_UNCERTAIN: interrupt may have reached the helper ({error})"
+                    )),
+                }
+            } else {
+                errors.push(format!(
+                    "Native runtime {runtime_id} helper is not connected"
+                ));
+            }
+            return if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            };
+        }
+
         // Do not report completion or retire the generation if owned tools
         // could not be quiesced. The caller must see the stop failure.
         let stop_handle = self.request_child_stop(runtime_id, false)?;
@@ -7755,6 +7801,7 @@ impl NativeRuntimeManager {
             codex_path: options.codex_path.clone(),
             codex_base_url: options.codex_base_url.clone(),
             codex_api_key: options.codex_api_key.clone(),
+            agy_path: options.agy_path.clone(),
             permission_quarantined: AtomicBool::new(record.permission_quarantined),
             alive: AtomicBool::new(true),
         });
@@ -7963,6 +8010,7 @@ impl NativeRuntimeManager {
             codex_path: handle.codex_path.as_deref(),
             codex_base_url: handle.codex_base_url.as_deref(),
             codex_api_key: handle.codex_api_key.as_deref(),
+            agy_path: handle.agy_path.as_deref(),
             effort: options.effort.as_deref(),
             model: options.model.as_deref(),
             todo_snapshot_seed: todo_snapshot_seed.as_ref(),
@@ -11394,13 +11442,19 @@ fn build_runtime_bootstrap_options(
                 let proxy_env_vars = resolve_codex_proxy_env();
                 (proxy_env_vars.clone(), proxy_env_vars, None, None)
             }
+            NativeProvider::Agy => {
+                let proxy_env_vars = resolve_codex_proxy_env();
+                (proxy_env_vars.clone(), proxy_env_vars, None, None)
+            }
         };
     merge_helper_env_path(&mut helper_env_vars, &terminal::get_user_path());
-    let client = match record.provider { NativeProvider::Claude => "claude", NativeProvider::Codex => "codex" };
+    let client = record.provider.as_str();
     let codex_isolated = record.codex_isolated.unwrap_or(false);
-    crate::agent_home::prepare_agent_homes_for_mode(
-        if record.provider == NativeProvider::Codex { codex_isolated } else { crate::agent_home::codex_isolation_preference()? }
-    )?;
+    if record.provider != NativeProvider::Agy {
+        crate::agent_home::prepare_agent_homes_for_mode(
+            if record.provider == NativeProvider::Codex { codex_isolated } else { crate::agent_home::codex_isolation_preference()? }
+        )?;
+    }
     pin_codex_profile(record.provider, record.codex_isolated, &mut helper_env_vars);
     pin_codex_profile(record.provider, record.codex_isolated, &mut terminal_env_vars);
     crate::agent_profile::apply_env(client, &mut helper_env_vars);
@@ -11429,9 +11483,10 @@ fn build_runtime_bootstrap_options(
         helper_env_vars,
         terminal_env_vars,
         claude_path,
-        codex_path: resolve_codex_path(),
+        codex_path: (record.provider == NativeProvider::Codex).then(resolve_codex_path).flatten(),
         codex_base_url,
         codex_api_key,
+        agy_path: (record.provider == NativeProvider::Agy).then(resolve_agy_path).flatten(),
         effort: record.effort.clone(),
         model: record.model.clone(),
         router_launch_draft: None,
@@ -11671,13 +11726,141 @@ mod tests {
                 env_vars: &env_vars, initial_prompt: None, initial_command_id: None,
                 initial_images: None, provider_session_id: Some("provider-resume"),
                 fork_session: None, fork_at_message_id: None, claude_path: None,
-                codex_path: None, codex_base_url: None, codex_api_key: None,
+                codex_path: None, codex_base_url: None, codex_api_key: None, agy_path: None,
                 effort: Some("medium"), model, todo_snapshot_seed: None, router: None,
             };
             let value = serde_json::to_value(command).unwrap();
             assert_eq!(value.get("model").and_then(|v| v.as_str()), model);
             assert_eq!(value["provider_session_id"], "provider-resume");
         }
+    }
+
+    #[test]
+    fn agy_provider_contract_roundtrips_and_allows_task_model() {
+        assert_eq!(NativeProvider::Agy.as_str(), "agy");
+        assert_eq!(
+            serde_json::to_string(&NativeProvider::Agy).unwrap(),
+            "\"agy\""
+        );
+        assert_eq!(
+            serde_json::from_str::<NativeProvider>("\"agy\"").unwrap(),
+            NativeProvider::Agy
+        );
+        assert!(super::validate_task_model(NativeProvider::Agy, Some("gemini-2.5-pro")).is_ok());
+        assert!(super::validate_task_model(NativeProvider::Agy, Some("bad model")).is_err());
+
+        let env_vars = HashMap::new();
+        let command = HelperInputCommand::Init {
+            provider: NativeProvider::Agy.as_str(),
+            env_name: "Antigravity",
+            perm_mode: "dev",
+            allow_dangerously_skip_permissions: false,
+            working_dir: "/tmp/project",
+            env_vars: &env_vars,
+            initial_prompt: Some("hello"),
+            initial_command_id: None,
+            initial_images: None,
+            provider_session_id: None,
+            fork_session: None,
+            fork_at_message_id: None,
+            claude_path: None,
+            codex_path: None,
+            codex_base_url: None,
+            codex_api_key: None,
+            agy_path: Some("/custom/bin/agy"),
+            effort: Some("high"),
+            model: Some("gemini-2.5-pro"),
+            todo_snapshot_seed: None,
+            router: None,
+        };
+        let value = serde_json::to_value(command).unwrap();
+        assert_eq!(value["provider"], "agy");
+        assert_eq!(value["agy_path"], "/custom/bin/agy");
+        assert_eq!(value["model"], "gemini-2.5-pro");
+        assert!(value.get("codex_path").is_none());
+
+        let mut record = native_record("native-agy-settings", "ready", true);
+        record.provider = NativeProvider::Agy;
+        super::stage_runtime_settings_update(
+            &mut record,
+            Some("Antigravity"),
+            Some("high"),
+            "settings-agy",
+        );
+        assert_eq!(record.env_name, "Antigravity");
+        assert_eq!(record.effort.as_deref(), Some("high"));
+        assert!(record.pending_env_name.is_none());
+        assert!(record.pending_settings_request_id.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agy_stop_session_sends_interrupt_turn_and_keeps_session_active() {
+        let runtime_id = "native-agy-interrupt-keeps-session-alive";
+        let manager = manager_with_handle(runtime_id);
+        let handle = manager
+            .handles
+            .lock()
+            .expect("handles")
+            .get(runtime_id)
+            .expect("handle")
+            .clone();
+        manager
+            .records
+            .lock()
+            .expect("records")
+            .get_mut(runtime_id)
+            .expect("record")
+            .provider = NativeProvider::Agy;
+        handle.record.lock().expect("handle record").provider = NativeProvider::Agy;
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(r#"IFS= read -r line; printf '%s\n' "$line"; /bin/sleep 5"#);
+        let (mut events, child) =
+            super::spawn_native_helper_process(command).expect("spawn fake agy helper");
+        *handle.child.lock().expect("child slot") = Some(child);
+
+        let manager = Arc::new(manager);
+        manager
+            .stop_session_from_expected(runtime_id, Some("composer_escape"), None)
+            .expect("agy stop must deliver interrupt_turn without teardown");
+
+        let received_line = tauri::async_runtime::block_on(async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let event = tokio::time::timeout_at(deadline, events.recv())
+                    .await
+                    .expect("helper must receive interrupt_turn before timeout")
+                    .expect("helper event channel open");
+                if let tauri_plugin_shell::process::CommandEvent::Stdout(bytes) = event {
+                    let text = String::from_utf8_lossy(&bytes).trim().to_string();
+                    if !text.is_empty() {
+                        break text;
+                    }
+                }
+            }
+        });
+        let parsed: serde_json::Value =
+            serde_json::from_str(&received_line).expect("valid helper command JSON");
+        assert_eq!(parsed["type"], "interrupt_turn");
+
+        let summary = manager
+            .get_session_summary(runtime_id)
+            .expect("agy session lookup must succeed")
+            .expect("agy session summary must remain present");
+        assert!(summary.is_active, "agy session must remain active after interrupt");
+        assert_ne!(summary.status, "interrupted");
+        assert_ne!(summary.status, "stopped");
+        assert!(
+            manager
+                .is_current_handle(runtime_id, &handle)
+                .unwrap_or(false),
+            "agy handle must stay live for subsequent prompts"
+        );
+
+        let _ = manager.kill_child(runtime_id);
     }
 
     fn native_session_handle(record: NativeSessionRecord) -> Arc<NativeSessionHandle> {
@@ -11763,6 +11946,7 @@ mod tests {
             codex_path: None,
             codex_base_url: None,
             codex_api_key: None,
+            agy_path: None,
             permission_quarantined: AtomicBool::new(false),
             alive: AtomicBool::new(true),
         })
@@ -13846,6 +14030,7 @@ mod tests {
             codex_path: None,
             codex_base_url: None,
             codex_api_key: None,
+            agy_path: None,
             effort: None,
             model: None,
             router_launch_draft: None,
@@ -14744,6 +14929,7 @@ mod tests {
             codex_path: None,
             codex_base_url: None,
             codex_api_key: None,
+            agy_path: None,
             effort: None,
             model: None,
             todo_snapshot_seed: None,
@@ -14772,6 +14958,7 @@ mod tests {
             codex_path: None,
             codex_base_url: None,
             codex_api_key: None,
+            agy_path: None,
             effort: None,
             model: None,
             todo_snapshot_seed: None,
@@ -14813,6 +15000,7 @@ mod tests {
             codex_path: None,
             codex_base_url: None,
             codex_api_key: None,
+            agy_path: None,
             effort: None,
             model: None,
             todo_snapshot_seed: None,
@@ -14861,6 +15049,7 @@ mod tests {
             codex_path: None,
             codex_base_url: None,
             codex_api_key: None,
+            agy_path: None,
             effort: None,
             model: None,
             todo_snapshot_seed: Some(&seed),
@@ -14895,6 +15084,7 @@ mod tests {
             codex_path: None,
             codex_base_url: None,
             codex_api_key: None,
+            agy_path: None,
             effort: None,
             model: None,
             todo_snapshot_seed: None,
