@@ -355,6 +355,8 @@ pub enum SessionEventPayload {
         elapsed_ms: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         generation_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttft_ms: Option<u64>,
     },
     /// Throttled live counter for the running main-agent turn. Output tokens
     /// estimate the response in flight until its usage lands; superseded by
@@ -365,6 +367,8 @@ pub enum SessionEventPayload {
         output_tokens: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         generation_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttft_ms: Option<u64>,
     },
     TokenUsage {
         #[serde(default, skip_serializing_if = "Option::is_none")]

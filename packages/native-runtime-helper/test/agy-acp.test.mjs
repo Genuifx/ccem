@@ -351,3 +351,60 @@ test('agy acp stop closes session cleanly and preserves HOME while stripping ANT
   assert.ok(log.some((e) => e.event === 'recv' && e.msg.method === 'session/close'));
   assert.ok(log.some((e) => e.event === 'eof_exit'), 'agy acp child must exit cleanly on stdin EOF');
 });
+
+test('agy acp multi-step turn emits context_usage from usage_update, single turn_total from prompt result, ttft_ms, and segmented generation_ms', async (t) => {
+  const h = await launchAgyHelper(t, { scenario: 'multi_step_metrics' });
+
+  h.send({
+    ...h.baseInit,
+    model: 'gemini-3-pro',
+    initial_prompt: 'Run multi-step check',
+  });
+
+  await h.wait((o) => o.type === 'status' && o.status === 'ready' && o.detail === 'Ready for the next prompt.');
+
+  const events = h.outputs.filter((o) => o.type === 'event').map((o) => o.payload);
+
+  // usage_update { used, size } maps to context_usage (never inflated into token_usage)
+  const contextEvents = events.filter((e) => e.type === 'context_usage');
+  assert.deepEqual(
+    contextEvents.map((e) => ({
+      provider: e.provider,
+      used: e.used_tokens,
+      max: e.max_tokens,
+      model: e.model,
+    })),
+    [
+      { provider: 'agy', used: 0, max: 1000000, model: 'gemini-3-pro' },
+      { provider: 'agy', used: 9337, max: 1000000, model: 'gemini-3-pro' },
+      { provider: 'agy', used: 24500, max: 1000000, model: 'gemini-3-pro' },
+    ],
+  );
+
+  // Only ONE turn_total token_usage from session/prompt result.usage
+  const tokenUsageEvents = events.filter((e) => e.type === 'token_usage');
+  assert.equal(tokenUsageEvents.length, 1, 'intermediate usage_update context snapshots must never emit token_usage');
+  assert.equal(tokenUsageEvents[0].provider, 'agy');
+  assert.equal(tokenUsageEvents[0].scope, 'turn_total');
+  assert.equal(tokenUsageEvents[0].input_tokens, 12000);
+  assert.equal(tokenUsageEvents[0].output_tokens, 450);
+  assert.equal(tokenUsageEvents[0].cache_read_tokens, 8000);
+  assert.equal(tokenUsageEvents[0].cache_creation_tokens, 0);
+
+  // Live progress carries ttft_ms
+  const progressEvents = events.filter((e) => e.type === 'turn_progress');
+  assert.ok(progressEvents.length >= 1, 'expected live turn_progress');
+  assert.ok(progressEvents.every((e) => typeof e.ttft_ms === 'number' && e.ttft_ms >= 80), 'ttft_ms on turn_progress');
+
+  // Final turn_metrics carries accurate ttft_ms and segmented generation_ms (excludes tool run & inter-step TTFT)
+  const turnMetrics = events.filter((e) => e.type === 'turn_metrics');
+  assert.equal(turnMetrics.length, 1);
+  assert.equal(turnMetrics[0].provider, 'agy');
+  assert.equal(turnMetrics[0].output_tokens, 450);
+  assert.ok(turnMetrics[0].ttft_ms >= 80 && turnMetrics[0].ttft_ms < 300, `expected ttft_ms around 110ms, got ${turnMetrics[0].ttft_ms}`);
+  assert.ok(turnMetrics[0].generation_ms >= 80 && turnMetrics[0].generation_ms < 260, `expected segmented generation_ms ~120ms, got ${turnMetrics[0].generation_ms}`);
+  assert.ok(
+    turnMetrics[0].elapsed_ms >= turnMetrics[0].generation_ms + 380,
+    `elapsed_ms (${turnMetrics[0].elapsed_ms}) should significantly exceed generation_ms (${turnMetrics[0].generation_ms}) because TTFT + tool execution are excluded`,
+  );
+});

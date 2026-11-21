@@ -312,3 +312,53 @@ test('non-routed sessions expose no ledger', async () => {
   ]);
   assert.equal(usage.routedLedger, null);
 });
+
+test('agy context_usage updates context window independently from turn_total token_usage', async () => {
+  const { computeSessionUsage } = await importWorkspaceUsage();
+  const usage = computeSessionUsage([
+    event(1, {
+      type: 'context_usage',
+      provider: 'agy',
+      used_tokens: 9337,
+      max_tokens: 1_000_000,
+      raw_max_tokens: 1_000_000,
+      percentage: 0.9337,
+      auto_compact_threshold: null,
+      is_auto_compact_enabled: true,
+      model: 'gemini-4-neon-high',
+      categories: [],
+    }),
+    event(2, {
+      type: 'context_usage',
+      provider: 'agy',
+      used_tokens: 56_854,
+      max_tokens: 1_000_000,
+      raw_max_tokens: 1_000_000,
+      percentage: 5.6854,
+      auto_compact_threshold: null,
+      is_auto_compact_enabled: true,
+      model: 'gemini-4-neon-high',
+      categories: [],
+    }),
+    event(3, {
+      type: 'token_usage',
+      operation_id: 'agy-op-1',
+      provider: 'agy',
+      input_tokens: 51_051,
+      output_tokens: 9_104,
+      cache_read_tokens: 82_687,
+      cache_creation_tokens: 0,
+      scope: 'turn_total',
+    }),
+  ]);
+
+  assert.equal(usage.turnCount, 1);
+  assert.equal(usage.totalInputTokens, 51_051);
+  assert.equal(usage.totalOutputTokens, 9_104);
+  assert.equal(usage.totalCacheReadTokens, 82_687);
+  assert.equal(usage.totalCacheCreationTokens, 0);
+  assert.equal(usage.context?.provider, 'agy');
+  assert.equal(usage.context?.usedTokens, 56_854);
+  assert.equal(usage.context?.maxTokens, 1_000_000);
+  assert.equal(usage.context?.model, 'gemini-4-neon-high');
+});

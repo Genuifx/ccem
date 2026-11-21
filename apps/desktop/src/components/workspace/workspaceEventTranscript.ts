@@ -882,6 +882,7 @@ function shallowEqualMessages(
     && previous.turnMetrics?.outputTokens === next.turnMetrics?.outputTokens
     && previous.turnMetrics?.elapsedMs === next.turnMetrics?.elapsedMs
     && previous.turnMetrics?.generationMs === next.turnMetrics?.generationMs
+    && previous.turnMetrics?.ttftMs === next.turnMetrics?.ttftMs
     && previous.annotations === next.annotations
     && shallowEqualContent(previous.content, next.content);
 }
@@ -1002,6 +1003,7 @@ export interface TurnLiveProgress {
   operationId: string;
   outputTokens: number;
   generationMs?: number;
+  ttftMs?: number;
 }
 
 export interface TranscriptDerivationState {
@@ -1449,22 +1451,24 @@ function foldTranscriptEvents(
         break;
       }
       case 'turn_progress': {
-        const { operation_id, output_tokens, generation_ms } = event.payload;
+        const { operation_id, output_tokens, generation_ms, ttft_ms } = event.payload;
         if (operation_id !== state.activeOperationId
           || !Number.isSafeInteger(output_tokens) || output_tokens < 0) break;
         state.liveProgress = {
           operationId: operation_id, outputTokens: output_tokens,
           ...(Number.isSafeInteger(generation_ms) && generation_ms! > 0 ? { generationMs: generation_ms } : {}),
+          ...(Number.isSafeInteger(ttft_ms) && ttft_ms! >= 0 ? { ttftMs: ttft_ms } : {}),
         };
         break;
       }
       case 'turn_metrics': {
-        const { operation_id, output_tokens, elapsed_ms, generation_ms } = event.payload;
+        const { operation_id, output_tokens, elapsed_ms, generation_ms, ttft_ms } = event.payload;
         if (!Number.isSafeInteger(output_tokens) || output_tokens < 0
           || !Number.isSafeInteger(elapsed_ms) || elapsed_ms <= 0) break;
         const turnMetrics = {
           outputTokens: output_tokens, elapsedMs: elapsed_ms,
           ...(Number.isSafeInteger(generation_ms) && generation_ms! > 0 ? { generationMs: generation_ms } : {}),
+          ...(Number.isSafeInteger(ttft_ms) && ttft_ms! >= 0 ? { ttftMs: ttft_ms } : {}),
         };
         if (state.pendingTurn?.turnOperationId === operation_id) {
           state.pendingTurn.turnMetrics ??= turnMetrics;

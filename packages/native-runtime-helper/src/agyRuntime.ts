@@ -202,6 +202,9 @@ export class AgyRuntime {
   private client: AgyAcpClient | null = null;
   private sessionId: string | null = null;
   private configOptions: AcpConfigOption[] = [];
+  private currentModel: string | null = null;
+  private lastContextUsageKey: string | null = null;
+  private pendingFallbackTurnUsage: Record<string, unknown> | null = null;
   private activeOperation: InputOperation | null = null;
   private activeDangerouslySkipPermissions = false;
   private readonly startedTools = new Map<string, StartedToolState>();
@@ -238,6 +241,8 @@ export class AgyRuntime {
     const agyPath = config.agyPath?.trim() || 'agy';
     const env = buildAgyProcessEnv(process.env, config.envVars);
     this.activeDangerouslySkipPermissions = normalizedPerm.dangerouslySkipPermissions;
+    this.currentModel = readString(config.model) ?? null;
+    this.lastContextUsageKey = null;
 
     const client = new AgyAcpClient({
       agyPath,
@@ -277,6 +282,7 @@ export class AgyRuntime {
       this.sessionId = resolvedSessionId;
       if (Array.isArray(sessionResult.configOptions)) {
         this.configOptions = sessionResult.configOptions;
+        this.syncCurrentModelFromConfigOptions(this.configOptions);
       }
       this.callbacks.emitSessionMeta(resolvedSessionId);
 
@@ -312,6 +318,7 @@ export class AgyRuntime {
     }
 
     this.activeOperation = operation ?? null;
+    this.pendingFallbackTurnUsage = null;
     this.startedTools.clear();
     this.completedTools.clear();
 
@@ -335,9 +342,9 @@ export class AgyRuntime {
     try {
       const result = await client.sessionPrompt(sessionId, promptBlocks);
       const stopReason = readString(result?.stopReason) ?? 'end_turn';
-      const usage = readObject(result?.usage);
+      const usage = readObject(result?.usage) ?? this.pendingFallbackTurnUsage;
       if (usage) {
-        this.emitUsagePayload(usage);
+        this.emitTurnUsagePayload(usage);
       }
 
       if (stopReason === 'cancelled' || this.turnCancelled || abortController.signal.aborted) {
@@ -370,6 +377,7 @@ export class AgyRuntime {
     } finally {
       abortController.signal.removeEventListener('abort', onAbort);
       this.cancelPendingPermissions('turn_settled');
+      this.pendingFallbackTurnUsage = null;
       if (this.activeOperation === operation) {
         this.activeOperation = null;
       }
@@ -419,6 +427,9 @@ export class AgyRuntime {
     this.client = null;
     this.sessionId = null;
     this.configOptions = [];
+    this.currentModel = null;
+    this.lastContextUsageKey = null;
+    this.pendingFallbackTurnUsage = null;
     this.startedTools.clear();
     this.completedTools.clear();
     if (client) {
@@ -487,12 +498,32 @@ export class AgyRuntime {
       const record = readObject(result);
       if (Array.isArray(record?.configOptions)) {
         this.configOptions = record.configOptions as AcpConfigOption[];
+        this.syncCurrentModelFromConfigOptions(this.configOptions);
+      }
+      if (configId === 'model' && value.trim()) {
+        this.currentModel = value.trim();
       }
       return true;
     } catch {
       // Gracefully ignore unsupported config options without breaking the turn.
       return false;
     }
+  }
+
+  private syncCurrentModelFromConfigOptions(options: AcpConfigOption[]): void {
+    const modelOption = options.find(
+      (option) => option.category === 'model' || getConfigOptionId(option) === 'model',
+    );
+    const value = readString(modelOption?.currentValue);
+    if (value) {
+      this.currentModel = value;
+    }
+  }
+
+  private getCurrentModel(): string {
+    return this.currentModel
+      ?? readString(this.callbacks.getInitConfig()?.model)
+      ?? 'agy';
   }
 
   private handleSessionUpdate(params: AcpSessionUpdateParams): void {
@@ -531,6 +562,8 @@ export class AgyRuntime {
     }
 
     if (kind === 'tool_call') {
+      this.activeOperation?.markFirstResponse();
+      this.activeOperation?.markResponseEnd({ extendToNow: true });
       const toolCallId = readString(update.toolCallId) ?? `agy-tool-${Date.now()}`;
       const rawName = readString(update.title)
         ?? readString(update.name)
@@ -584,6 +617,8 @@ export class AgyRuntime {
       }
 
       if (!existing) {
+        this.activeOperation?.markFirstResponse();
+        this.activeOperation?.markResponseEnd({ extendToNow: true });
         const category = classifyAgyToolCategory(readString(update.kind), rawName);
         this.startedTools.set(toolCallId, { rawName, category });
         this.callbacks.emitEvent({
@@ -634,23 +669,67 @@ export class AgyRuntime {
     }
 
     if (kind === 'usage_update') {
-      this.emitUsagePayload(update);
+      this.activeOperation?.markResponseEnd({ extendToNow: true });
+      this.handleUsageUpdate(update);
       return;
     }
 
     if (kind === 'config_option_update') {
       if (Array.isArray(update.configOptions)) {
         this.configOptions = update.configOptions as AcpConfigOption[];
+        this.syncCurrentModelFromConfigOptions(this.configOptions);
       }
       return;
     }
   }
 
-  private emitUsagePayload(record: Record<string, unknown>): void {
+  private handleUsageUpdate(update: Record<string, unknown>): void {
+    const used = readFiniteNumber(update.used);
+    const size = readFiniteNumber(update.size)
+      ?? readFiniteNumber(update.contextWindowSize)
+      ?? readFiniteNumber(update.context_window_size);
+
+    if (used !== undefined && used >= 0 && size !== undefined && size > 0) {
+      const usedTokens = Math.trunc(used);
+      const maxTokens = Math.trunc(size);
+      const model = this.getCurrentModel();
+      const key = `${usedTokens}:${maxTokens}:${model}`;
+      if (key !== this.lastContextUsageKey) {
+        this.lastContextUsageKey = key;
+        this.callbacks.emitEvent({
+          type: 'context_usage',
+          provider: 'agy',
+          used_tokens: usedTokens,
+          max_tokens: maxTokens,
+          raw_max_tokens: maxTokens,
+          percentage: (usedTokens / maxTokens) * 100,
+          auto_compact_threshold: null,
+          is_auto_compact_enabled: true,
+          model,
+          categories: [],
+        });
+      }
+      return;
+    }
+
+    // Fallback for non-standard ACP servers that report per-turn token counts
+    // in usage_update instead of session/prompt result.usage. Never treat `used`
+    // (context window occupancy) as turn input tokens.
+    const usageRecord = readObject(update.usage) ?? update;
+    const hasExplicitTurnUsage =
+      readFiniteNumber(usageRecord.inputTokens) !== undefined
+      || readFiniteNumber(usageRecord.input_tokens) !== undefined
+      || readFiniteNumber(usageRecord.outputTokens) !== undefined
+      || readFiniteNumber(usageRecord.output_tokens) !== undefined;
+    if (hasExplicitTurnUsage) {
+      this.pendingFallbackTurnUsage = update;
+    }
+  }
+
+  private emitTurnUsagePayload(record: Record<string, unknown>): void {
     const usageRecord = readObject(record.usage) ?? record;
     const inputTokens = readFiniteNumber(usageRecord.inputTokens)
       ?? readFiniteNumber(usageRecord.input_tokens)
-      ?? readFiniteNumber(usageRecord.used)
       ?? 0;
     const outputTokens = readFiniteNumber(usageRecord.outputTokens)
       ?? readFiniteNumber(usageRecord.output_tokens)

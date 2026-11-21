@@ -28,6 +28,7 @@ export class InputOperation {
   private startedAt: number | undefined;
   private completedAt: number | undefined;
   private outputTokens: number | undefined;
+  private ttftMs: number | undefined;
   private metricsEmitted = false;
   /** Sum of first→last streamed delta per model response: excludes time to
    * first token, tool execution and waiting between responses. */
@@ -96,10 +97,33 @@ export class InputOperation {
     this.closeResponse();
   }
 
+  /** Close the current response segment so tool execution and inter-step TTFT stay outside generation_ms. */
+  markResponseEnd(options?: { extendToNow?: boolean }) {
+    if (!this.started || this.terminal) return;
+    if (options?.extendToNow && this.responseFirstDeltaAt !== undefined) {
+      const at = this.now();
+      if (this.responseLastDeltaAt === undefined || at > this.responseLastDeltaAt) {
+        this.responseLastDeltaAt = at;
+      }
+    }
+    this.closeResponse();
+  }
+
+  /** Fallback first-response anchor for agy when step 1 triggers a tool call without prior text/thought deltas. */
+  markFirstResponse() {
+    if (this.provider !== 'agy' || !this.started || this.terminal) return;
+    if (this.ttftMs !== undefined || this.startedAt === undefined) return;
+    this.ttftMs = Math.max(0, Math.round(this.now() - this.startedAt));
+    this.emitProgress(true);
+  }
+
   /** A main-agent output delta (text, thinking or tool input) arrived. */
   markOutputDelta(text?: string) {
     if (!this.started || this.terminal) return;
     const at = this.now();
+    if (this.provider === 'agy' && this.ttftMs === undefined && this.startedAt !== undefined) {
+      this.ttftMs = Math.max(0, Math.round(at - this.startedAt));
+    }
     this.responseFirstDeltaAt ??= at;
     this.responseLastDeltaAt = at;
     if (text) this.responseEstimateTokens += estimateTokens(text);
@@ -147,6 +171,7 @@ export class InputOperation {
       provider: this.provider,
       output_tokens: this.settledOutputTokens + this.liveResponseTokens(),
       ...(generationMs > 0 ? { generation_ms: generationMs } : {}),
+      ...(this.provider === 'agy' && this.ttftMs !== undefined ? { ttft_ms: this.ttftMs } : {}),
     });
   }
 
@@ -165,6 +190,7 @@ export class InputOperation {
       output_tokens: this.outputTokens,
       elapsed_ms: elapsedMs,
       ...(generationMs > 0 ? { generation_ms: generationMs } : {}),
+      ...(this.provider === 'agy' && this.ttftMs !== undefined ? { ttft_ms: this.ttftMs } : {}),
     });
   }
 }

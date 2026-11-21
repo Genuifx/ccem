@@ -1519,6 +1519,7 @@ export type SessionEventPayload =
       output_tokens: number;
       elapsed_ms: number;
       generation_ms?: number;
+      ttft_ms?: number;
     }
   | {
       type: 'turn_progress';
@@ -1526,6 +1527,7 @@ export type SessionEventPayload =
       provider: 'claude' | 'codex' | 'agy';
       output_tokens: number;
       generation_ms?: number;
+      ttft_ms?: number;
     }
   | {
       type: 'token_usage';

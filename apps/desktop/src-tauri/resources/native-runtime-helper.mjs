@@ -51210,6 +51210,7 @@ var InputOperation = class {
   startedAt;
   completedAt;
   outputTokens;
+  ttftMs;
   metricsEmitted = false;
   /** Sum of first→last streamed delta per model response: excludes time to
    * first token, tool execution and waiting between responses. */
@@ -51259,10 +51260,31 @@ var InputOperation = class {
     if (!this.started || this.terminal) return;
     this.closeResponse();
   }
+  /** Close the current response segment so tool execution and inter-step TTFT stay outside generation_ms. */
+  markResponseEnd(options) {
+    if (!this.started || this.terminal) return;
+    if (options?.extendToNow && this.responseFirstDeltaAt !== void 0) {
+      const at2 = this.now();
+      if (this.responseLastDeltaAt === void 0 || at2 > this.responseLastDeltaAt) {
+        this.responseLastDeltaAt = at2;
+      }
+    }
+    this.closeResponse();
+  }
+  /** Fallback first-response anchor for agy when step 1 triggers a tool call without prior text/thought deltas. */
+  markFirstResponse() {
+    if (this.provider !== "agy" || !this.started || this.terminal) return;
+    if (this.ttftMs !== void 0 || this.startedAt === void 0) return;
+    this.ttftMs = Math.max(0, Math.round(this.now() - this.startedAt));
+    this.emitProgress(true);
+  }
   /** A main-agent output delta (text, thinking or tool input) arrived. */
   markOutputDelta(text) {
     if (!this.started || this.terminal) return;
     const at2 = this.now();
+    if (this.provider === "agy" && this.ttftMs === void 0 && this.startedAt !== void 0) {
+      this.ttftMs = Math.max(0, Math.round(at2 - this.startedAt));
+    }
     this.responseFirstDeltaAt ??= at2;
     this.responseLastDeltaAt = at2;
     if (text) this.responseEstimateTokens += estimateTokens(text);
@@ -51303,7 +51325,8 @@ var InputOperation = class {
       operation_id: this.id,
       provider: this.provider,
       output_tokens: this.settledOutputTokens + this.liveResponseTokens(),
-      ...generationMs > 0 ? { generation_ms: generationMs } : {}
+      ...generationMs > 0 ? { generation_ms: generationMs } : {},
+      ...this.provider === "agy" && this.ttftMs !== void 0 ? { ttft_ms: this.ttftMs } : {}
     });
   }
   emitMetricsIfReady() {
@@ -51318,7 +51341,8 @@ var InputOperation = class {
       provider: this.provider,
       output_tokens: this.outputTokens,
       elapsed_ms: elapsedMs,
-      ...generationMs > 0 ? { generation_ms: generationMs } : {}
+      ...generationMs > 0 ? { generation_ms: generationMs } : {},
+      ...this.provider === "agy" && this.ttftMs !== void 0 ? { ttft_ms: this.ttftMs } : {}
     });
   }
 };
@@ -52270,6 +52294,9 @@ var AgyRuntime = class {
   client = null;
   sessionId = null;
   configOptions = [];
+  currentModel = null;
+  lastContextUsageKey = null;
+  pendingFallbackTurnUsage = null;
   activeOperation = null;
   activeDangerouslySkipPermissions = false;
   startedTools = /* @__PURE__ */ new Map();
@@ -52294,6 +52321,8 @@ var AgyRuntime = class {
     const agyPath = config2.agyPath?.trim() || "agy";
     const env = buildAgyProcessEnv(process5.env, config2.envVars);
     this.activeDangerouslySkipPermissions = normalizedPerm.dangerouslySkipPermissions;
+    this.currentModel = readString2(config2.model) ?? null;
+    this.lastContextUsageKey = null;
     const client = new AgyAcpClient({
       agyPath,
       cwd: config2.workingDir,
@@ -52327,6 +52356,7 @@ var AgyRuntime = class {
       this.sessionId = resolvedSessionId;
       if (Array.isArray(sessionResult.configOptions)) {
         this.configOptions = sessionResult.configOptions;
+        this.syncCurrentModelFromConfigOptions(this.configOptions);
       }
       this.callbacks.emitSessionMeta(resolvedSessionId);
       await this.applySessionConfig(client, resolvedSessionId, {
@@ -52352,6 +52382,7 @@ var AgyRuntime = class {
       return;
     }
     this.activeOperation = operation ?? null;
+    this.pendingFallbackTurnUsage = null;
     this.startedTools.clear();
     this.completedTools.clear();
     const onAbort = () => {
@@ -52372,9 +52403,9 @@ var AgyRuntime = class {
     try {
       const result = await client.sessionPrompt(sessionId, promptBlocks);
       const stopReason = readString2(result?.stopReason) ?? "end_turn";
-      const usage2 = readObject4(result?.usage);
+      const usage2 = readObject4(result?.usage) ?? this.pendingFallbackTurnUsage;
       if (usage2) {
-        this.emitUsagePayload(usage2);
+        this.emitTurnUsagePayload(usage2);
       }
       if (stopReason === "cancelled" || this.turnCancelled || abortController.signal.aborted) {
         operation?.observe("unknown", "Antigravity turn interrupted.");
@@ -52405,6 +52436,7 @@ var AgyRuntime = class {
     } finally {
       abortController.signal.removeEventListener("abort", onAbort);
       this.cancelPendingPermissions("turn_settled");
+      this.pendingFallbackTurnUsage = null;
       if (this.activeOperation === operation) {
         this.activeOperation = null;
       }
@@ -52442,6 +52474,9 @@ var AgyRuntime = class {
     this.client = null;
     this.sessionId = null;
     this.configOptions = [];
+    this.currentModel = null;
+    this.lastContextUsageKey = null;
+    this.pendingFallbackTurnUsage = null;
     this.startedTools.clear();
     this.completedTools.clear();
     if (client) {
@@ -52495,11 +52530,27 @@ var AgyRuntime = class {
       const record3 = readObject4(result);
       if (Array.isArray(record3?.configOptions)) {
         this.configOptions = record3.configOptions;
+        this.syncCurrentModelFromConfigOptions(this.configOptions);
+      }
+      if (configId === "model" && value.trim()) {
+        this.currentModel = value.trim();
       }
       return true;
     } catch {
       return false;
     }
+  }
+  syncCurrentModelFromConfigOptions(options) {
+    const modelOption = options.find(
+      (option) => option.category === "model" || getConfigOptionId(option) === "model"
+    );
+    const value = readString2(modelOption?.currentValue);
+    if (value) {
+      this.currentModel = value;
+    }
+  }
+  getCurrentModel() {
+    return this.currentModel ?? readString2(this.callbacks.getInitConfig()?.model) ?? "agy";
   }
   handleSessionUpdate(params) {
     const update = readObject4(params.update);
@@ -52533,6 +52584,8 @@ var AgyRuntime = class {
       return;
     }
     if (kind === "tool_call") {
+      this.activeOperation?.markFirstResponse();
+      this.activeOperation?.markResponseEnd({ extendToNow: true });
       const toolCallId = readString2(update.toolCallId) ?? `agy-tool-${Date.now()}`;
       const rawName = readString2(update.title) ?? readString2(update.name) ?? readString2(update.kind) ?? "tool_call";
       const category = classifyAgyToolCategory(readString2(update.kind), rawName);
@@ -52574,6 +52627,8 @@ var AgyRuntime = class {
         return;
       }
       if (!existing) {
+        this.activeOperation?.markFirstResponse();
+        this.activeOperation?.markResponseEnd({ extendToNow: true });
         const category = classifyAgyToolCategory(readString2(update.kind), rawName);
         this.startedTools.set(toolCallId, { rawName, category });
         this.callbacks.emitEvent({
@@ -52622,19 +52677,52 @@ var AgyRuntime = class {
       return;
     }
     if (kind === "usage_update") {
-      this.emitUsagePayload(update);
+      this.activeOperation?.markResponseEnd({ extendToNow: true });
+      this.handleUsageUpdate(update);
       return;
     }
     if (kind === "config_option_update") {
       if (Array.isArray(update.configOptions)) {
         this.configOptions = update.configOptions;
+        this.syncCurrentModelFromConfigOptions(this.configOptions);
       }
       return;
     }
   }
-  emitUsagePayload(record3) {
+  handleUsageUpdate(update) {
+    const used = readFiniteNumber(update.used);
+    const size = readFiniteNumber(update.size) ?? readFiniteNumber(update.contextWindowSize) ?? readFiniteNumber(update.context_window_size);
+    if (used !== void 0 && used >= 0 && size !== void 0 && size > 0) {
+      const usedTokens = Math.trunc(used);
+      const maxTokens = Math.trunc(size);
+      const model = this.getCurrentModel();
+      const key = `${usedTokens}:${maxTokens}:${model}`;
+      if (key !== this.lastContextUsageKey) {
+        this.lastContextUsageKey = key;
+        this.callbacks.emitEvent({
+          type: "context_usage",
+          provider: "agy",
+          used_tokens: usedTokens,
+          max_tokens: maxTokens,
+          raw_max_tokens: maxTokens,
+          percentage: usedTokens / maxTokens * 100,
+          auto_compact_threshold: null,
+          is_auto_compact_enabled: true,
+          model,
+          categories: []
+        });
+      }
+      return;
+    }
+    const usageRecord = readObject4(update.usage) ?? update;
+    const hasExplicitTurnUsage = readFiniteNumber(usageRecord.inputTokens) !== void 0 || readFiniteNumber(usageRecord.input_tokens) !== void 0 || readFiniteNumber(usageRecord.outputTokens) !== void 0 || readFiniteNumber(usageRecord.output_tokens) !== void 0;
+    if (hasExplicitTurnUsage) {
+      this.pendingFallbackTurnUsage = update;
+    }
+  }
+  emitTurnUsagePayload(record3) {
     const usageRecord = readObject4(record3.usage) ?? record3;
-    const inputTokens = readFiniteNumber(usageRecord.inputTokens) ?? readFiniteNumber(usageRecord.input_tokens) ?? readFiniteNumber(usageRecord.used) ?? 0;
+    const inputTokens = readFiniteNumber(usageRecord.inputTokens) ?? readFiniteNumber(usageRecord.input_tokens) ?? 0;
     const outputTokens = readFiniteNumber(usageRecord.outputTokens) ?? readFiniteNumber(usageRecord.output_tokens) ?? 0;
     const cacheReadTokens = readFiniteNumber(usageRecord.cachedReadTokens) ?? readFiniteNumber(usageRecord.cacheReadTokens) ?? readFiniteNumber(usageRecord.cache_read_tokens) ?? 0;
     const cacheCreationTokens = readFiniteNumber(usageRecord.cachedWriteTokens) ?? readFiniteNumber(usageRecord.cacheCreationTokens) ?? readFiniteNumber(usageRecord.cache_creation_tokens) ?? 0;
