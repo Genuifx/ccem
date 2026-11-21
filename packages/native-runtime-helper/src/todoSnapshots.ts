@@ -9,8 +9,8 @@ export interface TodoSnapshotItemV1 {
 
 export interface TodoSnapshotV1 {
   version: 1;
-  provider: 'claude' | 'codex';
-  source: 'TodoWrite' | 'TaskCreate' | 'TaskUpdate' | 'TaskList' | 'todo_list';
+  provider: 'claude' | 'codex' | 'agy';
+  source: 'TodoWrite' | 'TaskCreate' | 'TaskUpdate' | 'TaskList' | 'todo_list' | 'plan';
   revision: number;
   items: TodoSnapshotItemV1[];
 }
@@ -51,6 +51,12 @@ function readId(record: Record<string, unknown> | null) {
 function normalizeStatus(value: unknown, fallback: TodoSnapshotStatusV1 = 'pending') {
   if (value === 'pending' || value === 'in_progress' || value === 'completed' || value === 'failed') {
     return value;
+  }
+  if (value === 'in-progress') {
+    return 'in_progress';
+  }
+  if (value === 'done') {
+    return 'completed';
   }
   return fallback;
 }
@@ -113,7 +119,7 @@ function isTodoSnapshotV1(value: unknown): value is TodoSnapshotV1 {
   if (
     !record
     || record.version !== 1
-    || (record.provider !== 'claude' && record.provider !== 'codex')
+    || (record.provider !== 'claude' && record.provider !== 'codex' && record.provider !== 'agy')
     || typeof record.revision !== 'number'
     || !Number.isSafeInteger(record.revision)
     || record.revision < 0
@@ -123,9 +129,13 @@ function isTodoSnapshotV1(value: unknown): value is TodoSnapshotV1 {
     return false;
   }
 
-  return record.provider === 'claude'
-    ? ['TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskList'].includes(String(record.source))
-    : record.source === 'todo_list';
+  if (record.provider === 'claude') {
+    return ['TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskList'].includes(String(record.source));
+  }
+  if (record.provider === 'agy') {
+    return record.source === 'plan';
+  }
+  return record.source === 'todo_list';
 }
 
 function itemFromRecord(
@@ -167,6 +177,27 @@ export function snapshotFromCodexTodoList(
     version: 1,
     provider: 'codex',
     source: 'todo_list',
+    revision,
+    items,
+  };
+}
+
+export function snapshotFromAgyPlan(
+  entries: unknown,
+  revision = 1,
+): TodoSnapshotV1 | undefined {
+  if (!Array.isArray(entries)) {
+    return undefined;
+  }
+
+  const items = entries
+    .map((value, index) => itemFromRecord(value, `plan:${index}`))
+    .filter((value): value is TodoSnapshotItemV1 => Boolean(value));
+
+  return {
+    version: 1,
+    provider: 'agy',
+    source: 'plan',
     revision,
     items,
   };
@@ -318,6 +349,15 @@ export class TodoSnapshotTracker {
 
   fromCodexTodoList(item: unknown): TodoSnapshotV1 | undefined {
     const snapshot = snapshotFromCodexTodoList(item, this.revision + 1);
+    if (!snapshot) {
+      return undefined;
+    }
+    this.revision = snapshot.revision;
+    return snapshot;
+  }
+
+  fromAgyPlan(entries: unknown): TodoSnapshotV1 | undefined {
+    const snapshot = snapshotFromAgyPlan(entries, this.revision + 1);
     if (!snapshot) {
       return undefined;
     }

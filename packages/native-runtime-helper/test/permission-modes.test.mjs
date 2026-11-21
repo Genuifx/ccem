@@ -110,3 +110,28 @@ test('normalizeCodexSandboxMode maps each permission mode to correct sandbox + n
     assert.deepEqual(result, expected, `mode "${mode}" should map to ${JSON.stringify(expected)}`);
   }
 });
+
+test('normalizeAgyPermissionMode maps each permission mode to ACP mode and yolo flag', async () => {
+  const { normalizeAgyPermissionMode } = await importPermissionModesModule();
+
+  const cases = [
+    { mode: 'yolo', acpMode: 'auto', dangerouslySkipPermissions: true },
+    { mode: 'bypassPermissions', acpMode: 'auto', dangerouslySkipPermissions: true },
+    { mode: 'auto', acpMode: 'auto', dangerouslySkipPermissions: false },
+    { mode: 'dev', acpMode: 'accept-edits', dangerouslySkipPermissions: false },
+    { mode: 'acceptEdits', acpMode: 'accept-edits', dangerouslySkipPermissions: false },
+    { mode: 'accept-edits', acpMode: 'accept-edits', dangerouslySkipPermissions: false },
+    { mode: 'plan', acpMode: 'plan', dangerouslySkipPermissions: false },
+    { mode: 'readonly', acpMode: 'plan', dangerouslySkipPermissions: false },
+    { mode: 'audit', acpMode: 'plan', dangerouslySkipPermissions: false },
+    { mode: 'safe', acpMode: 'default', dangerouslySkipPermissions: false },
+    { mode: 'ci', acpMode: 'default', dangerouslySkipPermissions: false },
+    { mode: 'default', acpMode: 'default', dangerouslySkipPermissions: false },
+    { mode: 'unknown-mode', acpMode: 'default', dangerouslySkipPermissions: false },
+  ];
+
+  for (const { mode, ...expected } of cases) {
+    const result = normalizeAgyPermissionMode(mode);
+    assert.deepEqual(result, expected, `mode "${mode}" should map to ${JSON.stringify(expected)}`);
+  }
+});

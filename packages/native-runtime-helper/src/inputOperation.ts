@@ -42,7 +42,7 @@ export class InputOperation {
   private lastProgressAt: number | undefined;
 
   constructor(
-    private readonly provider: 'claude' | 'codex',
+    private readonly provider: 'claude' | 'codex' | 'agy',
     clientMessageIds: unknown,
     private readonly emit: (payload: Record<string, unknown>) => void,
     private readonly commandId?: string,
