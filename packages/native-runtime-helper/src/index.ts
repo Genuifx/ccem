@@ -4747,6 +4747,7 @@ async function runQueuedTurns() {
   const providerLabel = isAgy ? 'Antigravity' : 'Codex';
 
   activeTurn = true;
+  let turnFailed = false;
   const abortController = new AbortController();
   currentAbortController = abortController;
   emitStatus('processing', `${providerLabel} is processing a turn.`);
@@ -4767,6 +4768,7 @@ async function runQueuedTurns() {
       emitStatus('ready', 'Turn interrupted. Ready for the next prompt.');
     }
     if (!isAbort) {
+      turnFailed = true;
       const message = error instanceof Error ? error.message : String(error);
       emitEvent({
         type: 'stderr_line',
@@ -4786,18 +4788,32 @@ async function runQueuedTurns() {
     if (pendingSettings && !stopped) {
       const patch = pendingSettings;
       const hadEnvVars = patch.envVars !== undefined;
+      const previousModel = initCommand.model;
+      const previousEffort = initCommand.effort;
       applyPendingSettingsToInitCommand();
       if (isAgy) {
-        await agyRuntime.applyLiveSettings({
+        const outcome = await agyRuntime.applyLiveSettings({
           permMode: patch.permMode,
           model: patch.model,
           effort: patch.effort,
           envVarsChanged: hadEnvVars,
         });
+        if (!outcome.ok) {
+          if (patch.model !== undefined && initCommand.model === patch.model) {
+            initCommand.model = previousModel;
+          }
+          if (patch.effort !== undefined && initCommand.effort === patch.effort) {
+            initCommand.effort = previousEffort;
+          }
+        } else if (!turnFailed) {
+          emitStatus('ready', 'Settings applied.');
+        }
       } else {
         teardownCodexSession(hadEnvVars);
+        if (!turnFailed) {
+          emitStatus('ready', 'Settings applied.');
+        }
       }
-      emitStatus('ready', 'Settings applied.');
     }
     if (stopped) {
       if (isAgy) {

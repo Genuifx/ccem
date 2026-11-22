@@ -15,14 +15,25 @@ type CachedAgyModelsState = {
 const FRONTEND_CACHE_TTL_MS = 5 * 60 * 1000;
 let sharedCache: CachedAgyModelsState | null = null;
 let inflightRequest: Promise<CachedAgyModelsState> | null = null;
+let cacheGeneration = 0;
 
 async function fetchAgyModelsCached(forceRefresh: boolean): Promise<CachedAgyModelsState> {
-  if (!forceRefresh && sharedCache && Date.now() - sharedCache.fetchedAt < FRONTEND_CACHE_TTL_MS) {
+  if (
+    !forceRefresh
+    && sharedCache
+    && sharedCache.models.length > 0
+    && Date.now() - sharedCache.fetchedAt < FRONTEND_CACHE_TTL_MS
+  ) {
     return sharedCache;
   }
   if (!forceRefresh && inflightRequest) {
     return inflightRequest;
   }
+
+  if (forceRefresh) {
+    cacheGeneration += 1;
+  }
+  const requestGeneration = cacheGeneration;
 
   const request = listAgyModels(forceRefresh)
     .then((response) => {
@@ -31,7 +42,9 @@ async function fetchAgyModelsCached(forceRefresh: boolean): Promise<CachedAgyMod
         defaultModel: response.defaultModel ?? response.models?.[0]?.id ?? null,
         fetchedAt: Date.now(),
       };
-      sharedCache = next;
+      if (next.models.length > 0 && requestGeneration === cacheGeneration) {
+        sharedCache = next;
+      }
       return next;
     })
     .finally(() => {
@@ -45,6 +58,7 @@ async function fetchAgyModelsCached(forceRefresh: boolean): Promise<CachedAgyMod
 }
 
 export function clearAgyModelsFrontendCache() {
+  cacheGeneration += 1;
   sharedCache = null;
 }
 

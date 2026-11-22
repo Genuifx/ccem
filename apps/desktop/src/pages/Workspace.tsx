@@ -3370,10 +3370,19 @@ export function Workspace({
   }, [agyModels]);
 
   const handleHistoryEffortChange = useCallback((effort: EffortLevel) => {
-    const nextEffort = normalizeEffortForProvider(effort, selectedSession?.source);
+    let nextEffort: EffortLevel;
+    if (selectedSession?.source === 'agy') {
+      const targetModel = historyModel ?? effectiveComposeAgyModel;
+      const supported = resolveAgyEffortLevels(targetModel, agyModels) as EffortLevel[];
+      nextEffort = supported.length > 0
+        ? clampEffortToSupportedLevels(effort, supported)
+        : normalizeEffortForProvider(effort, 'agy');
+    } else {
+      nextEffort = normalizeEffortForProvider(effort, selectedSession?.source);
+    }
     setHistoryEffort(nextEffort);
     saveSelectedHistoryPreference({ effort: nextEffort });
-  }, [saveSelectedHistoryPreference, selectedSession?.source]);
+  }, [agyModels, effectiveComposeAgyModel, historyModel, saveSelectedHistoryPreference, selectedSession?.source]);
 
   const handleHistoryModelChange = useCallback((nextModel: string) => {
     const trimmed = nextModel.trim();

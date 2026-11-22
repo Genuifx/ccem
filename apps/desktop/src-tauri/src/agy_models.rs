@@ -1,6 +1,7 @@
 use crate::{system_proxy, terminal};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -223,13 +224,15 @@ pub fn parse_agy_models_output(raw: &str) -> Vec<AgyModelCatalogItem> {
                 efforts: distinct_efforts,
                 default_effort,
             });
-        } else if let Some(single) = variants.into_iter().next() {
-            catalog.push(AgyModelCatalogItem {
-                id: single.raw_id,
-                name: single.display_name,
-                efforts: Vec::new(),
-                default_effort: None,
-            });
+        } else {
+            for single in variants {
+                catalog.push(AgyModelCatalogItem {
+                    id: single.raw_id,
+                    name: single.display_name,
+                    efforts: Vec::new(),
+                    default_effort: None,
+                });
+            }
         }
     }
 
@@ -276,32 +279,62 @@ fn run_agy_models_cli(agy_path: &str) -> Result<String, String> {
         .spawn()
         .map_err(|error| format!("Failed to run Antigravity CLI ({agy_path} models): {error}"))?;
 
+    // Drain stdout and stderr concurrently so large outputs can never deadlock the pipe buffer.
+    let stdout_handle = child.stdout.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).to_string()
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).to_string()
+        })
+    });
+
     let deadline = Instant::now() + CLI_TIMEOUT;
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    if let Some(handle) = stdout_handle {
+                        let _ = handle.join();
+                    }
+                    if let Some(handle) = stderr_handle {
+                        let _ = handle.join();
+                    }
                     return Err("Timed out fetching Antigravity models.".to_string());
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
             Err(error) => {
                 let _ = child.kill();
+                let _ = child.wait();
+                if let Some(handle) = stdout_handle {
+                    let _ = handle.join();
+                }
+                if let Some(handle) = stderr_handle {
+                    let _ = handle.join();
+                }
                 return Err(format!("Failed while waiting for agy models: {error}"));
             }
         }
-    }
+    };
 
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("Failed to collect agy models output: {error}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = stdout_handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_handle
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
 
-    if !output.status.success() {
+    if !status.success() {
         let combined = format!("{}\n{}", stderr.trim(), stdout.trim());
         if is_auth_required_message(&combined) {
             return Err(
@@ -314,7 +347,7 @@ fn run_agy_models_cli(agy_path: &str) -> Result<String, String> {
         } else if !stdout.trim().is_empty() {
             stdout.trim().to_string()
         } else {
-            format!("exited with status {}", output.status)
+            format!("exited with status {status}")
         };
         return Err(format!("Antigravity model discovery failed: {detail}"));
     }
@@ -336,7 +369,10 @@ pub fn list_agy_models(force_refresh: bool) -> Result<AgyModelCatalogResponse, S
     if !force_refresh {
         if let Ok(guard) = cache_lock().lock() {
             if let Some(cached) = guard.as_ref() {
-                if cached.agy_path == agy_path && cached.fetched_at.elapsed() < CACHE_TTL {
+                if cached.agy_path == agy_path
+                    && !cached.models.is_empty()
+                    && cached.fetched_at.elapsed() < CACHE_TTL
+                {
                     return Ok(AgyModelCatalogResponse {
                         models: cached.models.clone(),
                         default_model: cached.default_model.clone(),
@@ -349,15 +385,23 @@ pub fn list_agy_models(force_refresh: bool) -> Result<AgyModelCatalogResponse, S
 
     let raw = run_agy_models_cli(&agy_path)?;
     let models = parse_agy_models_output(&raw);
+    if models.is_empty() && is_auth_required_message(&raw) {
+        return Err(
+            "AGY_AUTH_REQUIRED: Antigravity is not signed in. Sign in with Google to continue."
+                .to_string(),
+        );
+    }
     let default_model = models.first().map(|item| item.id.clone());
 
-    if let Ok(mut guard) = cache_lock().lock() {
-        *guard = Some(CachedCatalog {
-            agy_path,
-            fetched_at: Instant::now(),
-            models: models.clone(),
-            default_model: default_model.clone(),
-        });
+    if !models.is_empty() {
+        if let Ok(mut guard) = cache_lock().lock() {
+            *guard = Some(CachedCatalog {
+                agy_path,
+                fetched_at: Instant::now(),
+                models: models.clone(),
+                default_model: default_model.clone(),
+            });
+        }
     }
 
     Ok(AgyModelCatalogResponse {

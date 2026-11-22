@@ -974,6 +974,32 @@ fn wait_for_required_settings_ack(
     }
 }
 
+fn wait_for_live_or_deferred_settings_ack(
+    request_id: &str,
+    receiver: mpsc::Receiver<SettingsUpdateAck>,
+    timeout: Duration,
+) -> Result<(), String> {
+    match receiver.recv_timeout(timeout) {
+        Ok(SettingsUpdateAck {
+            outcome: SettingsUpdateOutcome::Applied | SettingsUpdateOutcome::Deferred,
+            ..
+        }) => Ok(()),
+        Ok(SettingsUpdateAck {
+            outcome: SettingsUpdateOutcome::Failed | SettingsUpdateOutcome::RejectedUnchanged,
+            detail,
+        }) => Err(format!(
+            "Native settings update {request_id} failed{}.",
+            settings_ack_detail_suffix(detail.as_deref())
+        )),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!(
+            "Native settings update {request_id} acknowledgement timed out."
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(format!(
+            "Native settings update {request_id} acknowledgement channel closed."
+        )),
+    }
+}
+
 fn settings_ack_detail_suffix(detail: Option<&str>) -> String {
     let detail = detail
         .map(str::trim)
@@ -4887,6 +4913,15 @@ impl NativeRuntimeManager {
                 LiveWriteOutcome::NotStarted(error) => Err((error, false)),
                 LiveWriteOutcome::StartedUnknown(error) => Err((error, true)),
             }
+        } else if original_settings.provider == NativeProvider::Agy {
+            self.write_agy_settings_with_ack(
+                app,
+                runtime_id,
+                Arc::clone(&handle),
+                &settings_command,
+                &request_id,
+            )
+            .map_err(|error| (error, false))
         } else {
             self.write_to_child_with_reconnect(
                 app,
@@ -6143,6 +6178,37 @@ impl NativeRuntimeManager {
             },
             || self.quarantine_permission_transition(app, runtime_id, &handle),
         )
+    }
+
+    fn write_agy_settings_with_ack(
+        self: &Arc<Self>,
+        app: &AppHandle,
+        runtime_id: &str,
+        handle: Arc<NativeSessionHandle>,
+        command: &HelperInputCommand<'_>,
+        request_id: &str,
+    ) -> Result<(), String> {
+        let ack_timeout = crate::native_session_coordinator::SETTINGS_ACK_WAIT;
+        let receiver = handle.settings_update_acks.register(request_id)?;
+        match self.write_to_child(&handle, command) {
+            Ok(()) => {
+                let result =
+                    wait_for_live_or_deferred_settings_ack(request_id, receiver, ack_timeout);
+                let _ = handle.settings_update_acks.cancel(request_id);
+                result
+            }
+            Err(error)
+                if error == NATIVE_HELPER_RETIRING_ERROR
+                    || is_retryable_native_child_write_error(&error) =>
+            {
+                let _ = handle.settings_update_acks.cancel(request_id);
+                self.write_to_child_with_reconnect(app, runtime_id, handle, command)
+            }
+            Err(error) => {
+                let _ = handle.settings_update_acks.cancel(request_id);
+                Err(error)
+            }
+        }
     }
 
     fn write_settings_with_required_ack(

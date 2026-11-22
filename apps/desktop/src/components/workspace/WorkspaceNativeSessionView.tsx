@@ -2346,31 +2346,17 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
     setRecentFiles(null);
   }, [session.project_dir]);
 
-  const latestConfigOptions = useMemo(() => {
-    for (let index = events.length - 1; index >= 0; index -= 1) {
-      const payload = events[index]?.payload;
-      if (payload?.type === 'runtime_config_options_updated') {
-        return {
-          current_model: payload.current_model ?? null,
-          current_effort: payload.current_effort ?? null,
-          supports_effort: payload.supports_effort,
-          models: payload.models,
-          efforts: payload.efforts,
-        };
-      }
-    }
-    return session.config_options ?? null;
-  }, [events, session.config_options]);
+  const latestConfigOptions = session.config_options ?? null;
 
   useEffect(() => {
     setSessionEnv(session.env_name);
     setSessionRuntimePermMode(nativeSessionRuntimePermMode(session));
     setSessionDisplayPermMode(normalizePermissionModeName(session.perm_mode, defaultPermissionMode));
-    const authoritativeModel = latestConfigOptions?.current_model ?? session.model ?? null;
+    const authoritativeModel = session.model ?? latestConfigOptions?.current_model ?? null;
     setSessionModel(authoritativeModel);
-    const authoritativeEffort = latestConfigOptions?.supports_effort
-      ? (latestConfigOptions.current_effort ?? session.effort)
-      : session.effort;
+    const authoritativeEffort = session.effort ?? (latestConfigOptions?.supports_effort
+      ? latestConfigOptions.current_effort
+      : null);
     const supportedLevels = session.provider === 'agy'
       ? (resolveAgyEffortLevels(
           authoritativeModel,
@@ -3960,7 +3946,23 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
 
   const performEffortChange = useCallback((effort: EffortLevel, forceRestart = false) => {
     const previousEffort = sessionEffort;
-    const nextEffort = normalizeEffortForProvider(effort, session.provider);
+    let nextEffort: EffortLevel;
+    if (session.provider === 'agy') {
+      const effectiveModels = resolveAgyModelsForControl({
+        catalog: agyModels ?? [],
+        liveConfigOptions: latestConfigOptions,
+      });
+      const supportedLevels = resolveAgyEffortLevels(
+        sessionModel,
+        effectiveModels,
+        latestConfigOptions,
+      ) as EffortLevel[];
+      nextEffort = supportedLevels.length > 0
+        ? clampEffortToSupportedLevels(effort, supportedLevels)
+        : normalizeEffortForProvider(effort, session.provider);
+    } else {
+      nextEffort = normalizeEffortForProvider(effort, session.provider);
+    }
     setSessionEffort(nextEffort);
     return updateNativeSessionSettings(
       session.runtime_id,
@@ -3979,7 +3981,17 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
         toast.error(t('workspace.nativeSettingsFailed'));
         return false;
       });
-  }, [refreshSummary, session.provider, session.runtime_id, sessionEffort, t, updateNativeSessionSettings]);
+  }, [
+    agyModels,
+    latestConfigOptions,
+    refreshSummary,
+    session.provider,
+    session.runtime_id,
+    sessionEffort,
+    sessionModel,
+    t,
+    updateNativeSessionSettings,
+  ]);
 
   const handleEffortChange = useCallback((effort: EffortLevel) => {
     if (activeBackgroundTaskCount > 0) {

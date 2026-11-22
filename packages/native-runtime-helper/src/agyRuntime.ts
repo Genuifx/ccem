@@ -268,11 +268,11 @@ function normalizeConfigOptionChoices(options: AcpConfigOption['options']): AgyC
 }
 
 function isFullConfigOptionsSnapshot(options: AcpConfigOption[]): boolean {
-  if (options.length > 1) {
-    return true;
-  }
   return options.some(
-    (option) => Array.isArray(option.options) || Boolean(readString(option.category)),
+    (option) =>
+      (option.category === 'model' || getConfigOptionId(option) === 'model')
+      && Array.isArray(option.options)
+      && option.options.length > 0,
   );
 }
 

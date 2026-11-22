@@ -1,4 +1,4 @@
-import { lazy, memo, Suspense, useCallback, useEffect, useState } from 'react';
+import { lazy, memo, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { shallow } from 'zustand/shallow';
 import type { PermissionModeName } from '@ccem/core/browser';
 import { useLocale } from '@/locales';
@@ -74,6 +74,8 @@ export const WorkspaceSplitHistoryPane = memo(function WorkspaceSplitHistoryPane
   const [permMode, setPermMode] = useState<PermissionModeName>(initialControls.permMode);
   const [effort, setEffort] = useState<EffortLevel>(initialControls.effort);
   const [model, setModel] = useState<string | null>(initialControls.model ?? null);
+  const userEditedModelRef = useRef(Boolean(initialControls.model));
+  const userEditedEffortRef = useRef(false);
   const provider = session.source === 'codex' ? 'codex' : session.source === 'agy' ? 'agy' : 'claude';
 
   useEffect(() => {
@@ -84,19 +86,6 @@ export const WorkspaceSplitHistoryPane = memo(function WorkspaceSplitHistoryPane
         if (cancelled) return;
         setMessages(detail.messages);
         setSegments(detail.segments);
-        if (session.source === 'agy') {
-          const lastModelMsg = [...detail.messages].reverse().find((m) => m.model?.trim());
-          const parsed = parseAgyTranscriptModel(lastModelMsg?.model, agyModels);
-          if (parsed) {
-            setModel((previous) => previous ?? parsed.model);
-            if (parsed.effort) {
-              const supported = resolveAgyEffortLevels(parsed.model, agyModels ?? []) as EffortLevel[];
-              if (supported.length > 0) {
-                setEffort(clampEffortToSupportedLevels(parsed.effort, supported));
-              }
-            }
-          }
-        }
       })
       .catch((error) => console.error('Failed to load split pane transcript:', error))
       .finally(() => {
@@ -105,9 +94,35 @@ export const WorkspaceSplitHistoryPane = memo(function WorkspaceSplitHistoryPane
     return () => {
       cancelled = true;
     };
-  }, [agyModels, session]);
+  }, [session]);
+
+  useEffect(() => {
+    if (session.source !== 'agy' || messages.length === 0) {
+      return;
+    }
+    const lastModelMsg = [...messages].reverse().find((m) => m.model?.trim());
+    const parsed = parseAgyTranscriptModel(lastModelMsg?.model, agyModels);
+    if (!parsed) {
+      return;
+    }
+    if (!userEditedModelRef.current) {
+      setModel(parsed.model);
+    }
+    if (!userEditedEffortRef.current && parsed.effort) {
+      const supported = resolveAgyEffortLevels(parsed.model, agyModels ?? []) as EffortLevel[];
+      if (supported.length > 0) {
+        setEffort(clampEffortToSupportedLevels(parsed.effort, supported));
+      }
+    }
+  }, [agyModels, messages, session.source]);
+
+  const handleEffortChange = useCallback((nextEffort: EffortLevel) => {
+    userEditedEffortRef.current = true;
+    setEffort(nextEffort);
+  }, []);
 
   const handleModelChange = useCallback((nextModel: string) => {
+    userEditedModelRef.current = true;
     setModel(nextModel);
     const supported = resolveAgyEffortLevels(nextModel, agyModels ?? []) as EffortLevel[];
     if (supported.length > 0) {
@@ -173,7 +188,7 @@ export const WorkspaceSplitHistoryPane = memo(function WorkspaceSplitHistoryPane
             enabledEnvironments={enabledEnvironments}
             onEnvChange={setEnvName}
             onPermModeChange={setPermMode}
-            onEffortChange={setEffort}
+            onEffortChange={handleEffortChange}
             onModelChange={handleModelChange}
             onRefreshAgyModels={onRefreshAgyModels}
           />
