@@ -1297,6 +1297,8 @@ fn build_agy_shell_command(
     working_dir: &str,
     session_id: &str,
     resume_session_id: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
 ) -> String {
     let mut parts = Vec::new();
     parts.push("mkdir -p ~/.ccem/sessions".to_string());
@@ -1315,19 +1317,27 @@ fn build_agy_shell_command(
     }
 
     let agy_path = resolve_agy_path().unwrap_or_else(|| "agy".to_string());
-    let quoted_agy = quote_posix_shell_word(&agy_path);
-    let escaped_session_id = session_id.replace("'", "'\\''");
-    let agy_cmd = if let Some(resume_id) = resume_session_id
+    let mut agy_args = vec![quote_posix_shell_word(&agy_path)];
+    if let Some(resume_id) = resume_session_id
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        format!("{} --conversation {}", quoted_agy, quote_posix_shell_word(resume_id))
-    } else {
-        quoted_agy
-    };
+        agy_args.push("--conversation".to_string());
+        agy_args.push(quote_posix_shell_word(resume_id));
+    }
+    if let Some(model_id) = model.map(str::trim).filter(|value| !value.is_empty()) {
+        agy_args.push("--model".to_string());
+        agy_args.push(quote_posix_shell_word(model_id));
+    }
+    if let Some(effort_level) = effort.map(str::trim).filter(|value| !value.is_empty()) {
+        agy_args.push("--effort".to_string());
+        agy_args.push(quote_posix_shell_word(effort_level));
+    }
+    let escaped_session_id = session_id.replace("'", "'\\''");
     parts.push(format!(
         "{}; echo $? > ~/.ccem/sessions/'{}'.exit",
-        agy_cmd, escaped_session_id
+        agy_args.join(" "),
+        escaped_session_id
     ));
 
     format!("( {} )", parts.join(" && "))
@@ -1622,6 +1632,31 @@ fn dispatch_iterm2_command(session_id: String, shell_command: String) {
 /// * `Err(String)` with error message on failure
 pub fn launch_in_terminal(
     terminal: TerminalType,
+    env_vars: HashMap<String, String>,
+    working_dir: &str,
+    session_id: &str,
+    env_name: &str,
+    perm_mode: Option<&str>,
+    resume_session_id: Option<&str>,
+    client: &str,
+) -> Result<(Option<String>, Option<String>), String> {
+    launch_in_terminal_with_options(
+        terminal,
+        env_vars,
+        working_dir,
+        session_id,
+        env_name,
+        perm_mode,
+        resume_session_id,
+        client,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn launch_in_terminal_with_options(
+    terminal: TerminalType,
     mut env_vars: HashMap<String, String>,
     working_dir: &str,
     session_id: &str,
@@ -1629,6 +1664,8 @@ pub fn launch_in_terminal(
     perm_mode: Option<&str>,
     resume_session_id: Option<&str>,
     client: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
 ) -> Result<(Option<String>, Option<String>), String> {
     if matches!(client, "claude" | "codex") {
         crate::agent_profile::prepare_env(client, &mut env_vars)?;
@@ -1642,7 +1679,14 @@ pub fn launch_in_terminal(
     let shell_command = if client == "codex" {
         build_codex_shell_command(&env_vars, working_dir, session_id, resume_session_id)
     } else if client == "agy" {
-        build_agy_shell_command(&env_vars, working_dir, session_id, resume_session_id)
+        build_agy_shell_command(
+            &env_vars,
+            working_dir,
+            session_id,
+            resume_session_id,
+            model,
+            effort,
+        )
     } else if client == "opencode" {
         let (safe_env_vars, secret_path) = split_opencode_secret_env(env_vars, session_id)?;
         build_opencode_shell_command(
@@ -3172,15 +3216,26 @@ mod tests {
     #[test]
     fn test_build_agy_shell_command_preserves_env_and_supports_resume() {
         let env = HashMap::from([("HTTPS_PROXY".to_string(), "http://127.0.0.1:7890".to_string())]);
-        let fresh = build_agy_shell_command(&env, "/tmp/my proj", "sess-1", None);
+        let fresh = build_agy_shell_command(&env, "/tmp/my proj", "sess-1", None, None, None);
         assert!(fresh.contains("cd '/tmp/my proj'"));
         assert!(fresh.contains("unset CLAUDECODE"));
         assert!(fresh.contains("export HTTPS_PROXY='http://127.0.0.1:7890'"));
         assert!(!fresh.contains("CLAUDE_CONFIG_DIR"));
         assert!(!fresh.contains("CODEX_HOME"));
         assert!(!fresh.contains("--conversation"));
+        assert!(!fresh.contains("--model"));
+        assert!(!fresh.contains("--effort"));
 
-        let resumed = build_agy_shell_command(&env, "/tmp/my proj", "sess-1", Some("conv-42"));
+        let resumed = build_agy_shell_command(
+            &env,
+            "/tmp/my proj",
+            "sess-1",
+            Some("conv-42"),
+            Some("claude-opus-5-5"),
+            Some("high"),
+        );
         assert!(resumed.contains("--conversation 'conv-42'"));
+        assert!(resumed.contains("--model 'claude-opus-5-5'"));
+        assert!(resumed.contains("--effort 'high'"));
     }
 }

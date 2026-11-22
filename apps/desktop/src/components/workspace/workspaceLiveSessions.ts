@@ -39,6 +39,8 @@ export function areNativeSessionSummariesEqual(
     && previous.perm_mode === next.perm_mode
     && previous.runtime_perm_mode === next.runtime_perm_mode
     && previous.effort === next.effort
+    && previous.model === next.model
+    && JSON.stringify(previous.config_options ?? null) === JSON.stringify(next.config_options ?? null)
     && previous.status === next.status
     && previous.created_at === next.created_at
     && previous.updated_at === next.updated_at

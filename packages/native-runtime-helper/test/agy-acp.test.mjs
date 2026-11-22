@@ -408,3 +408,108 @@ test('agy acp multi-step turn emits context_usage from usage_update, single turn
     `elapsed_ms (${turnMetrics[0].elapsed_ms}) should significantly exceed generation_ms (${turnMetrics[0].generation_ms}) because TTFT + tool execution are excluded`,
   );
 });
+
+test('agy acp dynamic model and effort switching clamps initial effort, hot-swaps models without respawn, and rejects invalid standalone updates', async (t) => {
+  const h = await launchAgyHelper(t, { scenario: 'dynamic_models' });
+
+  // Initial launch requests effort="max" on gemini-4-neon (which only supports low..xhigh);
+  // helper should clamp to xhigh and emit authoritative runtime_config_options_updated.
+  h.send({
+    ...h.baseInit,
+    model: 'gemini-4-neon',
+    effort: 'max',
+    initial_prompt: 'Start with neon',
+  });
+  await h.wait((o) => o.type === 'status' && o.status === 'ready' && o.detail === 'Ready for the next prompt.');
+
+  const initialConfigEvents = h.outputs
+    .filter((o) => o.type === 'event' && o.payload.type === 'runtime_config_options_updated')
+    .map((o) => o.payload);
+  assert.ok(initialConfigEvents.length >= 1, 'expected runtime_config_options_updated on session start');
+  const firstSnapshot = initialConfigEvents.at(-1);
+  assert.equal(firstSnapshot.current_model, 'gemini-4-neon');
+  assert.equal(firstSnapshot.current_effort, 'xhigh');
+  assert.equal(firstSnapshot.supports_effort, true);
+  assert.deepEqual(
+    firstSnapshot.efforts.map((c) => c.value),
+    ['low', 'medium', 'high', 'xhigh'],
+  );
+
+  // Hot-swap model to claude-opus-5-5 (only supports low/medium/high) on the SAME ACP child process.
+  const beforeOpusCount = h.outputs.length;
+  h.send({
+    type: 'update_settings',
+    request_id: 'req-model-opus',
+    model: 'claude-opus-5-5',
+  });
+  const opusAck = await h.wait((o) => o.type === 'settings_update_result' && o.request_id === 'req-model-opus');
+  assert.equal(opusAck.outcome, 'applied');
+
+  const opusSnapshot = h.outputs
+    .slice(beforeOpusCount)
+    .filter((o) => o.type === 'event' && o.payload.type === 'runtime_config_options_updated')
+    .map((o) => o.payload)
+    .at(-1);
+  assert.ok(opusSnapshot, 'expected runtime_config_options_updated after model switch');
+  assert.equal(opusSnapshot.current_model, 'claude-opus-5-5');
+  assert.equal(opusSnapshot.current_effort, 'high');
+  assert.equal(opusSnapshot.supports_effort, true);
+  assert.deepEqual(
+    opusSnapshot.efforts.map((c) => c.value),
+    ['low', 'medium', 'high'],
+  );
+
+  // Reject unsupported standalone effort ("xhigh" on claude-opus-5-5) and re-emit authoritative state.
+  const beforeInvalidEffort = h.outputs.length;
+  h.send({
+    type: 'update_settings',
+    request_id: 'req-effort-invalid',
+    effort: 'xhigh',
+  });
+  const invalidEffortAck = await h.wait(
+    (o) => o.type === 'settings_update_result' && o.request_id === 'req-effort-invalid',
+  );
+  assert.equal(invalidEffortAck.outcome, 'failed');
+  assert.match(invalidEffortAck.detail ?? '', /not offered/);
+  const snappedSnapshot = h.outputs
+    .slice(beforeInvalidEffort)
+    .filter((o) => o.type === 'event' && o.payload.type === 'runtime_config_options_updated')
+    .map((o) => o.payload)
+    .at(-1);
+  assert.equal(snappedSnapshot?.current_effort, 'high');
+
+  // Switch to a model without thought_level support -> supports_effort becomes false.
+  const beforeOrchCount = h.outputs.length;
+  h.send({
+    type: 'update_settings',
+    request_id: 'req-model-orch',
+    model: 'gemini-pro-orchestrator-neon',
+  });
+  const orchAck = await h.wait((o) => o.type === 'settings_update_result' && o.request_id === 'req-model-orch');
+  assert.equal(orchAck.outcome, 'applied');
+  const orchSnapshot = h.outputs
+    .slice(beforeOrchCount)
+    .filter((o) => o.type === 'event' && o.payload.type === 'runtime_config_options_updated')
+    .map((o) => o.payload)
+    .at(-1);
+  assert.equal(orchSnapshot?.current_model, 'gemini-pro-orchestrator-neon');
+  assert.equal(orchSnapshot?.supports_effort, false);
+  assert.equal(orchSnapshot?.current_effort, null);
+  assert.deepEqual(orchSnapshot?.efforts, []);
+
+  // Reject unknown model cleanly.
+  h.send({
+    type: 'update_settings',
+    request_id: 'req-model-unknown',
+    model: 'nonexistent-model',
+  });
+  const unknownAck = await h.wait(
+    (o) => o.type === 'settings_update_result' && o.request_id === 'req-model-unknown',
+  );
+  assert.equal(unknownAck.outcome, 'failed');
+
+  // Confirm all live model/effort switches happened on the SAME agy acp child process (no respawn).
+  const log = await h.readFixtureLog();
+  const spawns = log.filter((entry) => entry.event === 'spawn');
+  assert.equal(spawns.length, 1, 'live agy model/effort switching must not respawn agy acp');
+});

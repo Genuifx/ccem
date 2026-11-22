@@ -6,6 +6,7 @@ import {
   ChevronRight,
   Gauge,
   Lock,
+  RefreshCw,
   Shield,
   ShieldAlert,
   ShieldBan,
@@ -39,6 +40,13 @@ import type { Environment } from '@/store';
 import { resolveEnvironmentIconHint } from '@/components/workspace/sessionTreeIcons';
 import { filterRuntimeEnvironments } from '@/lib/enabledEnvironments';
 import {
+  resolveAgyEffortLevels,
+  resolveAgyModelsForControl,
+  type AgyModelCatalogItem,
+} from '@/lib/agy-runtime';
+import type { RuntimeConfigOptionsState } from '@/lib/tauri-ipc';
+import { clampEffortToSupportedLevels } from '@/components/workspace/workspaceSessionPreferences';
+import {
   getWorkspacePermissionModeDisplayName,
   normalizeWorkspacePermissionModeName,
   type WorkspacePermissionModeName,
@@ -50,7 +58,7 @@ export const normalizePermissionModeName = normalizeWorkspacePermissionModeName;
 
 const CLAUDE_EFFORT_LEVELS: EffortLevel[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 const CODEX_EFFORT_LEVELS: EffortLevel[] = ['minimal', 'low', 'medium', 'high', 'xhigh'];
-const AGY_EFFORT_LEVELS: EffortLevel[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+const AGY_EFFORT_LEVELS: EffortLevel[] = ['low', 'medium', 'high', 'xhigh'];
 
 const EFFORT_I18N_KEYS: Record<EffortLevel, string> = {
   minimal: 'workspace.effortMinimal',
@@ -303,9 +311,19 @@ export interface ComposerControlsProps {
   enabledEnvironments?: string[] | null;
   /** Exact routed-history resumes keep their frozen main environment. */
   environmentLocked?: boolean;
+  /** Selected model id for direct-model providers (e.g. agy). */
+  model?: string | null;
+  /** Catalog of available Antigravity models. */
+  agyModels?: AgyModelCatalogItem[];
+  /** Whether the Antigravity model catalog is currently loading. */
+  agyModelsLoading?: boolean;
+  /** Authoritative live ACP config options (overrides static catalog when present). */
+  liveConfigOptions?: RuntimeConfigOptionsState | null;
   onEnvChange: (envName: string) => void;
   onPermModeChange: (mode: PermissionModeName) => void;
   onEffortChange: (effort: EffortLevel) => void;
+  onModelChange?: (model: string) => void;
+  onRefreshAgyModels?: () => void;
 }
 
 // The live session view re-renders on every transcript poll; these menus only
@@ -320,9 +338,15 @@ function ComposerControlsView({
   environments,
   enabledEnvironments = null,
   environmentLocked = false,
+  model = null,
+  agyModels,
+  agyModelsLoading = false,
+  liveConfigOptions = null,
   onEnvChange,
   onPermModeChange,
   onEffortChange,
+  onModelChange,
+  onRefreshAgyModels,
 }: ComposerControlsProps) {
   const { t } = useLocale();
   const normalizedPermMode = normalizeWorkspacePermissionModeName(permMode);
@@ -394,13 +418,13 @@ function ComposerControlsView({
   useEffect(() => clearEnvPanelSwitch, []);
   const envEffortContentRef = useRef<HTMLDivElement>(null);
 
-  // Long environment lists: land the current group in view on open instead
+  // Long environment/model lists: land the current item in view on open instead
   // of always starting from the top.
   useEffect(() => {
     if (!envEffortOpen) return;
     const frame = requestAnimationFrame(() => {
       envEffortContentRef.current
-        ?.querySelector('[data-current-env-group]')
+        ?.querySelector('[data-current-env-group], [data-current-agy-model]')
         ?.scrollIntoView({ block: 'nearest' });
     });
     return () => cancelAnimationFrame(frame);
@@ -454,11 +478,33 @@ function ComposerControlsView({
     detail: t(`environments.permMode_${permissionPreviewMode}_detail`),
   };
 
+  const effectiveAgyModels = useMemo(
+    () => (isAgyProvider
+      ? resolveAgyModelsForControl({ catalog: agyModels ?? [], liveConfigOptions })
+      : []),
+    [agyModels, isAgyProvider, liveConfigOptions],
+  );
+  const selectedAgyModelId = isAgyProvider
+    ? (model?.trim() || liveConfigOptions?.current_model || effectiveAgyModels[0]?.id || null)
+    : null;
+  const selectedAgyModel = isAgyProvider && selectedAgyModelId
+    ? effectiveAgyModels.find((item) => item.id === selectedAgyModelId) ?? null
+    : null;
+  const agyEffortLevels = useMemo<EffortLevel[]>(() => {
+    if (!isAgyProvider) return AGY_EFFORT_LEVELS;
+    return resolveAgyEffortLevels(selectedAgyModelId, effectiveAgyModels, liveConfigOptions) as EffortLevel[];
+  }, [effectiveAgyModels, isAgyProvider, liveConfigOptions, selectedAgyModelId]);
+
   const effortLevels = isCodexProvider
     ? CODEX_EFFORT_LEVELS
     : isAgyProvider
-      ? AGY_EFFORT_LEVELS
+      ? agyEffortLevels
       : CLAUDE_EFFORT_LEVELS;
+  const showEffortControl = effortLevels.length > 0;
+  const displayEffort = showEffortControl
+    ? clampEffortToSupportedLevels(effort, effortLevels)
+    : effort;
+  const agyTriggerLabel = selectedAgyModel?.name ?? selectedAgyModelId ?? 'Antigravity';
 
   return (
     <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2">
@@ -477,6 +523,7 @@ function ComposerControlsView({
         <DropdownMenuTrigger asChild>
           <button
             type="button"
+            data-testid="composer-model-effort-trigger"
             className={cn(
               'flex h-8 min-w-0 max-w-full items-center gap-2 rounded-xl px-2.5 text-[12px] text-foreground',
               // Transition colors/shadow only: animating layout props (padding,
@@ -495,11 +542,18 @@ function ComposerControlsView({
             >
               <span className={cn('flex shrink-0', !isAgyProvider && isEnvironmentLocked && 'opacity-45 grayscale')}>
                 {isAgyProvider
-                  ? <Antigravity.Color size={14} className="shrink-0" />
+                  ? (selectedAgyModelId
+                    ? <EnvironmentLobeIcon hint={selectedAgyModelId} />
+                    : <Antigravity.Color size={14} className="shrink-0" />)
                   : <EnvironmentLobeIcon hint={currentEnvironmentIconHint} />}
               </span>
-              <span className="min-w-0 max-w-[120px] truncate max-[760px]:hidden group-data-[compact]/composer-footer:hidden">
-                {isAgyProvider ? 'Antigravity' : envName}
+              <span
+                className={cn(
+                  'min-w-0 truncate max-[760px]:hidden group-data-[compact]/composer-footer:hidden',
+                  isAgyProvider ? 'max-w-[160px]' : 'max-w-[120px]',
+                )}
+              >
+                {isAgyProvider ? agyTriggerLabel : envName}
               </span>
               {!isAgyProvider && isEnvironmentLocked && (
                 <Tooltip>
@@ -514,9 +568,15 @@ function ComposerControlsView({
                 </Tooltip>
               )}
             </span>
-            <span className="text-muted-foreground/60 max-[760px]:hidden group-data-[compact]/composer-footer:hidden">·</span>
-            <Gauge className="h-3 w-3 shrink-0 text-muted-foreground max-[760px]:hidden group-data-[compact]/composer-footer:hidden" />
-            <span className="shrink-0 whitespace-nowrap text-muted-foreground max-[760px]:hidden group-data-[compact]/composer-footer:hidden">{t(EFFORT_I18N_KEYS[effort])}</span>
+            {showEffortControl && (
+              <>
+                <span className="text-muted-foreground/60 max-[760px]:hidden group-data-[compact]/composer-footer:hidden">·</span>
+                <Gauge className="h-3 w-3 shrink-0 text-muted-foreground max-[760px]:hidden group-data-[compact]/composer-footer:hidden" />
+                <span className="shrink-0 whitespace-nowrap text-muted-foreground max-[760px]:hidden group-data-[compact]/composer-footer:hidden">
+                  {t(EFFORT_I18N_KEYS[displayEffort])}
+                </span>
+              </>
+            )}
             {/* Compact mode keeps just the model glyph: the affordance moves
                 into the icon itself (whole trigger stays clickable). */}
             <ChevronDown className="h-3 w-3 shrink-0 opacity-50 group-data-[compact]/composer-footer:hidden" />
@@ -529,21 +589,99 @@ function ComposerControlsView({
           sideOffset={6}
           collisionPadding={12}
           // Never taller than the room Radix measured on the open side, so the
-          // menu can't spill past the window edge; the env list absorbs it.
+          // menu can't spill past the window edge; the env/model list absorbs it.
           className="flex max-h-[min(480px,var(--radix-dropdown-menu-content-available-height))] w-[340px] flex-col overflow-visible p-0"
         >
-          <div className={cn('shrink-0 px-3 pt-2.5', isAgyProvider ? 'pb-2.5' : 'pb-1')}>
-            <div className="px-0.5 leading-4 text-2xs uppercase tracking-wider font-medium text-muted-foreground/70">
-              {t('workspace.effortLabel')}
+          {showEffortControl && (
+            <div className="shrink-0 px-3 pt-2.5 pb-1">
+              <div className="px-0.5 leading-4 text-2xs uppercase tracking-wider font-medium text-muted-foreground/70">
+                {t('workspace.effortLabel')}
+              </div>
+              <EffortSlider
+                levels={effortLevels}
+                labels={effortLevels.map((level) => t(EFFORT_I18N_KEYS[level]))}
+                value={displayEffort}
+                onChange={onEffortChange}
+                ariaLabel={t('workspace.effortLabel')}
+              />
             </div>
-            <EffortSlider
-              levels={effortLevels}
-              labels={effortLevels.map((level) => t(EFFORT_I18N_KEYS[level]))}
-              value={effort}
-              onChange={onEffortChange}
-              ariaLabel={t('workspace.effortLabel')}
-            />
-          </div>
+          )}
+          {isAgyProvider && (
+            <>
+              {showEffortControl && <DropdownMenuSeparator className="my-1 shrink-0" />}
+              <div
+                className={cn(
+                  'flex shrink-0 items-center justify-between gap-3 px-3 text-2xs uppercase tracking-wider font-medium text-muted-foreground/70',
+                  showEffortControl ? 'py-1.5' : 'pt-2.5 pb-1.5',
+                )}
+              >
+                <span>{t('workspace.modelLabel')}</span>
+                {onRefreshAgyModels && (
+                  <button
+                    type="button"
+                    aria-label={t('workspace.agyModelsRefresh')}
+                    title={t('workspace.agyModelsRefresh')}
+                    disabled={agyModelsLoading}
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      onRefreshAgyModels();
+                    }}
+                    className="inline-flex h-5 w-5 items-center justify-center rounded-md text-muted-foreground/70 transition-colors hover:bg-foreground/[0.06] hover:text-foreground disabled:opacity-50"
+                  >
+                    <RefreshCw className={cn('h-3 w-3', agyModelsLoading && 'animate-spin')} />
+                  </button>
+                )}
+              </div>
+              {effectiveAgyModels.length === 0 ? (
+                <p className="mx-2.5 mb-2.5 rounded-lg border border-border/60 bg-muted/25 px-2.5 py-2 text-[11px] leading-4 text-muted-foreground">
+                  {t(agyModelsLoading ? 'workspace.agyModelsLoading' : 'workspace.agyModelsEmpty')}
+                </p>
+              ) : (
+                <ScrollArea
+                  type="always"
+                  data-ccem-composer-agy-model-scroll
+                  className="ccem-overlay-scroll flex min-h-0 max-h-[320px] flex-1 flex-col"
+                  viewportClassName="min-h-0 flex-1"
+                >
+                  <div className="px-1.5 pb-1.5">
+                    {effectiveAgyModels.map((item) => {
+                      const isSelected = selectedAgyModelId === item.id;
+                      return (
+                        <DropdownMenuItem
+                          key={item.id}
+                          data-agy-model-option={item.id}
+                          data-current-agy-model={isSelected || undefined}
+                          onSelect={() => onModelChange?.(item.id)}
+                          className={cn(
+                            'h-8 cursor-pointer gap-2.5 rounded-lg px-2 text-[12.5px] leading-none',
+                            'text-foreground/85 transition-colors',
+                            'hover:bg-foreground/[0.05] focus:bg-foreground/[0.05] data-[highlighted]:bg-foreground/[0.05]',
+                            isSelected && 'bg-primary/[0.07] hover:bg-primary/[0.1] focus:bg-primary/[0.1] data-[highlighted]:bg-primary/[0.1]',
+                          )}
+                        >
+                          <span className="flex h-5 w-5 shrink-0 items-center justify-center">
+                            <EnvironmentLobeIcon hint={item.id} size={16} />
+                          </span>
+                          <span
+                            className={cn(
+                              'min-w-0 flex-1 truncate',
+                              isSelected && 'font-medium text-primary',
+                            )}
+                          >
+                            {item.name}
+                          </span>
+                          {isSelected && (
+                            <Check className="h-3.5 w-3.5 shrink-0 text-primary" />
+                          )}
+                        </DropdownMenuItem>
+                      );
+                    })}
+                  </div>
+                </ScrollArea>
+              )}
+            </>
+          )}
           {!isAgyProvider && (
             <>
               <DropdownMenuSeparator className="my-1 shrink-0" />

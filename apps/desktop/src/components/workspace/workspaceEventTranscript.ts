@@ -681,6 +681,7 @@ export function sessionEventsNeedSummaryRefresh(events: SessionEventRecord[]) {
       case 'terminal_prompt_required':
       case 'terminal_prompt_resolved':
       case 'runtime_settings_changed':
+      case 'runtime_config_options_updated':
       case 'background_tasks_changed':
       case 'background_task_updated':
         return true;
