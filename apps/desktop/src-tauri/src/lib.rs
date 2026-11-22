@@ -4,6 +4,7 @@
 mod agent_home;
 mod agent_profile;
 mod agy_history;
+mod agy_models;
 mod analytics;
 mod app_update_engine;
 mod app_updates;
@@ -619,6 +620,8 @@ async fn launch_claude_code(
     resume_session_id: Option<String>,
     client: Option<String>,
     codex_isolated: Option<bool>,
+    model: Option<String>,
+    effort: Option<String>,
 ) -> Result<Session, String> {
     let client_name = history::validate_launch_client(client.as_deref())?;
 
@@ -726,7 +729,7 @@ async fn launch_claude_code(
     let preferred_terminal = terminal::get_preferred_terminal();
     println!("Preferred terminal: {:?}", preferred_terminal);
 
-    let launch_result = terminal::launch_in_terminal(
+    let launch_result = terminal::launch_in_terminal_with_options(
         preferred_terminal,
         env_vars,
         &work_dir,
@@ -739,6 +742,8 @@ async fn launch_claude_code(
         },
         resume_session_id.as_deref(),
         &client_name,
+        model.as_deref(),
+        effort.as_deref(),
     );
 
     let (window_id, iterm_session_id) = match &launch_result {
@@ -1891,17 +1896,18 @@ fn apply_native_session_settings_ordered(
     perm_mode: Option<&str>,
     env_vars: Option<&HashMap<String, String>>,
     effort: Option<&str>,
+    model: Option<&str>,
     force_restart: bool,
 ) -> Result<(), String> {
     if claude_managed
         && perm_mode.is_some()
-        && (env_name.is_some() || env_vars.is_some() || effort.is_some())
+        && (env_name.is_some() || env_vars.is_some() || effort.is_some() || model.is_some())
     {
         // Claude applies permission-only changes to the live query, while
         // environment/effort may defer until turn end. Keep their ACK lanes
         // ordered so an older mixed patch cannot later undo the permission.
         native_state
-            .update_session_settings(app, runtime_id, None, perm_mode, None, None, false)?;
+            .update_session_settings(app, runtime_id, None, perm_mode, None, None, None, false)?;
         return native_state.update_session_settings(
             app,
             runtime_id,
@@ -1909,6 +1915,7 @@ fn apply_native_session_settings_ordered(
             None,
             env_vars,
             effort,
+            model,
             force_restart,
         );
     }
@@ -1919,6 +1926,7 @@ fn apply_native_session_settings_ordered(
         perm_mode,
         env_vars,
         effort,
+        model,
         force_restart,
     )
 }
@@ -1932,6 +1940,7 @@ fn update_native_session_settings_blocking(
     env_name: Option<String>,
     perm_mode: Option<String>,
     effort: Option<String>,
+    model: Option<String>,
     force_restart: Option<bool>,
 ) -> Result<(), String> {
     // Settings writes can lazily reconnect an interrupted helper. Serialize the
@@ -1964,7 +1973,7 @@ fn update_native_session_settings_blocking(
                     "environment",
                 )
                 .map_err(|error| error.to_string())?;
-            if perm_mode.is_none() && effort.is_none() {
+            if perm_mode.is_none() && effort.is_none() && model.is_none() {
                 return Ok(());
             }
             return apply_native_session_settings_ordered(
@@ -1976,6 +1985,7 @@ fn update_native_session_settings_blocking(
                 perm_mode.as_deref(),
                 None,
                 effort.as_deref(),
+                model.as_deref(),
                 force_restart.unwrap_or(false),
             );
         }
@@ -2014,6 +2024,7 @@ fn update_native_session_settings_blocking(
         perm_mode.as_deref(),
         env_vars.as_ref(),
         effort.as_deref(),
+        model.as_deref(),
         force_restart.unwrap_or(false),
     )
 }
@@ -2027,6 +2038,7 @@ async fn update_native_session_settings(
     env_name: Option<String>,
     perm_mode: Option<String>,
     effort: Option<String>,
+    model: Option<String>,
     force_restart: Option<bool>,
 ) -> Result<(), String> {
     let native_state = native_state.inner().clone();
@@ -2040,6 +2052,7 @@ async fn update_native_session_settings(
             env_name,
             perm_mode,
             effort,
+            model,
             force_restart,
         )
     })
@@ -2306,6 +2319,8 @@ async fn create_interactive_session(
             resume_session_id,
             Some(client_name),
             codex_isolated,
+            None,
+            None,
         )
         .await;
     }
@@ -2428,6 +2443,8 @@ async fn create_interactive_session(
             resume_session_id,
             Some(client_name),
             codex_isolated,
+            None,
+            None,
         )
         .await;
     }
@@ -3547,7 +3564,18 @@ fn set_agy_custom_path(path: Option<String>) -> Result<AgyRuntimeStatus, String>
     let updated = config::update_settings(|settings| {
         settings.agy_path = validated.clone();
     })?;
+    agy_models::invalidate_cache();
     Ok(build_agy_runtime_status(updated.agy_path))
+}
+
+#[tauri::command]
+async fn list_agy_models(
+    force_refresh: Option<bool>,
+) -> Result<agy_models::AgyModelCatalogResponse, String> {
+    let refresh = force_refresh.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || agy_models::list_agy_models(refresh))
+        .await
+        .map_err(|error| format!("Antigravity model discovery task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -6394,6 +6422,7 @@ pub fn run_desktop_app() -> i32 {
             check_agy_installed,
             get_agy_runtime_status,
             set_agy_custom_path,
+            list_agy_models,
             check_tmux_installed,
             get_platform_capabilities,
             load_from_remote,

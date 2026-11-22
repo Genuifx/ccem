@@ -157,6 +157,7 @@ commands.allow = [
   "check_agy_installed",
   "get_agy_runtime_status",
   "set_agy_custom_path",
+  "list_agy_models",
   "check_tmux_installed",
   "get_platform_capabilities",
   "load_from_remote",

@@ -5,8 +5,8 @@ use crate::browser::{authorize_browser_tool, BrowserToolRequest};
 use crate::config::{resolve_claude_env, resolve_codex_runtime};
 use crate::event_bus::{
     NativeBackgroundTask, NativeBackgroundTaskStatus, NativeEventReplayPage, ReplayBatch,
-    SessionEventPayload, SessionEventRecord, SessionPromptAnnotation, SessionPromptImage,
-    SessionStore, TodoSnapshotV1,
+    RuntimeConfigOptionsState, SessionEventPayload, SessionEventRecord, SessionPromptAnnotation,
+    SessionPromptImage, SessionStore, TodoSnapshotV1,
 };
 use crate::native_event_log::{
     bound_decoded_event_page, ensure_event_replay_page_size, validate_event_replay_page_request,
@@ -356,6 +356,9 @@ pub struct NativeSessionRecord {
     /// Requested task model, not a provider-confirmed usage claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Live provider-advertised config options (e.g. Antigravity ACP model/thought_level).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_options: Option<RuntimeConfigOptionsState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_env_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -417,6 +420,9 @@ pub struct NativeSessionSummary {
     /// Requested task model, not a provider-confirmed usage claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Live provider-advertised config options (e.g. Antigravity ACP model/thought_level).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_options: Option<RuntimeConfigOptionsState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_env_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -737,6 +743,8 @@ enum HelperInputCommand<'a> {
         env_vars: Option<&'a HashMap<String, String>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         effort: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<&'a str>,
         force_restart: bool,
     },
     RewindFiles {
@@ -1083,9 +1091,10 @@ fn stage_runtime_settings_update(
     record: &mut NativeSessionRecord,
     env_name: Option<&str>,
     effort: Option<&str>,
+    model: Option<&str>,
     request_id: &str,
 ) {
-    if env_name.is_none() && effort.is_none() {
+    if env_name.is_none() && effort.is_none() && model.is_none() {
         return;
     }
     match record.provider {
@@ -1104,6 +1113,15 @@ fn stage_runtime_settings_update(
             }
             if let Some(next_effort) = effort {
                 record.effort = non_empty_error(next_effort);
+                if let Some(config) = record.config_options.as_mut() {
+                    config.current_effort = record.effort.clone();
+                }
+            }
+            if let Some(next_model) = model {
+                record.model = non_empty_error(next_model);
+                if let Some(config) = record.config_options.as_mut() {
+                    config.current_model = record.model.clone();
+                }
             }
             record.pending_env_name = None;
             record.pending_effort = None;
@@ -1119,6 +1137,8 @@ fn rollback_runtime_settings_projection(
 ) {
     record.env_name = original.env_name.clone();
     record.effort = original.effort.clone();
+    record.model = original.model.clone();
+    record.config_options = original.config_options.clone();
     record.pending_env_name = original.pending_env_name.clone();
     record.pending_effort = original.pending_effort.clone();
     record.pending_settings_request_id = original.pending_settings_request_id.clone();
@@ -2082,6 +2102,7 @@ impl NativeSessionHandle {
             runtime_perm_mode: record.runtime_perm_mode,
             effort: record.effort,
             model: record.model,
+            config_options: record.config_options,
             pending_env_name: record.pending_env_name,
             pending_effort: record.pending_effort,
             status: record.status,
@@ -2539,6 +2560,7 @@ impl NativeRuntimeManager {
             runtime_perm_mode: options.runtime_perm_mode.clone(),
             effort: options.effort.clone(),
             model: options.model.clone(),
+            config_options: None,
             pending_env_name: None,
             pending_effort: None,
             pending_settings_request_id: None,
@@ -2930,6 +2952,7 @@ impl NativeRuntimeManager {
                         runtime_perm_mode: record.runtime_perm_mode,
                         effort: record.effort,
                         model: record.model,
+                        config_options: record.config_options,
                         pending_env_name: record.pending_env_name,
                         pending_effort: record.pending_effort,
                         status: record.status,
@@ -4731,6 +4754,7 @@ impl NativeRuntimeManager {
         perm_mode: Option<&str>,
         env_vars: Option<&HashMap<String, String>>,
         effort: Option<&str>,
+        model: Option<&str>,
         force_restart: bool,
     ) -> Result<(), String> {
         let _transition_guard = self
@@ -4764,11 +4788,15 @@ impl NativeRuntimeManager {
             .lock()
             .map_err(|_| "Failed to lock native session record".to_string())?
             .clone();
+        validate_task_model(original_settings.provider, model)?;
         // Correlated settings operation: the matching runtime_settings_changed
         // ACK resolves it; prompt dispatch waits for convergence while pending.
         let lifecycle_managed = original_settings.provider == NativeProvider::Claude;
-        let permission_only =
-            perm_mode.is_some() && env_name.is_none() && env_vars.is_none() && effort.is_none();
+        let permission_only = perm_mode.is_some()
+            && env_name.is_none()
+            && env_vars.is_none()
+            && effort.is_none()
+            && model.is_none();
         if lifecycle_managed {
             validate_claude_settings_patch(env_name, perm_mode, env_vars.is_some(), effort)?;
             if permission_only {
@@ -4788,8 +4816,8 @@ impl NativeRuntimeManager {
                 // and the visible current environment remain authoritative.
                 record.pending_settings_request_id = Some(request_id.clone());
             }
-            if env_name.is_some() || effort.is_some() {
-                stage_runtime_settings_update(record, env_name, effort, &request_id);
+            if env_name.is_some() || effort.is_some() || model.is_some() {
+                stage_runtime_settings_update(record, env_name, effort, model, &request_id);
             }
             record.updated_at = Utc::now();
         });
@@ -4818,6 +4846,7 @@ impl NativeRuntimeManager {
             permission_scope: perm_mode.map(|_| "display"),
             env_vars,
             effort,
+            model,
             force_restart,
         };
         if let Some(next_perm_mode) = perm_mode {
@@ -4843,7 +4872,7 @@ impl NativeRuntimeManager {
                 )
             };
             if let Err(error) = delivery {
-                if env_name.is_some() || effort.is_some() {
+                if env_name.is_some() || effort.is_some() || model.is_some() {
                     self.update_record(runtime_id, |record| {
                         rollback_runtime_settings_projection(record, &original_settings);
                     })?;
@@ -5213,6 +5242,7 @@ impl NativeRuntimeManager {
                 &mut updated_record,
                 Some(&updated_router.default_env),
                 None,
+                None,
                 &settings_request_id,
             );
         } else {
@@ -5261,6 +5291,7 @@ impl NativeRuntimeManager {
                         permission_scope: None,
                         env_vars: Some(&resolved.env_vars),
                         effort: None,
+                        model: None,
                         force_restart: false,
                     };
                     match self.write_to_live_child_outcome(handle, &command) {
@@ -5786,6 +5817,7 @@ impl NativeRuntimeManager {
             permission_scope: Some("runtime"),
             env_vars: None,
             effort: None,
+            model: None,
             force_restart: false,
         };
         if lifecycle_managed {
@@ -10257,6 +10289,23 @@ impl NativeRuntimeManager {
             )),
             _ => None,
         };
+        let config_options_update = match &payload {
+            SessionEventPayload::RuntimeConfigOptionsUpdated {
+                current_model,
+                current_effort,
+                supports_effort,
+                models,
+                efforts,
+                ..
+            } => Some(RuntimeConfigOptionsState {
+                current_model: current_model.clone(),
+                current_effort: current_effort.clone(),
+                supports_effort: *supports_effort,
+                models: models.clone(),
+                efforts: efforts.clone(),
+            }),
+            _ => None,
+        };
         let handles = self
             .handles
             .lock()
@@ -10333,6 +10382,22 @@ impl NativeRuntimeManager {
                     record.pending_env_name = pending_env_name;
                     record.pending_effort = pending_effort;
                 }
+                record.updated_at = Utc::now();
+            })?;
+        }
+        if let Some(config_state) = config_options_update {
+            self.update_record(runtime_id, |record| {
+                if let Some(model) = config_state.current_model.as_ref().filter(|value| !value.trim().is_empty()) {
+                    record.model = Some(model.clone());
+                }
+                if config_state.supports_effort {
+                    if let Some(effort) = config_state.current_effort.as_ref().filter(|value| !value.trim().is_empty()) {
+                        record.effort = Some(effort.clone());
+                    }
+                } else {
+                    record.effort = None;
+                }
+                record.config_options = Some(config_state);
                 record.updated_at = Utc::now();
             })?;
         }
@@ -11048,6 +11113,7 @@ impl NativeRuntimeManager {
                 runtime_perm_mode: record.runtime_perm_mode,
                 effort: record.effort,
                 model: record.model,
+                config_options: record.config_options,
                 pending_env_name: record.pending_env_name,
                 pending_effort: record.pending_effort,
                 status: record.status,
@@ -11785,12 +11851,101 @@ mod tests {
             &mut record,
             Some("Antigravity"),
             Some("high"),
+            Some("claude-opus-5-5"),
             "settings-agy",
         );
         assert_eq!(record.env_name, "Antigravity");
         assert_eq!(record.effort.as_deref(), Some("high"));
+        assert_eq!(record.model.as_deref(), Some("claude-opus-5-5"));
         assert!(record.pending_env_name.is_none());
         assert!(record.pending_settings_request_id.is_none());
+    }
+
+    #[test]
+    fn runtime_config_options_event_syncs_record_and_summary() {
+        let runtime_id = "native-agy-config-options-sync";
+        let manager = manager_with_handle(runtime_id);
+        manager
+            .update_record(runtime_id, |record| {
+                record.provider = NativeProvider::Agy;
+                record.env_name = "Antigravity".to_string();
+                record.model = Some("gemini-4-neon".to_string());
+                record.effort = Some("xhigh".to_string());
+            })
+            .expect("seed agy record");
+
+        manager
+            .append_event(
+                runtime_id,
+                SessionEventPayload::RuntimeConfigOptionsUpdated {
+                    provider: "agy".to_string(),
+                    current_model: Some("claude-opus-5-5".to_string()),
+                    current_effort: Some("high".to_string()),
+                    supports_effort: true,
+                    models: vec![
+                        crate::event_bus::RuntimeConfigOptionChoice {
+                            value: "gemini-4-neon".to_string(),
+                            name: Some("Gemini 4 Neon".to_string()),
+                            description: None,
+                        },
+                        crate::event_bus::RuntimeConfigOptionChoice {
+                            value: "claude-opus-5-5".to_string(),
+                            name: Some("Claude Opus 5.5".to_string()),
+                            description: None,
+                        },
+                    ],
+                    efforts: vec![
+                        crate::event_bus::RuntimeConfigOptionChoice {
+                            value: "low".to_string(),
+                            name: Some("Low".to_string()),
+                            description: None,
+                        },
+                        crate::event_bus::RuntimeConfigOptionChoice {
+                            value: "high".to_string(),
+                            name: Some("High".to_string()),
+                            description: None,
+                        },
+                    ],
+                },
+            )
+            .expect("apply config options event");
+
+        let summary = manager
+            .get_session_summary(runtime_id)
+            .expect("summary query")
+            .expect("summary exists");
+        assert_eq!(summary.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(summary.effort.as_deref(), Some("high"));
+        let config = summary.config_options.expect("config options present");
+        assert!(config.supports_effort);
+        assert_eq!(config.models.len(), 2);
+        assert_eq!(config.efforts.len(), 2);
+
+        // Switching to a model without effort clears effort cleanly.
+        manager
+            .append_event(
+                runtime_id,
+                SessionEventPayload::RuntimeConfigOptionsUpdated {
+                    provider: "agy".to_string(),
+                    current_model: Some("gemini-pro-orchestrator-neon".to_string()),
+                    current_effort: None,
+                    supports_effort: false,
+                    models: vec![],
+                    efforts: vec![],
+                },
+            )
+            .expect("apply no-effort model event");
+
+        let updated = manager
+            .get_session_summary(runtime_id)
+            .expect("summary query")
+            .expect("summary exists");
+        assert_eq!(
+            updated.model.as_deref(),
+            Some("gemini-pro-orchestrator-neon")
+        );
+        assert_eq!(updated.effort, None);
+        assert!(!updated.config_options.expect("config").supports_effort);
     }
 
     #[cfg(unix)]
@@ -11979,6 +12134,7 @@ mod tests {
             runtime_perm_mode: None,
             effort: None,
             model: None,
+            config_options: None,
             pending_env_name: None,
             pending_effort: None,
             pending_settings_request_id: None,
@@ -12286,6 +12442,7 @@ mod tests {
             runtime_perm_mode: None,
             effort: None,
             model: None,
+            config_options: None,
             pending_env_name: None,
             pending_effort: None,
             pending_settings_request_id: None,
@@ -15861,6 +16018,7 @@ mod tests {
             permission_scope: Some("display"),
             env_vars: None,
             effort: None,
+            model: Some("claude-opus-5-5"),
             force_restart: false,
         })
         .expect("serialize settings update");
@@ -15869,6 +16027,7 @@ mod tests {
         assert_eq!(serialized["request_id"], "settings-request-serialization");
         assert_eq!(serialized["perm_mode"], "readonly");
         assert_eq!(serialized["permission_scope"], "display");
+        assert_eq!(serialized["model"], "claude-opus-5-5");
     }
 
     #[test]
@@ -16640,6 +16799,7 @@ mod tests {
             &mut codex,
             Some("new-codex"),
             Some("high"),
+            None,
             "settings-codex",
         );
         assert_eq!(codex.env_name, "new-codex");
@@ -16655,6 +16815,7 @@ mod tests {
             &mut claude,
             Some("new-claude"),
             Some("high"),
+            None,
             "settings-claude",
         );
         assert_eq!(claude.env_name, "old-claude");
@@ -16680,6 +16841,7 @@ mod tests {
             &mut record,
             Some("new-codex"),
             Some("high"),
+            None,
             "settings-codex-failed",
         );
         assert_eq!(record.perm_mode, "dev");
@@ -16990,6 +17152,7 @@ mod tests {
                     record,
                     Some("next-environment"),
                     Some("high"),
+                    None,
                     "settings-env",
                 );
             })

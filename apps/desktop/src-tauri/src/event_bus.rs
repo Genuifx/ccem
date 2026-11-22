@@ -214,6 +214,29 @@ pub struct NativeBackgroundTask {
     pub stop_failed: Option<bool>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeConfigOptionChoice {
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeConfigOptionsState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_effort: Option<String>,
+    #[serde(default)]
+    pub supports_effort: bool,
+    #[serde(default)]
+    pub models: Vec<RuntimeConfigOptionChoice>,
+    #[serde(default)]
+    pub efforts: Vec<RuntimeConfigOptionChoice>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEventPayload {
@@ -486,6 +509,19 @@ pub enum SessionEventPayload {
     },
     BackgroundTaskUpdated {
         task: NativeBackgroundTask,
+    },
+    RuntimeConfigOptionsUpdated {
+        provider: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_effort: Option<String>,
+        #[serde(default)]
+        supports_effort: bool,
+        #[serde(default)]
+        models: Vec<RuntimeConfigOptionChoice>,
+        #[serde(default)]
+        efforts: Vec<RuntimeConfigOptionChoice>,
     },
 }
 

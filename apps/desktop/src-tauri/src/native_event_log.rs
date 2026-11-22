@@ -1203,7 +1203,8 @@ fn should_flush_after_append(payload: &SessionEventPayload) -> bool {
         | SessionEventPayload::TokenUsage { .. }
         | SessionEventPayload::TurnMetrics { .. }
         | SessionEventPayload::ContextUsage { .. }
-        | SessionEventPayload::SessionUsage { .. } => true,
+        | SessionEventPayload::SessionUsage { .. }
+        | SessionEventPayload::RuntimeConfigOptionsUpdated { .. } => true,
         SessionEventPayload::ToolUseStarted {
             needs_response,
             todo_snapshot,

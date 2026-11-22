@@ -277,6 +277,7 @@ pub(crate) fn summarize_payload(payload: &SessionEventPayload) -> Option<EventSu
         | SessionEventPayload::TurnMetrics { .. }
         | SessionEventPayload::TurnProgress { .. }
         | SessionEventPayload::RuntimeSettingsChanged { .. }
+        | SessionEventPayload::RuntimeConfigOptionsUpdated { .. }
         | SessionEventPayload::InteractiveResponseResult { .. }
         | SessionEventPayload::BackgroundTasksChanged { .. }
         | SessionEventPayload::BackgroundTaskUpdated { .. }

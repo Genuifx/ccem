@@ -304,6 +304,7 @@ pub async fn login_agent_profile(
     environment_mutations: tauri::State<'_, Arc<crate::config::EnvironmentMutationCoordinator>>,
 ) -> Result<(), String> {
     if provider == "agy" {
+        crate::agy_models::invalidate_cache();
         return tauri::async_runtime::spawn_blocking(move || {
             crate::terminal::open_agent_login("agy", false)
         })
