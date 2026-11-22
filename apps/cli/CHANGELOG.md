@@ -1,5 +1,11 @@
 # ccem
 
+## 2.113.0
+
+### Minor Changes
+
+- Release v2.113.0: native Antigravity (agy) history, subagents, and token analytics with subagent drawer, history list scan performance improvement, and Cargo 1.100 dev launcher fix.
+
 ## 2.112.0
 
 ### Minor Changes
