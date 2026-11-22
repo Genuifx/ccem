@@ -49,6 +49,71 @@ let activePromptId = null;
 let activeSessionId = null;
 let promptCount = 0;
 
+const DYNAMIC_MODELS = {
+  'gemini-4-neon': {
+    name: 'Gemini 4 Neon',
+    efforts: ['low', 'medium', 'high', 'xhigh'],
+    defaultEffort: 'high',
+  },
+  'claude-opus-5-5': {
+    name: 'Claude Opus 5.5',
+    efforts: ['low', 'medium', 'high'],
+    defaultEffort: 'high',
+  },
+  'gemini-pro-orchestrator-neon': {
+    name: 'Orchestrator (Neon)',
+    efforts: [],
+    defaultEffort: null,
+  },
+};
+let dynamicModel = 'gemini-4-neon';
+let dynamicEffort = 'high';
+let dynamicMode = 'default';
+
+function buildDynamicConfigOptions() {
+  const modelSpec = DYNAMIC_MODELS[dynamicModel] || DYNAMIC_MODELS['gemini-4-neon'];
+  const options = [
+    {
+      id: 'model',
+      name: 'Model',
+      category: 'model',
+      type: 'select',
+      currentValue: dynamicModel,
+      options: Object.entries(DYNAMIC_MODELS).map(([value, spec]) => ({
+        value,
+        name: spec.name,
+      })),
+    },
+  ];
+  if (modelSpec.efforts.length > 0) {
+    options.push({
+      id: 'thought_level',
+      name: 'Thinking Level',
+      category: 'thought_level',
+      type: 'select',
+      currentValue: dynamicEffort ?? modelSpec.defaultEffort,
+      options: modelSpec.efforts.map((value) => ({
+        value,
+        name: value === 'xhigh' ? 'Extra' : value[0].toUpperCase() + value.slice(1),
+      })),
+    });
+  }
+  options.push({
+    id: 'mode',
+    name: 'Mode',
+    category: 'mode',
+    type: 'select',
+    currentValue: dynamicMode,
+    options: [
+      { value: 'default', name: 'Default' },
+      { value: 'accept-edits', name: 'Accept Edits' },
+      { value: 'auto', name: 'Auto' },
+      { value: 'plan', name: 'Plan' },
+    ],
+  });
+  return options;
+}
+
 function sendServerRequest(method, params) {
   const id = nextServerReqId++;
   return new Promise((resolve) => {
@@ -110,6 +175,17 @@ rl.on('line', async (line) => {
       return;
     }
     activeSessionId = 'agy-sess-1';
+    if (scenario === 'dynamic_models') {
+      send({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: {
+          sessionId: activeSessionId,
+          configOptions: buildDynamicConfigOptions(),
+        },
+      });
+      return;
+    }
     send({
       jsonrpc: '2.0',
       id: msg.id,
@@ -178,6 +254,62 @@ rl.on('line', async (line) => {
   }
 
   if (msg.method === 'session/set_config_option') {
+    if (scenario === 'dynamic_models') {
+      const { configId, value } = msg.params || {};
+      if (configId === 'model') {
+        if (!DYNAMIC_MODELS[value]) {
+          send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            error: { code: -32602, message: 'Model "' + value + '" is not offered' },
+          });
+          return;
+        }
+        dynamicModel = value;
+        const spec = DYNAMIC_MODELS[dynamicModel];
+        if (spec.efforts.length === 0) {
+          dynamicEffort = null;
+        } else if (!dynamicEffort || !spec.efforts.includes(dynamicEffort)) {
+          dynamicEffort = spec.defaultEffort;
+        }
+        send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { configOptions: buildDynamicConfigOptions() },
+        });
+        return;
+      }
+      if (configId === 'thought_level') {
+        const spec = DYNAMIC_MODELS[dynamicModel];
+        if (!spec || !spec.efforts.includes(value)) {
+          send({
+            jsonrpc: '2.0',
+            id: msg.id,
+            error: {
+              code: -32602,
+              message: 'Thinking level "' + value + '" is not offered for model "' + (spec?.name ?? dynamicModel) + '"',
+            },
+          });
+          return;
+        }
+        dynamicEffort = value;
+        send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { configOptions: buildDynamicConfigOptions() },
+        });
+        return;
+      }
+      if (configId === 'mode') {
+        dynamicMode = value;
+        send({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { configOptions: buildDynamicConfigOptions() },
+        });
+        return;
+      }
+    }
     if (scenario === 'unsupported_config' && msg.params.configId === 'thought_level') {
       send({
         jsonrpc: '2.0',

@@ -18,6 +18,20 @@ import { formatPermissionPreview } from './permissionPreview';
 import { buildPromptContentParts, type PromptImage } from './promptContent';
 import type { TodoSnapshotTracker } from './todoSnapshots';
 
+export type AgyConfigOptionChoice = {
+  value: string;
+  name?: string;
+  description?: string;
+};
+
+export type AgyConfigOptionsSnapshot = {
+  current_model: string | null;
+  current_effort: string | null;
+  supports_effort: boolean;
+  models: AgyConfigOptionChoice[];
+  efforts: AgyConfigOptionChoice[];
+};
+
 export type AgyInitConfig = {
   workingDir: string;
   permMode: string;
@@ -35,6 +49,7 @@ export type AgyRuntimeCallbacks = {
   unregisterPermission: (requestId: string) => void;
   getCurrentProviderSessionId: () => string | null;
   getInitConfig: () => AgyInitConfig | null;
+  onConfigOptionsSynced?: (synced: { model?: string | null; effort?: string | null }) => void;
 };
 
 type StartedToolState = {
@@ -194,8 +209,71 @@ export function selectAgyPermissionOutcome(
   };
 }
 
+const AGY_EFFORT_ORDER = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
+
+export function resolveSupportedAgyEffort(
+  requested: string,
+  supportedValues: readonly string[],
+): string | null {
+  const trimmed = requested.trim();
+  if (!trimmed || supportedValues.length === 0) {
+    return null;
+  }
+  if (supportedValues.includes(trimmed)) {
+    return trimmed;
+  }
+  const requestedIndex = AGY_EFFORT_ORDER.indexOf(trimmed as (typeof AGY_EFFORT_ORDER)[number]);
+  if (requestedIndex >= 0) {
+    for (let i = requestedIndex - 1; i >= 0; i -= 1) {
+      const candidate = AGY_EFFORT_ORDER[i]!;
+      if (supportedValues.includes(candidate)) {
+        return candidate;
+      }
+    }
+    for (let i = requestedIndex + 1; i < AGY_EFFORT_ORDER.length; i += 1) {
+      const candidate = AGY_EFFORT_ORDER[i]!;
+      if (supportedValues.includes(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  return supportedValues[0] ?? null;
+}
+
 function getConfigOptionId(option: AcpConfigOption): string | undefined {
   return readString(option.configId) ?? readString(option.id);
+}
+
+function normalizeConfigOptionChoices(options: AcpConfigOption['options']): AgyConfigOptionChoice[] {
+  if (!Array.isArray(options)) {
+    return [];
+  }
+  const choices: AgyConfigOptionChoice[] = [];
+  const seen = new Set<string>();
+  for (const item of options) {
+    const value = readString(item?.value);
+    if (!value || seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+    const name = readString(item?.name);
+    const description = readString(item?.description);
+    choices.push({
+      value,
+      ...(name ? { name } : {}),
+      ...(description ? { description } : {}),
+    });
+  }
+  return choices;
+}
+
+function isFullConfigOptionsSnapshot(options: AcpConfigOption[]): boolean {
+  if (options.length > 1) {
+    return true;
+  }
+  return options.some(
+    (option) => Array.isArray(option.options) || Boolean(readString(option.category)),
+  );
 }
 
 export class AgyRuntime {
@@ -203,6 +281,8 @@ export class AgyRuntime {
   private sessionId: string | null = null;
   private configOptions: AcpConfigOption[] = [];
   private currentModel: string | null = null;
+  private currentEffort: string | null = null;
+  private lastConfigOptionsKey: string | null = null;
   private lastContextUsageKey: string | null = null;
   private pendingFallbackTurnUsage: Record<string, unknown> | null = null;
   private activeOperation: InputOperation | null = null;
@@ -242,6 +322,8 @@ export class AgyRuntime {
     const env = buildAgyProcessEnv(process.env, config.envVars);
     this.activeDangerouslySkipPermissions = normalizedPerm.dangerouslySkipPermissions;
     this.currentModel = readString(config.model) ?? null;
+    this.currentEffort = readString(config.effort) ?? null;
+    this.lastConfigOptionsKey = null;
     this.lastContextUsageKey = null;
 
     const client = new AgyAcpClient({
@@ -281,16 +363,17 @@ export class AgyRuntime {
 
       this.sessionId = resolvedSessionId;
       if (Array.isArray(sessionResult.configOptions)) {
-        this.configOptions = sessionResult.configOptions;
-        this.syncCurrentModelFromConfigOptions(this.configOptions);
+        this.applyConfigOptionsUpdate(sessionResult.configOptions);
       }
       this.callbacks.emitSessionMeta(resolvedSessionId);
 
       await this.applySessionConfig(client, resolvedSessionId, {
         permMode: config.permMode,
-        effort: config.effort ?? undefined,
         model: config.model ?? undefined,
-      });
+        effort: config.effort ?? undefined,
+      }, { live: false });
+
+      this.emitConfigOptionsSnapshot();
 
       return { client, sessionId: resolvedSessionId };
     } catch (error) {
@@ -386,12 +469,13 @@ export class AgyRuntime {
 
   async applyLiveSettings(patch: {
     permMode?: string;
+    model?: string;
     effort?: string;
     envVarsChanged?: boolean;
-  }): Promise<void> {
+  }): Promise<{ ok: boolean; error?: string }> {
     const config = this.callbacks.getInitConfig();
     if (!config) {
-      return;
+      return { ok: true };
     }
     const nextPerm = normalizeAgyPermissionMode(config.permMode);
     const needsRespawn = Boolean(patch.envVarsChanged)
@@ -400,17 +484,18 @@ export class AgyRuntime {
 
     if (needsRespawn) {
       await this.teardown();
-      return;
+      return { ok: true };
     }
 
     if (!this.client?.isAlive || !this.sessionId) {
-      return;
+      return { ok: true };
     }
 
-    await this.applySessionConfig(this.client, this.sessionId, {
+    return this.applySessionConfig(this.client, this.sessionId, {
       ...(patch.permMode !== undefined ? { permMode: patch.permMode } : {}),
+      ...(patch.model !== undefined ? { model: patch.model } : {}),
       ...(patch.effort !== undefined ? { effort: patch.effort } : {}),
-    });
+    }, { live: true });
   }
 
   interruptTurn(): void {
@@ -428,6 +513,8 @@ export class AgyRuntime {
     this.sessionId = null;
     this.configOptions = [];
     this.currentModel = null;
+    this.currentEffort = null;
+    this.lastConfigOptionsKey = null;
     this.lastContextUsageKey = null;
     this.pendingFallbackTurnUsage = null;
     this.startedTools.clear();
@@ -441,14 +528,20 @@ export class AgyRuntime {
     client: AgyAcpClient,
     sessionId: string,
     patch: { permMode?: string; effort?: string; model?: string },
-  ): Promise<void> {
-    if (patch.permMode !== undefined) {
+    options: { live: boolean },
+  ): Promise<{ ok: boolean; error?: string }> {
+    const hasPermPatch = patch.permMode !== undefined;
+    const hasModelPatch = Boolean(patch.model && patch.model.trim());
+    const hasEffortPatch = Boolean(patch.effort && patch.effort.trim());
+
+    if (hasPermPatch && patch.permMode !== undefined) {
       const normalized = normalizeAgyPermissionMode(patch.permMode);
       const modeOption = this.findConfigOption('mode', ['mode']);
       let updatedViaConfig = false;
       if (modeOption) {
         const configId = getConfigOptionId(modeOption) ?? 'mode';
-        updatedViaConfig = await this.trySetConfigOption(client, sessionId, configId, normalized.acpMode);
+        const outcome = await this.trySetConfigOption(client, sessionId, configId, normalized.acpMode);
+        updatedViaConfig = outcome.ok;
       }
       if (!updatedViaConfig) {
         try {
@@ -459,21 +552,66 @@ export class AgyRuntime {
       }
     }
 
-    if (patch.model !== undefined && patch.model.trim()) {
+    if (hasModelPatch && patch.model) {
+      const requestedModel = patch.model.trim();
       const modelOption = this.findConfigOption('model', ['model']);
       const configId = (modelOption ? getConfigOptionId(modelOption) : undefined) ?? 'model';
-      await this.trySetConfigOption(client, sessionId, configId, patch.model.trim());
+      const outcome = await this.trySetConfigOption(client, sessionId, configId, requestedModel);
+      if (!outcome.ok) {
+        const message = outcome.error || `Antigravity rejected model "${requestedModel}".`;
+        this.callbacks.emitEvent({ type: 'stderr_line', line: message });
+        this.emitConfigOptionsSnapshot(true);
+        if (options.live) {
+          return { ok: false, error: message };
+        }
+      }
     }
 
-    if (patch.effort !== undefined && patch.effort.trim()) {
+    if (hasEffortPatch && patch.effort) {
+      const requestedEffort = patch.effort.trim();
+      const modelOption = this.findConfigOption('model', ['model']);
       const effortOption = this.findConfigOption('thought_level', [
         'thought_level',
         'effort',
         'thinking_level',
       ]);
-      const configId = (effortOption ? getConfigOptionId(effortOption) : undefined) ?? 'thought_level';
-      await this.trySetConfigOption(client, sessionId, configId, patch.effort.trim());
+      const hasFullCatalog = Boolean(modelOption && Array.isArray(modelOption.options) && modelOption.options.length > 0);
+      const supportedEfforts = normalizeConfigOptionChoices(effortOption?.options).map((choice) => choice.value);
+
+      if (hasFullCatalog && !effortOption) {
+        if (options.live && !hasModelPatch && !hasPermPatch) {
+          const message = `Thinking level is not supported for model "${this.currentModel ?? 'current'}".`;
+          this.callbacks.emitEvent({ type: 'stderr_line', line: message });
+          this.emitConfigOptionsSnapshot(true);
+          return { ok: false, error: message };
+        }
+      } else {
+        let targetEffort = requestedEffort;
+        if (supportedEfforts.length > 0 && !supportedEfforts.includes(requestedEffort)) {
+          if (!options.live || hasModelPatch) {
+            const clamped = resolveSupportedAgyEffort(requestedEffort, supportedEfforts);
+            if (clamped) {
+              targetEffort = clamped;
+            }
+          }
+        }
+        const configId = (effortOption ? getConfigOptionId(effortOption) : undefined) ?? 'thought_level';
+        const outcome = await this.trySetConfigOption(client, sessionId, configId, targetEffort);
+        if (!outcome.ok) {
+          const message = outcome.error || `Antigravity rejected thinking level "${targetEffort}".`;
+          this.callbacks.emitEvent({ type: 'stderr_line', line: message });
+          this.emitConfigOptionsSnapshot(true);
+          // Only fail a standalone live effort update when the server actually advertised
+          // thought_level choices; preserve graceful degradation on legacy/mixed updates.
+          if (options.live && !hasPermPatch && !hasModelPatch && supportedEfforts.length > 0) {
+            return { ok: false, error: message };
+          }
+        }
+      }
     }
+
+    this.emitConfigOptionsSnapshot();
+    return { ok: true };
   }
 
   private findConfigOption(category: string, fallbackIds: string[]): AcpConfigOption | undefined {
@@ -492,32 +630,138 @@ export class AgyRuntime {
     sessionId: string,
     configId: string,
     value: string,
-  ): Promise<boolean> {
+  ): Promise<{ ok: boolean; error?: string }> {
     try {
       const result = await client.sessionSetConfigOption(sessionId, configId, value);
       const record = readObject(result);
       if (Array.isArray(record?.configOptions)) {
-        this.configOptions = record.configOptions as AcpConfigOption[];
-        this.syncCurrentModelFromConfigOptions(this.configOptions);
-      }
-      if (configId === 'model' && value.trim()) {
+        this.applyConfigOptionsUpdate(record.configOptions as AcpConfigOption[]);
+      } else if (configId === 'model' && value.trim()) {
         this.currentModel = value.trim();
+        this.callbacks.onConfigOptionsSynced?.({ model: this.currentModel });
+      } else if (
+        (configId === 'thought_level' || configId === 'effort' || configId === 'thinking_level')
+        && value.trim()
+      ) {
+        this.currentEffort = value.trim();
+        this.callbacks.onConfigOptionsSynced?.({ effort: this.currentEffort });
       }
-      return true;
-    } catch {
-      // Gracefully ignore unsupported config options without breaking the turn.
-      return false;
+      return { ok: true };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? '');
+      return { ok: false, error: message };
     }
   }
 
-  private syncCurrentModelFromConfigOptions(options: AcpConfigOption[]): void {
+  private applyConfigOptionsUpdate(incoming: AcpConfigOption[]): void {
+    if (incoming.length === 0) {
+      return;
+    }
+    if (this.configOptions.length === 0 || isFullConfigOptionsSnapshot(incoming)) {
+      this.configOptions = incoming;
+    } else {
+      const merged = this.configOptions.map((option) => ({ ...option }));
+      for (const patch of incoming) {
+        const patchId = getConfigOptionId(patch);
+        const index = merged.findIndex((existing) => (
+          (patch.category && existing.category === patch.category)
+          || (patchId && getConfigOptionId(existing) === patchId)
+        ));
+        if (index >= 0) {
+          merged[index] = {
+            ...merged[index],
+            ...patch,
+            options: Array.isArray(patch.options) ? patch.options : merged[index]!.options,
+          };
+        } else {
+          merged.push(patch);
+        }
+      }
+      this.configOptions = merged;
+    }
+    this.syncCurrentConfigFromOptions(this.configOptions);
+  }
+
+  private syncCurrentConfigFromOptions(options: AcpConfigOption[]): void {
     const modelOption = options.find(
       (option) => option.category === 'model' || getConfigOptionId(option) === 'model',
     );
-    const value = readString(modelOption?.currentValue);
-    if (value) {
-      this.currentModel = value;
+    const effortOption = options.find((option) => {
+      const id = getConfigOptionId(option);
+      return option.category === 'thought_level'
+        || id === 'thought_level'
+        || id === 'effort'
+        || id === 'thinking_level';
+    });
+
+    const synced: { model?: string | null; effort?: string | null } = {};
+    const modelValue = readString(modelOption?.currentValue);
+    if (modelValue) {
+      this.currentModel = modelValue;
+      synced.model = modelValue;
     }
+
+    const effortValue = readString(effortOption?.currentValue);
+    if (effortValue) {
+      this.currentEffort = effortValue;
+      synced.effort = effortValue;
+    } else if (
+      modelOption
+      && Array.isArray(modelOption.options)
+      && modelOption.options.length > 0
+      && !effortOption
+    ) {
+      // Full ACP config snapshot explicitly omitted thought_level -> model does not support effort.
+      this.currentEffort = null;
+      synced.effort = null;
+    }
+
+    if (synced.model !== undefined || synced.effort !== undefined) {
+      this.callbacks.onConfigOptionsSynced?.(synced);
+    }
+  }
+
+  private buildConfigOptionsSnapshot(): AgyConfigOptionsSnapshot | null {
+    if (this.configOptions.length === 0) {
+      return null;
+    }
+    const modelOption = this.findConfigOption('model', ['model']);
+    const effortOption = this.findConfigOption('thought_level', [
+      'thought_level',
+      'effort',
+      'thinking_level',
+    ]);
+    const models = normalizeConfigOptionChoices(modelOption?.options);
+    const efforts = normalizeConfigOptionChoices(effortOption?.options);
+    const currentModel = readString(modelOption?.currentValue) ?? this.currentModel ?? null;
+    const currentEffort = effortOption
+      ? (readString(effortOption.currentValue) ?? this.currentEffort ?? null)
+      : null;
+    const supportsEffort = efforts.length > 0;
+    return {
+      current_model: currentModel,
+      current_effort: supportsEffort ? currentEffort : null,
+      supports_effort: supportsEffort,
+      models,
+      efforts,
+    };
+  }
+
+  private emitConfigOptionsSnapshot(force = false): void {
+    const snapshot = this.buildConfigOptionsSnapshot();
+    if (!snapshot) {
+      return;
+    }
+    const key = JSON.stringify(snapshot);
+    if (!force && key === this.lastConfigOptionsKey) {
+      return;
+    }
+    this.lastConfigOptionsKey = key;
+    this.callbacks.emitEvent({
+      type: 'runtime_config_options_updated',
+      provider: 'agy',
+      ...snapshot,
+    });
   }
 
   private getCurrentModel(): string {
@@ -676,8 +920,8 @@ export class AgyRuntime {
 
     if (kind === 'config_option_update') {
       if (Array.isArray(update.configOptions)) {
-        this.configOptions = update.configOptions as AcpConfigOption[];
-        this.syncCurrentModelFromConfigOptions(this.configOptions);
+        this.applyConfigOptionsUpdate(update.configOptions as AcpConfigOption[]);
+        this.emitConfigOptionsSnapshot();
       }
       return;
     }

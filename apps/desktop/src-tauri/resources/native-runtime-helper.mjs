@@ -52284,8 +52284,64 @@ function selectAgyPermissionOutcome(approved, options) {
     }
   };
 }
+var AGY_EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"];
+function resolveSupportedAgyEffort(requested, supportedValues) {
+  const trimmed = requested.trim();
+  if (!trimmed || supportedValues.length === 0) {
+    return null;
+  }
+  if (supportedValues.includes(trimmed)) {
+    return trimmed;
+  }
+  const requestedIndex = AGY_EFFORT_ORDER.indexOf(trimmed);
+  if (requestedIndex >= 0) {
+    for (let i = requestedIndex - 1; i >= 0; i -= 1) {
+      const candidate = AGY_EFFORT_ORDER[i];
+      if (supportedValues.includes(candidate)) {
+        return candidate;
+      }
+    }
+    for (let i = requestedIndex + 1; i < AGY_EFFORT_ORDER.length; i += 1) {
+      const candidate = AGY_EFFORT_ORDER[i];
+      if (supportedValues.includes(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  return supportedValues[0] ?? null;
+}
 function getConfigOptionId(option) {
   return readString2(option.configId) ?? readString2(option.id);
+}
+function normalizeConfigOptionChoices(options) {
+  if (!Array.isArray(options)) {
+    return [];
+  }
+  const choices = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const item of options) {
+    const value = readString2(item?.value);
+    if (!value || seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+    const name = readString2(item?.name);
+    const description = readString2(item?.description);
+    choices.push({
+      value,
+      ...name ? { name } : {},
+      ...description ? { description } : {}
+    });
+  }
+  return choices;
+}
+function isFullConfigOptionsSnapshot(options) {
+  if (options.length > 1) {
+    return true;
+  }
+  return options.some(
+    (option) => Array.isArray(option.options) || Boolean(readString2(option.category))
+  );
 }
 var AgyRuntime = class {
   constructor(callbacks) {
@@ -52295,6 +52351,8 @@ var AgyRuntime = class {
   sessionId = null;
   configOptions = [];
   currentModel = null;
+  currentEffort = null;
+  lastConfigOptionsKey = null;
   lastContextUsageKey = null;
   pendingFallbackTurnUsage = null;
   activeOperation = null;
@@ -52322,6 +52380,8 @@ var AgyRuntime = class {
     const env = buildAgyProcessEnv(process5.env, config2.envVars);
     this.activeDangerouslySkipPermissions = normalizedPerm.dangerouslySkipPermissions;
     this.currentModel = readString2(config2.model) ?? null;
+    this.currentEffort = readString2(config2.effort) ?? null;
+    this.lastConfigOptionsKey = null;
     this.lastContextUsageKey = null;
     const client = new AgyAcpClient({
       agyPath,
@@ -52355,15 +52415,15 @@ var AgyRuntime = class {
       }
       this.sessionId = resolvedSessionId;
       if (Array.isArray(sessionResult.configOptions)) {
-        this.configOptions = sessionResult.configOptions;
-        this.syncCurrentModelFromConfigOptions(this.configOptions);
+        this.applyConfigOptionsUpdate(sessionResult.configOptions);
       }
       this.callbacks.emitSessionMeta(resolvedSessionId);
       await this.applySessionConfig(client, resolvedSessionId, {
         permMode: config2.permMode,
-        effort: config2.effort ?? void 0,
-        model: config2.model ?? void 0
-      });
+        model: config2.model ?? void 0,
+        effort: config2.effort ?? void 0
+      }, { live: false });
+      this.emitConfigOptionsSnapshot();
       return { client, sessionId: resolvedSessionId };
     } catch (error62) {
       await this.teardown();
@@ -52445,21 +52505,22 @@ var AgyRuntime = class {
   async applyLiveSettings(patch) {
     const config2 = this.callbacks.getInitConfig();
     if (!config2) {
-      return;
+      return { ok: true };
     }
     const nextPerm = normalizeAgyPermissionMode(config2.permMode);
     const needsRespawn = Boolean(patch.envVarsChanged) || this.client !== null && this.activeDangerouslySkipPermissions !== nextPerm.dangerouslySkipPermissions;
     if (needsRespawn) {
       await this.teardown();
-      return;
+      return { ok: true };
     }
     if (!this.client?.isAlive || !this.sessionId) {
-      return;
+      return { ok: true };
     }
-    await this.applySessionConfig(this.client, this.sessionId, {
+    return this.applySessionConfig(this.client, this.sessionId, {
       ...patch.permMode !== void 0 ? { permMode: patch.permMode } : {},
+      ...patch.model !== void 0 ? { model: patch.model } : {},
       ...patch.effort !== void 0 ? { effort: patch.effort } : {}
-    });
+    }, { live: true });
   }
   interruptTurn() {
     this.turnCancelled = true;
@@ -52475,6 +52536,8 @@ var AgyRuntime = class {
     this.sessionId = null;
     this.configOptions = [];
     this.currentModel = null;
+    this.currentEffort = null;
+    this.lastConfigOptionsKey = null;
     this.lastContextUsageKey = null;
     this.pendingFallbackTurnUsage = null;
     this.startedTools.clear();
@@ -52483,14 +52546,18 @@ var AgyRuntime = class {
       await client.close();
     }
   }
-  async applySessionConfig(client, sessionId, patch) {
-    if (patch.permMode !== void 0) {
+  async applySessionConfig(client, sessionId, patch, options) {
+    const hasPermPatch = patch.permMode !== void 0;
+    const hasModelPatch = Boolean(patch.model && patch.model.trim());
+    const hasEffortPatch = Boolean(patch.effort && patch.effort.trim());
+    if (hasPermPatch && patch.permMode !== void 0) {
       const normalized = normalizeAgyPermissionMode(patch.permMode);
       const modeOption = this.findConfigOption("mode", ["mode"]);
       let updatedViaConfig = false;
       if (modeOption) {
         const configId = getConfigOptionId(modeOption) ?? "mode";
-        updatedViaConfig = await this.trySetConfigOption(client, sessionId, configId, normalized.acpMode);
+        const outcome = await this.trySetConfigOption(client, sessionId, configId, normalized.acpMode);
+        updatedViaConfig = outcome.ok;
       }
       if (!updatedViaConfig) {
         try {
@@ -52499,20 +52566,61 @@ var AgyRuntime = class {
         }
       }
     }
-    if (patch.model !== void 0 && patch.model.trim()) {
+    if (hasModelPatch && patch.model) {
+      const requestedModel = patch.model.trim();
       const modelOption = this.findConfigOption("model", ["model"]);
       const configId = (modelOption ? getConfigOptionId(modelOption) : void 0) ?? "model";
-      await this.trySetConfigOption(client, sessionId, configId, patch.model.trim());
+      const outcome = await this.trySetConfigOption(client, sessionId, configId, requestedModel);
+      if (!outcome.ok) {
+        const message = outcome.error || `Antigravity rejected model "${requestedModel}".`;
+        this.callbacks.emitEvent({ type: "stderr_line", line: message });
+        this.emitConfigOptionsSnapshot(true);
+        if (options.live) {
+          return { ok: false, error: message };
+        }
+      }
     }
-    if (patch.effort !== void 0 && patch.effort.trim()) {
+    if (hasEffortPatch && patch.effort) {
+      const requestedEffort = patch.effort.trim();
+      const modelOption = this.findConfigOption("model", ["model"]);
       const effortOption = this.findConfigOption("thought_level", [
         "thought_level",
         "effort",
         "thinking_level"
       ]);
-      const configId = (effortOption ? getConfigOptionId(effortOption) : void 0) ?? "thought_level";
-      await this.trySetConfigOption(client, sessionId, configId, patch.effort.trim());
+      const hasFullCatalog = Boolean(modelOption && Array.isArray(modelOption.options) && modelOption.options.length > 0);
+      const supportedEfforts = normalizeConfigOptionChoices(effortOption?.options).map((choice) => choice.value);
+      if (hasFullCatalog && !effortOption) {
+        if (options.live && !hasModelPatch && !hasPermPatch) {
+          const message = `Thinking level is not supported for model "${this.currentModel ?? "current"}".`;
+          this.callbacks.emitEvent({ type: "stderr_line", line: message });
+          this.emitConfigOptionsSnapshot(true);
+          return { ok: false, error: message };
+        }
+      } else {
+        let targetEffort = requestedEffort;
+        if (supportedEfforts.length > 0 && !supportedEfforts.includes(requestedEffort)) {
+          if (!options.live || hasModelPatch) {
+            const clamped = resolveSupportedAgyEffort(requestedEffort, supportedEfforts);
+            if (clamped) {
+              targetEffort = clamped;
+            }
+          }
+        }
+        const configId = (effortOption ? getConfigOptionId(effortOption) : void 0) ?? "thought_level";
+        const outcome = await this.trySetConfigOption(client, sessionId, configId, targetEffort);
+        if (!outcome.ok) {
+          const message = outcome.error || `Antigravity rejected thinking level "${targetEffort}".`;
+          this.callbacks.emitEvent({ type: "stderr_line", line: message });
+          this.emitConfigOptionsSnapshot(true);
+          if (options.live && !hasPermPatch && !hasModelPatch && supportedEfforts.length > 0) {
+            return { ok: false, error: message };
+          }
+        }
+      }
     }
+    this.emitConfigOptionsSnapshot();
+    return { ok: true };
   }
   findConfigOption(category, fallbackIds) {
     const byCategory = this.configOptions.find((option) => option.category === category);
@@ -52529,25 +52637,109 @@ var AgyRuntime = class {
       const result = await client.sessionSetConfigOption(sessionId, configId, value);
       const record3 = readObject4(result);
       if (Array.isArray(record3?.configOptions)) {
-        this.configOptions = record3.configOptions;
-        this.syncCurrentModelFromConfigOptions(this.configOptions);
-      }
-      if (configId === "model" && value.trim()) {
+        this.applyConfigOptionsUpdate(record3.configOptions);
+      } else if (configId === "model" && value.trim()) {
         this.currentModel = value.trim();
+        this.callbacks.onConfigOptionsSynced?.({ model: this.currentModel });
+      } else if ((configId === "thought_level" || configId === "effort" || configId === "thinking_level") && value.trim()) {
+        this.currentEffort = value.trim();
+        this.callbacks.onConfigOptionsSynced?.({ effort: this.currentEffort });
       }
-      return true;
-    } catch {
-      return false;
+      return { ok: true };
+    } catch (error62) {
+      const message = error62 instanceof Error ? error62.message : String(error62 ?? "");
+      return { ok: false, error: message };
     }
   }
-  syncCurrentModelFromConfigOptions(options) {
+  applyConfigOptionsUpdate(incoming) {
+    if (incoming.length === 0) {
+      return;
+    }
+    if (this.configOptions.length === 0 || isFullConfigOptionsSnapshot(incoming)) {
+      this.configOptions = incoming;
+    } else {
+      const merged = this.configOptions.map((option) => ({ ...option }));
+      for (const patch of incoming) {
+        const patchId = getConfigOptionId(patch);
+        const index = merged.findIndex((existing) => patch.category && existing.category === patch.category || patchId && getConfigOptionId(existing) === patchId);
+        if (index >= 0) {
+          merged[index] = {
+            ...merged[index],
+            ...patch,
+            options: Array.isArray(patch.options) ? patch.options : merged[index].options
+          };
+        } else {
+          merged.push(patch);
+        }
+      }
+      this.configOptions = merged;
+    }
+    this.syncCurrentConfigFromOptions(this.configOptions);
+  }
+  syncCurrentConfigFromOptions(options) {
     const modelOption = options.find(
       (option) => option.category === "model" || getConfigOptionId(option) === "model"
     );
-    const value = readString2(modelOption?.currentValue);
-    if (value) {
-      this.currentModel = value;
+    const effortOption = options.find((option) => {
+      const id = getConfigOptionId(option);
+      return option.category === "thought_level" || id === "thought_level" || id === "effort" || id === "thinking_level";
+    });
+    const synced = {};
+    const modelValue = readString2(modelOption?.currentValue);
+    if (modelValue) {
+      this.currentModel = modelValue;
+      synced.model = modelValue;
     }
+    const effortValue = readString2(effortOption?.currentValue);
+    if (effortValue) {
+      this.currentEffort = effortValue;
+      synced.effort = effortValue;
+    } else if (modelOption && Array.isArray(modelOption.options) && modelOption.options.length > 0 && !effortOption) {
+      this.currentEffort = null;
+      synced.effort = null;
+    }
+    if (synced.model !== void 0 || synced.effort !== void 0) {
+      this.callbacks.onConfigOptionsSynced?.(synced);
+    }
+  }
+  buildConfigOptionsSnapshot() {
+    if (this.configOptions.length === 0) {
+      return null;
+    }
+    const modelOption = this.findConfigOption("model", ["model"]);
+    const effortOption = this.findConfigOption("thought_level", [
+      "thought_level",
+      "effort",
+      "thinking_level"
+    ]);
+    const models = normalizeConfigOptionChoices(modelOption?.options);
+    const efforts = normalizeConfigOptionChoices(effortOption?.options);
+    const currentModel = readString2(modelOption?.currentValue) ?? this.currentModel ?? null;
+    const currentEffort = effortOption ? readString2(effortOption.currentValue) ?? this.currentEffort ?? null : null;
+    const supportsEffort = efforts.length > 0;
+    return {
+      current_model: currentModel,
+      current_effort: supportsEffort ? currentEffort : null,
+      supports_effort: supportsEffort,
+      models,
+      efforts
+    };
+  }
+  emitConfigOptionsSnapshot(force = false) {
+    const snapshot = this.buildConfigOptionsSnapshot();
+    if (!snapshot) {
+      return;
+    }
+    const key = JSON.stringify(snapshot);
+    if (!force && key === this.lastConfigOptionsKey) {
+      return;
+    }
+    this.lastConfigOptionsKey = key;
+    this.callbacks.emitEvent({
+      type: "runtime_config_options_updated",
+      provider: "agy",
+      ...snapshot
+    });
   }
   getCurrentModel() {
     return this.currentModel ?? readString2(this.callbacks.getInitConfig()?.model) ?? "agy";
@@ -52683,8 +52875,8 @@ var AgyRuntime = class {
     }
     if (kind === "config_option_update") {
       if (Array.isArray(update.configOptions)) {
-        this.configOptions = update.configOptions;
-        this.syncCurrentModelFromConfigOptions(this.configOptions);
+        this.applyConfigOptionsUpdate(update.configOptions);
+        this.emitConfigOptionsSnapshot();
       }
       return;
     }
@@ -52909,7 +53101,18 @@ var agyRuntime = new AgyRuntime({
     envVars: initCommand.env_vars,
     model: initCommand.model,
     effort: initCommand.effort
-  } : null
+  } : null,
+  onConfigOptionsSynced: ({ model, effort }) => {
+    if (!initCommand || initCommand.provider !== "agy") {
+      return;
+    }
+    if (model !== void 0) {
+      initCommand.model = model ?? void 0;
+    }
+    if (effort !== void 0) {
+      initCommand.effort = effort ?? void 0;
+    }
+  }
 });
 var browserToolBridge = createBrowserToolBridge(
   (request) => emit(request),
@@ -54707,6 +54910,7 @@ function applySettingsToInitCommand(settings) {
   if (settings.envVars !== void 0) initCommand.env_vars = settings.envVars;
   if (settings.envName !== void 0) initCommand.env_name = settings.envName;
   if (settings.effort !== void 0) initCommand.effort = settings.effort || void 0;
+  if (settings.model !== void 0) initCommand.model = settings.model || void 0;
   return true;
 }
 function applyPendingSettingsToInitCommand() {
@@ -54726,7 +54930,8 @@ function applySettingsCommand(command) {
     permMode: command.perm_mode,
     permissionScope: command.permission_scope,
     envVars: command.env_vars,
-    effort: command.effort
+    effort: command.effort,
+    model: command.model
   };
   const applied = applySettingsToInitCommand(settings);
   if (applied && initCommand?.provider === "claude") {
@@ -54760,6 +54965,7 @@ function queuePendingSettings(command) {
     ...command.permission_scope !== void 0 ? { permissionScope: command.permission_scope } : {},
     ...command.env_vars !== void 0 ? { envVars: command.env_vars } : {},
     ...command.effort !== void 0 ? { effort: command.effort } : {},
+    ...command.model !== void 0 ? { model: command.model } : {},
     ...command.force_restart !== void 0 ? { forceRestart: command.force_restart } : {}
   };
   if (initCommand?.provider === "claude") {
@@ -54767,7 +54973,7 @@ function queuePendingSettings(command) {
   }
 }
 function isClaudePermissionOnlySettingsCommand(command) {
-  return command.perm_mode !== void 0 && command.env_name === void 0 && command.env_vars === void 0 && command.effort === void 0;
+  return command.perm_mode !== void 0 && command.env_name === void 0 && command.env_vars === void 0 && command.effort === void 0 && command.model === void 0;
 }
 function isValidSettingsUpdateRequestId(value) {
   return typeof value === "string" && value.length > 0 && value.length <= 96 && /^[A-Za-z0-9_-]+$/.test(value);
@@ -56246,6 +56452,7 @@ async function runQueuedTurns() {
       if (isAgy) {
         await agyRuntime.applyLiveSettings({
           permMode: patch.permMode,
+          model: patch.model,
           effort: patch.effort,
           envVarsChanged: hadEnvVars
         });
@@ -56769,15 +56976,33 @@ async function handleCommand(command) {
         return;
       }
       if (canApplySettingsImmediately()) {
+        const previousModel = initCommand.model;
+        const previousEffort = initCommand.effort;
         applySettingsCommand(command);
         if (initCommand.provider === "codex") {
           teardownCodexSession(command.env_vars !== void 0 || command.effort !== void 0);
         } else if (initCommand.provider === "agy") {
-          await agyRuntime.applyLiveSettings({
+          const outcome = await agyRuntime.applyLiveSettings({
             permMode: command.perm_mode,
+            model: command.model,
             effort: command.effort,
             envVarsChanged: command.env_vars !== void 0
           });
+          if (!outcome.ok) {
+            if (command.model !== void 0 && initCommand.model === command.model) {
+              initCommand.model = previousModel;
+            }
+            if (command.effort !== void 0 && initCommand.effort === command.effort) {
+              initCommand.effort = previousEffort;
+            }
+            emitStatus("ready", "Settings update rejected.");
+            emitSettingsUpdateResult(
+              command.request_id,
+              "failed",
+              outcome.error ?? "Antigravity rejected the settings update."
+            );
+            return;
+          }
         }
         emitStatus("ready", "Settings applied.");
         emitSettingsUpdateResult(command.request_id, "applied");

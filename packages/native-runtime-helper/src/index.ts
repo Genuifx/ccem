@@ -143,6 +143,7 @@ type UpdateSettingsCommand = {
   permission_scope?: 'display' | 'runtime';
   env_vars?: Record<string, string>;
   effort?: string;
+  model?: string;
   force_restart?: boolean;
 };
 
@@ -177,6 +178,7 @@ type RuntimeSettingsPatch = {
   permissionScope?: 'display' | 'runtime';
   envVars?: Record<string, string>;
   effort?: string;
+  model?: string;
   forceRestart?: boolean;
 };
 
@@ -431,6 +433,17 @@ const agyRuntime = new AgyRuntime({
         effort: initCommand.effort,
       }
     : null),
+  onConfigOptionsSynced: ({ model, effort }) => {
+    if (!initCommand || initCommand.provider !== 'agy') {
+      return;
+    }
+    if (model !== undefined) {
+      initCommand.model = model ?? undefined;
+    }
+    if (effort !== undefined) {
+      initCommand.effort = effort ?? undefined;
+    }
+  },
 });
 const browserToolBridge = createBrowserToolBridge(
   (request) => emit(request),
@@ -2897,6 +2910,7 @@ function applySettingsToInitCommand(settings: RuntimeSettingsPatch) {
   if (settings.envVars !== undefined) initCommand.env_vars = settings.envVars;
   if (settings.envName !== undefined) initCommand.env_name = settings.envName;
   if (settings.effort !== undefined) initCommand.effort = settings.effort || undefined;
+  if (settings.model !== undefined) initCommand.model = settings.model || undefined;
   return true;
 }
 
@@ -2919,6 +2933,7 @@ function applySettingsCommand(command: UpdateSettingsCommand) {
     permissionScope: command.permission_scope,
     envVars: command.env_vars,
     effort: command.effort,
+    model: command.model,
   };
   const applied = applySettingsToInitCommand(settings);
   if (applied && initCommand?.provider === 'claude') {
@@ -2960,6 +2975,7 @@ function queuePendingSettings(command: UpdateSettingsCommand) {
       : {}),
     ...(command.env_vars !== undefined ? { envVars: command.env_vars } : {}),
     ...(command.effort !== undefined ? { effort: command.effort } : {}),
+    ...(command.model !== undefined ? { model: command.model } : {}),
     ...(command.force_restart !== undefined ? { forceRestart: command.force_restart } : {}),
   };
   if (initCommand?.provider === 'claude') {
@@ -2971,7 +2987,8 @@ function isClaudePermissionOnlySettingsCommand(command: UpdateSettingsCommand) {
   return command.perm_mode !== undefined
     && command.env_name === undefined
     && command.env_vars === undefined
-    && command.effort === undefined;
+    && command.effort === undefined
+    && command.model === undefined;
 }
 
 function isValidSettingsUpdateRequestId(value: unknown): value is string {
@@ -4773,6 +4790,7 @@ async function runQueuedTurns() {
       if (isAgy) {
         await agyRuntime.applyLiveSettings({
           permMode: patch.permMode,
+          model: patch.model,
           effort: patch.effort,
           envVarsChanged: hadEnvVars,
         });
@@ -5392,15 +5410,34 @@ async function handleCommand(command: InputCommand) {
       }
 
       if (canApplySettingsImmediately()) {
+        const previousModel = initCommand.model;
+        const previousEffort = initCommand.effort;
         applySettingsCommand(command);
         if (initCommand.provider === 'codex') {
           teardownCodexSession(command.env_vars !== undefined || command.effort !== undefined);
         } else if (initCommand.provider === 'agy') {
-          await agyRuntime.applyLiveSettings({
+          const outcome = await agyRuntime.applyLiveSettings({
             permMode: command.perm_mode,
+            model: command.model,
             effort: command.effort,
             envVarsChanged: command.env_vars !== undefined,
           });
+          if (!outcome.ok) {
+            // Keep initCommand aligned with ACP's authoritative state if rejected.
+            if (command.model !== undefined && initCommand.model === command.model) {
+              initCommand.model = previousModel;
+            }
+            if (command.effort !== undefined && initCommand.effort === command.effort) {
+              initCommand.effort = previousEffort;
+            }
+            emitStatus('ready', 'Settings update rejected.');
+            emitSettingsUpdateResult(
+              command.request_id,
+              'failed',
+              outcome.error ?? 'Antigravity rejected the settings update.',
+            );
+            return;
+          }
         }
         emitStatus('ready', 'Settings applied.');
         emitSettingsUpdateResult(command.request_id, 'applied');
