@@ -11,6 +11,12 @@ import type {
   HistorySessionItem,
 } from '@/features/conversations/types';
 import { ComposerControls, type EffortLevel } from './ComposerControls';
+import {
+  parseAgyTranscriptModel,
+  resolveAgyEffortLevels,
+  type AgyModelCatalogItem,
+} from '@/lib/agy-runtime';
+import { clampEffortToSupportedLevels } from './workspaceSessionPreferences';
 import type { ComposerSubmitPayload } from './composerAttachments';
 import { WorkspaceSessionComposer } from './WorkspaceSessionComposer';
 import type { ComposerSubmitResult } from './composerSubmissionResult';
@@ -23,12 +29,16 @@ export interface SplitHistoryResumeControls {
   envName: string;
   permMode: PermissionModeName;
   effort: EffortLevel;
+  model?: string | null;
 }
 
 interface WorkspaceSplitHistoryPaneProps {
   session: HistorySessionItem;
   /** Same env/permission/effort the single history view would start with. */
   initialControls: SplitHistoryResumeControls;
+  agyModels?: AgyModelCatalogItem[];
+  agyModelsLoading?: boolean;
+  onRefreshAgyModels?: () => void;
   /** Resume the provider session into a live runtime that takes this pane over. */
   onResume: (
     payload: ComposerSubmitPayload,
@@ -44,6 +54,9 @@ interface WorkspaceSplitHistoryPaneProps {
 export const WorkspaceSplitHistoryPane = memo(function WorkspaceSplitHistoryPane({
   session,
   initialControls,
+  agyModels,
+  agyModelsLoading,
+  onRefreshAgyModels,
   onResume,
 }: WorkspaceSplitHistoryPaneProps) {
   const { t } = useLocale();
@@ -60,6 +73,7 @@ export const WorkspaceSplitHistoryPane = memo(function WorkspaceSplitHistoryPane
   const [envName, setEnvName] = useState(initialControls.envName);
   const [permMode, setPermMode] = useState<PermissionModeName>(initialControls.permMode);
   const [effort, setEffort] = useState<EffortLevel>(initialControls.effort);
+  const [model, setModel] = useState<string | null>(initialControls.model ?? null);
   const provider = session.source === 'codex' ? 'codex' : session.source === 'agy' ? 'agy' : 'claude';
 
   useEffect(() => {
@@ -70,6 +84,19 @@ export const WorkspaceSplitHistoryPane = memo(function WorkspaceSplitHistoryPane
         if (cancelled) return;
         setMessages(detail.messages);
         setSegments(detail.segments);
+        if (session.source === 'agy') {
+          const lastModelMsg = [...detail.messages].reverse().find((m) => m.model?.trim());
+          const parsed = parseAgyTranscriptModel(lastModelMsg?.model, agyModels);
+          if (parsed) {
+            setModel((previous) => previous ?? parsed.model);
+            if (parsed.effort) {
+              const supported = resolveAgyEffortLevels(parsed.model, agyModels ?? []) as EffortLevel[];
+              if (supported.length > 0) {
+                setEffort(clampEffortToSupportedLevels(parsed.effort, supported));
+              }
+            }
+          }
+        }
       })
       .catch((error) => console.error('Failed to load split pane transcript:', error))
       .finally(() => {
@@ -78,16 +105,35 @@ export const WorkspaceSplitHistoryPane = memo(function WorkspaceSplitHistoryPane
     return () => {
       cancelled = true;
     };
-  }, [session]);
+  }, [agyModels, session]);
+
+  const handleModelChange = useCallback((nextModel: string) => {
+    setModel(nextModel);
+    const supported = resolveAgyEffortLevels(nextModel, agyModels ?? []) as EffortLevel[];
+    if (supported.length > 0) {
+      setEffort((previous) => clampEffortToSupportedLevels(previous, supported));
+    }
+  }, [agyModels]);
 
   const handleSubmit = useCallback(async (payload: ComposerSubmitPayload) => {
     setIsResuming(true);
     try {
-      return await onResume(payload, { envName, permMode, effort }, messages);
+      const effectiveModel = provider === 'agy' ? (model ?? agyModels?.[0]?.id ?? null) : null;
+      const supportedEfforts = provider === 'agy'
+        ? (resolveAgyEffortLevels(effectiveModel, agyModels ?? []) as EffortLevel[])
+        : null;
+      const effectiveEffort = supportedEfforts && supportedEfforts.length > 0
+        ? clampEffortToSupportedLevels(effort, supportedEfforts)
+        : effort;
+      return await onResume(
+        payload,
+        { envName, permMode, effort: effectiveEffort, model: effectiveModel },
+        messages,
+      );
     } finally {
       setIsResuming(false);
     }
-  }, [effort, envName, messages, onResume, permMode]);
+  }, [agyModels, effort, envName, messages, model, onResume, permMode, provider]);
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -120,11 +166,16 @@ export const WorkspaceSplitHistoryPane = memo(function WorkspaceSplitHistoryPane
             envName={envName}
             permMode={permMode}
             effort={effort}
+            model={model}
+            agyModels={agyModels}
+            agyModelsLoading={agyModelsLoading}
             environments={environments}
             enabledEnvironments={enabledEnvironments}
             onEnvChange={setEnvName}
             onPermModeChange={setPermMode}
             onEffortChange={setEffort}
+            onModelChange={handleModelChange}
+            onRefreshAgyModels={onRefreshAgyModels}
           />
         )}
       />

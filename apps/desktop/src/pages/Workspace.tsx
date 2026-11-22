@@ -85,8 +85,14 @@ import { nativeCreateFailure, type ComposerSubmitResult } from '@/components/wor
 import { ClaudeRuntimeRequiredDialog } from '@/components/ClaudeRuntimeSettings';
 import { AgyAuthRequiredDialog } from '@/components/AgyRuntimeCard';
 import { isClaudeRuntimeRequiredError } from '@/lib/claude-runtime';
-import { checkAgyInstalled, isAgyAuthRequiredError } from '@/lib/agy-runtime';
+import {
+  checkAgyInstalled,
+  isAgyAuthRequiredError,
+  parseAgyTranscriptModel,
+  resolveAgyEffortLevels,
+} from '@/lib/agy-runtime';
 import { AGY_RUNTIME_CHANGED_EVENT } from '@/hooks/useAgyRuntime';
+import { useAgyModels } from '@/hooks/useAgyModels';
 import {
   buildComposerPromptPreview,
   buildComposerPromptText,
@@ -235,6 +241,7 @@ import {
   buildWorkspaceReviewSummary,
 } from '@/components/workspace/workspaceReview';
 import {
+  clampEffortToSupportedLevels,
   normalizeEffortForProvider,
   resolveHistorySessionControls,
   updateHistorySessionPreference,
@@ -570,6 +577,23 @@ export function Workspace({
   const [codexInstalled, setCodexInstalled] = useState(false);
   const [agyInstalled, setAgyInstalled] = useState(false);
   const [opencodeInstalled, setOpenCodeInstalled] = useState(false);
+  const {
+    models: agyModels,
+    defaultModel: agyDefaultModel,
+    loading: agyModelsLoading,
+    refresh: refreshAgyModels,
+  } = useAgyModels(agyInstalled);
+  const handleRefreshAgyModels = useCallback(() => {
+    void refreshAgyModels(true);
+  }, [refreshAgyModels]);
+  const [composeAgyModel, setComposeAgyModel] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem('ccem:workspace:agyModel')?.trim() || null;
+    } catch {
+      return null;
+    }
+  });
+  const [historyModel, setHistoryModel] = useState<string | null>(null);
   const [agyAuthRequired, setAgyAuthRequired] = useState(false);
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceViewMode>('compose');
   const [composeProvider, setComposeProvider] = useState<NativeProvider>(
@@ -1800,14 +1824,30 @@ export function Workspace({
     userSidePanel.open(lastTab && lastTab !== 'browser' ? lastTab : changeCount > 0 ? 'changes' : 'browse');
   }, [sidePanelOpen, closeSidePanel, sidePanel.lastTab, activeBrowserSessionId, selectActiveBrowser, userSidePanel.open]);
 
+  const effectiveComposeAgyModel = useMemo(() => {
+    if (composeAgyModel && (agyModels.length === 0 || agyModels.some((item) => item.id === composeAgyModel))) {
+      return composeAgyModel;
+    }
+    return agyDefaultModel ?? agyModels[0]?.id ?? composeAgyModel ?? null;
+  }, [agyDefaultModel, agyModels, composeAgyModel]);
+
   useEffect(() => {
-    setComposeEffort((previous) => normalizeEffortForProvider(previous, composeProvider));
+    if (composeProvider === 'agy') {
+      const supported = resolveAgyEffortLevels(effectiveComposeAgyModel, agyModels) as EffortLevel[];
+      setComposeEffort((previous) => (
+        supported.length > 0
+          ? clampEffortToSupportedLevels(previous, supported)
+          : normalizeEffortForProvider(previous, 'agy')
+      ));
+    } else {
+      setComposeEffort((previous) => normalizeEffortForProvider(previous, composeProvider));
+    }
     // Providers without env routing show no draft UI and must not carry a
     // stale opt-in into the next create call.
     if (composeProvider !== 'claude') {
       updateComposeRouteDraftState(createComposerRouteDraft());
     }
-  }, [composeProvider]);
+  }, [agyModels, composeProvider, effectiveComposeAgyModel]);
 
   useEffect(() => {
     if (!selectedSession) {
@@ -1819,6 +1859,7 @@ export function Workspace({
       preferences: historySessionPreferences,
       currentEnv,
       defaultPermMode: permissionMode,
+      defaultModel: selectedSession.source === 'agy' ? effectiveComposeAgyModel : undefined,
     });
 
     resetHistoryComposerText(readRecoveryDraft(
@@ -1828,8 +1869,41 @@ export function Workspace({
     setHistoryPlanModeEnabled(false);
     setHistoryEnv(controls.envName);
     setHistoryPermMode(controls.permMode);
-    setHistoryEffort(controls.effort);
+    setHistoryModel(controls.model ?? null);
+    if (selectedSession.source === 'agy') {
+      const supported = resolveAgyEffortLevels(controls.model ?? null, agyModels) as EffortLevel[];
+      setHistoryEffort(
+        supported.length > 0
+          ? clampEffortToSupportedLevels(controls.effort, supported)
+          : controls.effort,
+      );
+    } else {
+      setHistoryEffort(controls.effort);
+    }
   }, [resetHistoryComposerText, selectedKey]);
+
+  useEffect(() => {
+    if (!selectedSession || selectedSession.source !== 'agy' || messages.length === 0) {
+      return;
+    }
+    const key = selectedKeyRef.current;
+    const saved = key ? historySessionPreferences[key] : undefined;
+    if (saved?.model) {
+      return;
+    }
+    const lastModelMsg = [...messages].reverse().find((message) => message.model?.trim());
+    const parsed = parseAgyTranscriptModel(lastModelMsg?.model, agyModels);
+    if (!parsed) {
+      return;
+    }
+    setHistoryModel(parsed.model);
+    if (!saved?.effort && parsed.effort) {
+      const supported = resolveAgyEffortLevels(parsed.model, agyModels) as EffortLevel[];
+      if (supported.length > 0) {
+        setHistoryEffort(clampEffortToSupportedLevels(parsed.effort, supported));
+      }
+    }
+  }, [agyModels, historySessionPreferences, messages, selectedSession]);
 
   const environmentByName = useMemo(
     () => Object.fromEntries(environments.map((environment) => [environment.name, environment])),
@@ -2753,6 +2827,7 @@ export function Workspace({
       envName: string;
       permMode: string;
       effort: string | null;
+      model?: string | null;
       workingDir: string;
       codexIsolated: boolean;
       resumeRouterFromRuntimeId: string | null;
@@ -2798,7 +2873,16 @@ export function Workspace({
             initialAnnotations: payload.annotations,
             providerSessionId: target.providerSessionId,
             codexIsolated,
-            effort: normalizeEffortForProvider(target.effort, provider),
+            model: provider === 'agy' ? (target.model ?? null) : null,
+            effort: (() => {
+              if (provider !== 'agy') {
+                return normalizeEffortForProvider(target.effort, provider);
+              }
+              const supported = resolveAgyEffortLevels(target.model ?? null, agyModels) as EffortLevel[];
+              return supported.length > 0
+                ? clampEffortToSupportedLevels(target.effort, supported)
+                : null;
+            })(),
             seedBoundaryMessageCount: target.seedMessages.length,
             routerLaunchDraft: null,
             resumeRouterFromRuntimeId: target.resumeRouterFromRuntimeId,
@@ -2839,6 +2923,7 @@ export function Workspace({
       return createAttempted ? failure.result : false;
     }
   }, [
+    agyModels,
     buildComposerPromptPreview,
     buildComposerPromptText,
     createNativeSession,
@@ -2874,6 +2959,7 @@ export function Workspace({
       envName: ended.env_name,
       permMode: ended.perm_mode,
       effort: ended.effort ?? null,
+      model: ended.model ?? null,
       workingDir: ended.project_dir,
       codexIsolated: ended.codex_isolated ?? false,
       resumeRouterFromRuntimeId: ended.provider === 'claude'
@@ -2899,6 +2985,7 @@ export function Workspace({
       envName: controls.envName,
       permMode: controls.permMode,
       effort: controls.effort,
+      model: controls.model ?? null,
       workingDir: session.project,
       codexIsolated: session.codexIsolated ?? false,
       resumeRouterFromRuntimeId: null,
@@ -3267,11 +3354,40 @@ export function Workspace({
     saveSelectedHistoryPreference({ permMode: mode });
   }, [saveSelectedHistoryPreference]);
 
+  const handleComposeAgyModelChange = useCallback((nextModel: string) => {
+    const trimmed = nextModel.trim();
+    if (!trimmed) return;
+    setComposeAgyModel(trimmed);
+    try {
+      localStorage.setItem('ccem:workspace:agyModel', trimmed);
+    } catch {
+      // Best-effort preference persistence.
+    }
+    const supported = resolveAgyEffortLevels(trimmed, agyModels) as EffortLevel[];
+    if (supported.length > 0) {
+      setComposeEffort((previous) => clampEffortToSupportedLevels(previous, supported));
+    }
+  }, [agyModels]);
+
   const handleHistoryEffortChange = useCallback((effort: EffortLevel) => {
     const nextEffort = normalizeEffortForProvider(effort, selectedSession?.source);
     setHistoryEffort(nextEffort);
     saveSelectedHistoryPreference({ effort: nextEffort });
   }, [saveSelectedHistoryPreference, selectedSession?.source]);
+
+  const handleHistoryModelChange = useCallback((nextModel: string) => {
+    const trimmed = nextModel.trim();
+    if (!trimmed) return;
+    setHistoryModel(trimmed);
+    const supported = resolveAgyEffortLevels(trimmed, agyModels) as EffortLevel[];
+    if (supported.length > 0) {
+      const clamped = clampEffortToSupportedLevels(historyEffort, supported);
+      setHistoryEffort(clamped);
+      saveSelectedHistoryPreference({ model: trimmed, effort: clamped });
+    } else {
+      saveSelectedHistoryPreference({ model: trimmed });
+    }
+  }, [agyModels, historyEffort, saveSelectedHistoryPreference]);
 
   const handleCreateForProject = useCallback((projectPath: string) => {
     openComposer(composeProvider, projectPath);
@@ -3417,7 +3533,16 @@ export function Workspace({
             initialDisplayPrompt: previewPrompt,
             initialImages: images.length > 0 ? images : undefined,
             initialAnnotations: payload?.annotations,
-            effort: normalizeEffortForProvider(composeEffort, composeProvider),
+            model: composeProvider === 'agy' ? effectiveComposeAgyModel : null,
+            effort: (() => {
+              if (composeProvider !== 'agy') {
+                return normalizeEffortForProvider(composeEffort, composeProvider);
+              }
+              const supported = resolveAgyEffortLevels(effectiveComposeAgyModel, agyModels) as EffortLevel[];
+              return supported.length > 0
+                ? clampEffortToSupportedLevels(composeEffort, supported)
+                : null;
+            })(),
             seedBoundaryMessageCount: 0,
             routerLaunchDraft,
             codexMigrationProofToken,
@@ -3496,6 +3621,8 @@ export function Workspace({
     composeEffort,
     composeProvider,
     composePlanModeEnabled,
+    agyModels,
+    effectiveComposeAgyModel,
     createNativeSession,
     currentEnv,
     effectiveComposeDir,
@@ -3654,7 +3781,17 @@ export function Workspace({
             initialAnnotations: payload?.annotations,
             providerSessionId: selectedSession.id,
             codexIsolated: provider === 'codex' ? selectedSession.codexIsolated ?? false : null,
-            effort: normalizeEffortForProvider(historyEffort, provider),
+            model: provider === 'agy' ? (historyModel ?? effectiveComposeAgyModel) : null,
+            effort: (() => {
+              if (provider !== 'agy') {
+                return normalizeEffortForProvider(historyEffort, provider);
+              }
+              const targetModel = historyModel ?? effectiveComposeAgyModel;
+              const supported = resolveAgyEffortLevels(targetModel, agyModels) as EffortLevel[];
+              return supported.length > 0
+                ? clampEffortToSupportedLevels(historyEffort, supported)
+                : null;
+            })(),
             seedBoundaryMessageCount: messages.length,
             routerLaunchDraft,
             resumeRouterFromRuntimeId,
@@ -3715,6 +3852,9 @@ export function Workspace({
     historyPermMode,
     historyPlanModeEnabled,
     historyEffort,
+    historyModel,
+    agyModels,
+    effectiveComposeAgyModel,
     isResumingHistorySession,
     launchOpenCodeWeb,
     messages,
@@ -4256,11 +4396,16 @@ export function Workspace({
               envName={currentEnv}
               permMode={permissionMode}
               effort={composeEffort}
+              model={composeProvider === 'agy' ? effectiveComposeAgyModel : null}
+              agyModels={agyModels}
+              agyModelsLoading={agyModelsLoading}
               environments={environments}
               enabledEnvironments={enabledEnvironments}
               onEnvChange={(value) => void switchEnvironment(value)}
               onPermModeChange={setPermissionMode}
               onEffortChange={setComposeEffort}
+              onModelChange={handleComposeAgyModelChange}
+              onRefreshAgyModels={handleRefreshAgyModels}
             />
           )}
         />
@@ -4369,12 +4514,17 @@ export function Workspace({
               envName={historyEnv}
               permMode={historyPermMode}
               effort={historyEffort}
+              model={historyProvider === 'agy' ? (historyModel ?? effectiveComposeAgyModel) : null}
+              agyModels={agyModels}
+              agyModelsLoading={agyModelsLoading}
               environments={environments}
               enabledEnvironments={enabledEnvironments}
               environmentLocked={Boolean(historyRouteDraft.restoredSource)}
               onEnvChange={handleHistoryEnvChange}
               onPermModeChange={handleHistoryPermModeChange}
               onEffortChange={handleHistoryEffortChange}
+              onModelChange={handleHistoryModelChange}
+              onRefreshAgyModels={handleRefreshAgyModels}
             />
           )}
           secondaryActions={(
@@ -4777,6 +4927,9 @@ export function Workspace({
                           codexInstalled={codexInstalled}
                           agyInstalled={agyInstalled}
                           opencodeInstalled={opencodeInstalled}
+                          agyModels={agyModels}
+                          agyModelsLoading={agyModelsLoading}
+                          onRefreshAgyModels={handleRefreshAgyModels}
                           onLaunchNewSession={handleNewSession}
                           onForkTurnRequest={openForkTurn}
                           startedNextStepChildKeys={startedNextStepChildKeys}
@@ -4817,6 +4970,9 @@ export function Workspace({
                           <WorkspaceSplitHistoryPane
                             session={historySession}
                             initialControls={splitHistoryPaneControls[paneId]}
+                            agyModels={agyModels}
+                            agyModelsLoading={agyModelsLoading}
+                            onRefreshAgyModels={handleRefreshAgyModels}
                             onResume={resumeHistoryPaneHandlers[paneId]}
                           />
                         </div>

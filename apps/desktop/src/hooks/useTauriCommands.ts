@@ -987,6 +987,7 @@ export function useTauriCommands() {
     initialAnnotations?: SessionPromptAnnotation[];
     providerSessionId?: string | null;
     effort?: string | null;
+    model?: string | null;
     seedBoundaryMessageCount?: number | null;
     /** Claude only: fork the parent transcript up to and including this message uuid. */
     forkFromMessageId?: string | null;
@@ -1013,6 +1014,7 @@ export function useTauriCommands() {
       initialAnnotations: options.initialAnnotations?.length ? options.initialAnnotations : null,
       providerSessionId: options.providerSessionId ?? null,
       effort: options.effort ?? null,
+      model: options.model ?? null,
       seedBoundaryMessageCount: options.seedBoundaryMessageCount ?? null,
       forkFromMessageId: options.forkFromMessageId ?? null,
       routerLaunchDraft: options.routerLaunchDraft ?? null,
@@ -1185,12 +1187,14 @@ export function useTauriCommands() {
     permMode?: string | null,
     effort?: string | null,
     forceRestart = false,
+    model?: string | null,
   ): Promise<void> => {
     await invoke('update_native_session_settings', {
       runtimeId,
       envName: envName ?? null,
       permMode: permMode ?? null,
       effort: effort ?? null,
+      model: model ?? null,
       forceRestart,
     });
   }, []);

@@ -71,13 +71,41 @@ test('keeps history composer permission and effort per selected session', async 
   });
 });
 
-test('normalizes unsupported effort levels for the selected provider', async () => {
-  const { normalizeEffortForProvider } = await importWorkspaceSessionPreferences();
+test('normalizes unsupported effort levels for the selected provider and clamps to per-model efforts', async () => {
+  const {
+    normalizeEffortForProvider,
+    clampEffortToSupportedLevels,
+    updateHistorySessionPreference,
+    resolveHistorySessionControls,
+  } = await importWorkspaceSessionPreferences();
 
   assert.equal(normalizeEffortForProvider('max', 'codex'), 'high');
   assert.equal(normalizeEffortForProvider('max', 'claude'), 'max');
   assert.equal(normalizeEffortForProvider(null, 'claude'), 'max');
   assert.equal(normalizeEffortForProvider(null, 'agy'), 'high');
   assert.equal(normalizeEffortForProvider('minimal', 'agy'), 'high');
-  assert.equal(normalizeEffortForProvider('max', 'agy'), 'max');
+  assert.equal(normalizeEffortForProvider('max', 'agy'), 'xhigh');
+  assert.equal(normalizeEffortForProvider('xhigh', 'agy'), 'xhigh');
+
+  assert.equal(clampEffortToSupportedLevels('xhigh', ['low', 'medium', 'high']), 'high');
+  assert.equal(clampEffortToSupportedLevels('max', ['low', 'medium', 'high', 'xhigh']), 'xhigh');
+  assert.equal(clampEffortToSupportedLevels('minimal', ['low', 'medium', 'high']), 'low');
+  assert.equal(clampEffortToSupportedLevels('medium', ['low', 'medium', 'high']), 'medium');
+
+  const prefs = updateHistorySessionPreference({}, 'agy:conv-1', {
+    model: 'claude-opus-5-5',
+    effort: 'high',
+  });
+  assert.deepEqual(resolveHistorySessionControls({
+    session: { id: 'conv-1', source: 'agy', envName: 'Antigravity' },
+    preferences: prefs,
+    currentEnv: 'Default',
+    defaultPermMode: 'dev',
+    defaultModel: 'gemini-4-neon',
+  }), {
+    envName: 'Antigravity',
+    permMode: 'dev',
+    effort: 'high',
+    model: 'claude-opus-5-5',
+  });
 });

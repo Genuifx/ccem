@@ -122,7 +122,15 @@ import {
   partitionNativeQueuedPromptPresentation,
   reconcileNativeQueuedPrompts,
 } from './workspaceNativeQueueProjection';
-import { normalizeEffortForProvider } from './workspaceSessionPreferences';
+import {
+  clampEffortToSupportedLevels,
+  normalizeEffortForProvider,
+} from './workspaceSessionPreferences';
+import {
+  resolveAgyEffortLevels,
+  resolveAgyModelsForControl,
+  type AgyModelCatalogItem,
+} from '@/lib/agy-runtime';
 import { resolveWorkspaceRuntimePlanMode } from './workspaceRuntimePlanMode';
 import {
   deriveNativeFileCheckpoints,
@@ -324,6 +332,9 @@ interface WorkspaceNativeSessionViewProps {
   codexInstalled?: boolean;
   agyInstalled?: boolean;
   opencodeInstalled?: boolean;
+  agyModels?: AgyModelCatalogItem[];
+  agyModelsLoading?: boolean;
+  onRefreshAgyModels?: () => void;
   onLaunchNewSession?: (client: LaunchClient) => void;
   /** suggestion id -> child session keys, for next-step cards. */
   startedNextStepChildKeys?: Map<string, string[]>;
@@ -1512,6 +1523,9 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
   codexInstalled = false,
   agyInstalled = false,
   opencodeInstalled = false,
+  agyModels,
+  agyModelsLoading = false,
+  onRefreshAgyModels,
   onLaunchNewSession,
   onForkTurnRequest,
   onNavigateEnvironments,
@@ -1565,6 +1579,9 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
   const sessionPermMode = sessionDisplayPermMode;
   const [sessionEffort, setSessionEffort] = useState<EffortLevel>(
     () => normalizeEffortForProvider(session.effort, session.provider),
+  );
+  const [sessionModel, setSessionModel] = useState<string | null>(
+    () => session.model ?? session.config_options?.current_model ?? null,
   );
   const composerTextRef = useRef('');
   const composerHasDraftRef = useRef(false);
@@ -2329,15 +2346,50 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
     setRecentFiles(null);
   }, [session.project_dir]);
 
+  const latestConfigOptions = useMemo(() => {
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const payload = events[index]?.payload;
+      if (payload?.type === 'runtime_config_options_updated') {
+        return {
+          current_model: payload.current_model ?? null,
+          current_effort: payload.current_effort ?? null,
+          supports_effort: payload.supports_effort,
+          models: payload.models,
+          efforts: payload.efforts,
+        };
+      }
+    }
+    return session.config_options ?? null;
+  }, [events, session.config_options]);
+
   useEffect(() => {
     setSessionEnv(session.env_name);
     setSessionRuntimePermMode(nativeSessionRuntimePermMode(session));
     setSessionDisplayPermMode(normalizePermissionModeName(session.perm_mode, defaultPermissionMode));
-    setSessionEffort(normalizeEffortForProvider(session.effort, session.provider));
+    const authoritativeModel = latestConfigOptions?.current_model ?? session.model ?? null;
+    setSessionModel(authoritativeModel);
+    const authoritativeEffort = latestConfigOptions?.supports_effort
+      ? (latestConfigOptions.current_effort ?? session.effort)
+      : session.effort;
+    const supportedLevels = session.provider === 'agy'
+      ? (resolveAgyEffortLevels(
+          authoritativeModel,
+          resolveAgyModelsForControl({ catalog: agyModels ?? [], liveConfigOptions: latestConfigOptions }),
+          latestConfigOptions,
+        ) as EffortLevel[])
+      : null;
+    setSessionEffort(
+      supportedLevels && supportedLevels.length > 0
+        ? clampEffortToSupportedLevels(authoritativeEffort, supportedLevels)
+        : normalizeEffortForProvider(authoritativeEffort, session.provider),
+    );
   }, [
+    agyModels,
     defaultPermissionMode,
+    latestConfigOptions,
     session.effort,
     session.env_name,
+    session.model,
     session.perm_mode,
     session.provider,
     session.runtime_id,
@@ -3907,7 +3959,9 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
   }, [applyRuntimePlanModeChange]);
 
   const performEffortChange = useCallback((effort: EffortLevel, forceRestart = false) => {
+    const previousEffort = sessionEffort;
     const nextEffort = normalizeEffortForProvider(effort, session.provider);
+    setSessionEffort(nextEffort);
     return updateNativeSessionSettings(
       session.runtime_id,
       undefined,
@@ -3921,10 +3975,11 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
       })
       .catch((error) => {
         console.error('Failed to update native session effort:', error);
+        setSessionEffort(previousEffort);
         toast.error(t('workspace.nativeSettingsFailed'));
         return false;
       });
-  }, [refreshSummary, session.provider, session.runtime_id, t, updateNativeSessionSettings]);
+  }, [refreshSummary, session.provider, session.runtime_id, sessionEffort, t, updateNativeSessionSettings]);
 
   const handleEffortChange = useCallback((effort: EffortLevel) => {
     if (activeBackgroundTaskCount > 0) {
@@ -3933,6 +3988,55 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
     }
     performEffortChange(effort);
   }, [activeBackgroundTaskCount, performEffortChange]);
+
+  const handleModelChange = useCallback((nextModel: string) => {
+    const trimmed = nextModel.trim();
+    if (!trimmed || trimmed === sessionModel) {
+      return;
+    }
+    const previousModel = sessionModel;
+    const previousEffort = sessionEffort;
+    const effectiveModels = resolveAgyModelsForControl({
+      catalog: agyModels ?? [],
+      liveConfigOptions: latestConfigOptions,
+    });
+    const nextSupportedEfforts = resolveAgyEffortLevels(trimmed, effectiveModels, null) as EffortLevel[];
+    const nextClampedEffort = nextSupportedEfforts.length > 0
+      ? clampEffortToSupportedLevels(previousEffort, nextSupportedEfforts)
+      : undefined;
+
+    setSessionModel(trimmed);
+    if (nextClampedEffort) {
+      setSessionEffort(nextClampedEffort);
+    }
+
+    void updateNativeSessionSettings(
+      session.runtime_id,
+      undefined,
+      undefined,
+      nextClampedEffort,
+      false,
+      trimmed,
+    )
+      .then(async () => {
+        await refreshSummary({ force: true });
+      })
+      .catch((error) => {
+        console.error('Failed to update native session model:', error);
+        setSessionModel(previousModel);
+        setSessionEffort(previousEffort);
+        toast.error(t('workspace.nativeSettingsFailed'));
+      });
+  }, [
+    agyModels,
+    latestConfigOptions,
+    refreshSummary,
+    session.runtime_id,
+    sessionEffort,
+    sessionModel,
+    t,
+    updateNativeSessionSettings,
+  ]);
 
   const flushQueuedMessages = useCallback((explicitRecoverySend = false): Promise<boolean> => {
     // A new prompt is not consent to replay old input with an unknown ACK.
@@ -4877,11 +4981,17 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
             envName={sessionEnv}
             permMode={sessionPermMode}
             effort={sessionEffort}
+            model={sessionModel}
+            agyModels={agyModels}
+            agyModelsLoading={agyModelsLoading}
+            liveConfigOptions={latestConfigOptions}
             environments={environments}
             enabledEnvironments={enabledEnvironments}
             onEnvChange={handleEnvChange}
             onPermModeChange={handlePermModeChange}
             onEffortChange={handleEffortChange}
+            onModelChange={handleModelChange}
+            onRefreshAgyModels={onRefreshAgyModels}
           />
         )}
         secondaryActions={(

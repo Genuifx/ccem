@@ -35,6 +35,59 @@ test('isAgyAuthRequiredError detects sentinel across raw strings, Error, and wra
     assert.equal(mod.isAgyAuthRequiredError({ message: 'AGY_AUTH_REQUIRED' }), true);
     assert.equal(mod.isAgyAuthRequiredError('Network timeout'), false);
     assert.equal(mod.isAgyAuthRequiredError(null), false);
+
+    // Model + effort catalog helpers
+    const catalog = [
+      { id: 'gemini-4-neon', name: 'Gemini 4 Neon', efforts: ['low', 'medium', 'high', 'xhigh'], defaultEffort: 'high' },
+      { id: 'claude-opus-5-5', name: 'Claude Opus 5.5', efforts: ['low', 'medium', 'high'], defaultEffort: 'high' },
+      { id: 'gemini-pro-orchestrator-neon', name: 'Orchestrator (Neon)', efforts: [], defaultEffort: null },
+      { id: 'gpt-oss-120b-medium', name: 'GPT-OSS 120B (Medium)', efforts: [], defaultEffort: null },
+    ];
+
+    assert.deepEqual(mod.parseAgyTranscriptModel('gemini-4-neon-xhigh', catalog), {
+      model: 'gemini-4-neon',
+      effort: 'xhigh',
+    });
+    assert.deepEqual(mod.parseAgyTranscriptModel('gpt-oss-120b-medium', catalog), {
+      model: 'gpt-oss-120b-medium',
+    });
+    assert.deepEqual(mod.parseAgyTranscriptModel('gemini-pro-orchestrator-neon', catalog), {
+      model: 'gemini-pro-orchestrator-neon',
+    });
+
+    assert.deepEqual(mod.resolveAgyEffortLevels('gemini-4-neon', catalog), ['low', 'medium', 'high', 'xhigh']);
+    assert.deepEqual(mod.resolveAgyEffortLevels('claude-opus-5-5', catalog), ['low', 'medium', 'high']);
+    assert.deepEqual(mod.resolveAgyEffortLevels('gemini-pro-orchestrator-neon', catalog), []);
+
+    // Live ACP configOptions override static catalog for the active model
+    const liveConfig = {
+      current_model: 'claude-opus-5-5',
+      current_effort: 'medium',
+      supports_effort: true,
+      models: [
+        { value: 'gemini-4-neon', name: 'Gemini 4 Neon' },
+        { value: 'claude-opus-5-5', name: 'Claude Opus 5.5' },
+        { value: 'gemini-pro-orchestrator-neon', name: 'Orchestrator (Neon)' },
+      ],
+      efforts: [
+        { value: 'low', name: 'Low' },
+        { value: 'medium', name: 'Medium' },
+        { value: 'high', name: 'High' },
+      ],
+    };
+    const merged = mod.resolveAgyModelsForControl({ catalog, liveConfigOptions: liveConfig });
+    assert.equal(merged.length, 3);
+    assert.deepEqual(mod.resolveAgyEffortLevels('claude-opus-5-5', merged, liveConfig), ['low', 'medium', 'high']);
+    assert.deepEqual(
+      mod.resolveAgyEffortLevels('gemini-pro-orchestrator-neon', merged, {
+        ...liveConfig,
+        current_model: 'gemini-pro-orchestrator-neon',
+        current_effort: null,
+        supports_effort: false,
+        efforts: [],
+      }),
+      [],
+    );
   } finally {
     await fs.rm(directory, { recursive: true, force: true });
   }

@@ -366,6 +366,7 @@ export interface TauriCommands {
       initialAnnotations?: SessionPromptAnnotation[] | null;
       providerSessionId?: string | null;
       effort?: string | null;
+      model?: string | null;
       seedBoundaryMessageCount?: number | null;
       /** Claude only: fork the parent transcript up to and including this message uuid. */
       forkFromMessageId?: string | null;
@@ -484,6 +485,7 @@ export interface TauriCommands {
       envName?: string | null;
       permMode?: string | null;
       effort?: string | null;
+      model?: string | null;
       forceRestart?: boolean | null;
     },
     void
@@ -1046,6 +1048,20 @@ export interface NativeLifecycleProjection {
   capabilities: string[];
 }
 
+export interface RuntimeConfigOptionChoice {
+  value: string;
+  name?: string | null;
+  description?: string | null;
+}
+
+export interface RuntimeConfigOptionsState {
+  current_model?: string | null;
+  current_effort?: string | null;
+  supports_effort: boolean;
+  models: RuntimeConfigOptionChoice[];
+  efforts: RuntimeConfigOptionChoice[];
+}
+
 export interface NativeSessionSummary {
   runtime_id: string;
   provider: NativeProvider;
@@ -1062,6 +1078,8 @@ export interface NativeSessionSummary {
   effort?: string | null;
   /** Requested task model; provider acceptance is reported separately. */
   model?: string | null;
+  /** Live provider-advertised config options (e.g. Antigravity ACP). */
+  config_options?: RuntimeConfigOptionsState | null;
   pending_env_name?: string | null;
   pending_effort?: string | null;
   status: string;
@@ -1606,7 +1624,16 @@ export type SessionEventPayload =
       pending_effort?: string | null;
     }
   | { type: 'background_tasks_changed'; tasks: NativeBackgroundTask[] }
-  | { type: 'background_task_updated'; task: NativeBackgroundTask };
+  | { type: 'background_task_updated'; task: NativeBackgroundTask }
+  | {
+      type: 'runtime_config_options_updated';
+      provider: string;
+      current_model?: string | null;
+      current_effort?: string | null;
+      supports_effort: boolean;
+      models: RuntimeConfigOptionChoice[];
+      efforts: RuntimeConfigOptionChoice[];
+    };
 
 export interface ProxyTrafficPage {
   items: ProxyTrafficItem[];
