@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { pathToFileURL } from 'node:url';
+import { fixturePath, importFixture } from './helpers/fixture-paths.mjs';
 import { build, stop } from 'esbuild';
 
 test('profile-aware history rows, reads and invalidation keep copied Codex IDs separate', async () => {
@@ -17,14 +17,14 @@ test('profile-aware history rows, reads and invalidation keep copied Codex IDs s
   try {
     const outfile = path.join(directory, 'history.mjs');
     await build({
-      entryPoints: [path.resolve(import.meta.dirname, '../src/features/conversations/historyData.ts')],
+      entryPoints: [fixturePath(import.meta.url, '../src/features/conversations/historyData.ts')],
       outfile, bundle: true, platform: 'node', format: 'esm', logLevel: 'silent',
       plugins: [{ name: 'ipc', setup(builder) {
         builder.onResolve({ filter: /^@tauri-apps\/api\/core$/ }, () => ({ path: 'ipc', namespace: 'fixture' }));
         builder.onLoad({ filter: /.*/, namespace: 'fixture' }, () => ({ contents: 'export const invoke = (...args) => globalThis.__profileHistoryInvoke(...args);', loader: 'js' }));
       } }],
     });
-    const history = await import(pathToFileURL(outfile).href);
+    const history = await importFixture(outfile);
     const shared = { id: 'copied', source: 'codex', project: '/repo', projectName: 'repo', display: 'shared', timestamp: 1, codexIsolated: false };
     const isolated = { ...shared, display: 'isolated', codexIsolated: true };
     const snapshot = history.normalizeWorkspaceOverviewSnapshot({
