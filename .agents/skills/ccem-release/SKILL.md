@@ -47,6 +47,17 @@ gh workflow run release-cli.yml --ref main -f expected_sha="$CANDIDATE_SHA" -f e
 gh workflow run mode2-signed-readiness.yml --ref main -f expected_sha="$CANDIDATE_SHA" -f expected_version="$VERSION"
 ```
 
-记录新 run ID，等待真实结论；同时验证 required job `Preflight npm Trusted Publisher` / `Confirm Desktop Release Readiness` 成功。复用 `scripts/ci/check-pretag-readiness-runs.mjs` 检查精确 SHA、工作流、main、push/dispatch 事件和当前 attempt 的 required job，不能只看 workflow 总体绿灯或借用其他 SHA 的结果。最终打 tag 前仍须重新证明远端 main 等于候选 SHA，候选 tag 在本地和远端均不存在。
+记录新 run ID，使用分段前台等待脚本等待真实结论（单次上限 `<540s`，避免触发 600s 工具超时自动转后台导致无人值守会话提前结束）：
+
+```bash
+node scripts/ci/wait-workflow-run.mjs \
+  --run-id <run-id> \
+  --expected-sha "$CANDIDATE_SHA" \
+  --expected-workflow <release-cli.yml|mode2-signed-readiness.yml|release-desktop.yml> \
+  --expected-event push,workflow_dispatch \
+  --max-wait-seconds 420
+```
+
+退出码语义：`0` = `COMPLETED/success`，`1` = `COMPLETED` 非成功或 run 身份不匹配，`2` = `IN_PROGRESS`（在总时长允许内继续前台调用同一脚本等待，严禁结束当前轮次等待后台通知），`3` = `UNKNOWN`（不得当成功）。禁止直接运行可能超过 10 分钟的无界 `gh run watch`。同时验证 required job `Preflight npm Trusted Publisher` / `Confirm Desktop Release Readiness` 成功。复用 `scripts/ci/check-pretag-readiness-runs.mjs` 检查精确 SHA、工作流、main、push/dispatch 事件和当前 attempt 的 required job，不能只看 workflow 总体绿灯或借用其他 SHA 的结果。最终打 tag 前仍须重新证明远端 main 等于候选 SHA，候选 tag 在本地和远端均不存在。
 
 失败时优先用已认证的 `gh run view <run-id> --log-failed` 读取日志；匿名日志接口的 403 不证明当前用户没有权限。若是证据上传 `ENOTFOUND` 等临时基础设施错误，在重新核对当前 SHA 后最多补跑一次非发布工作流；重复失败则保留候选并报告实际错误。main 前进后重新解析并验证新 SHA；本轮再次前进则报告竞态，不循环追逐 main，也不沿用旧 readiness。
