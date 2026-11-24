@@ -1,5 +1,11 @@
 # ccem
 
+## 2.114.0
+
+### Minor Changes
+
+- Release v2.114.0: live agy model and effort switching with model catalog backend and Workspace Composer selector, accurate agy usage with segmented turn speed and TTFT analytics, plus agy settings, config merge, and catalog hardening.
+
 ## 2.113.0
 
 ### Minor Changes
