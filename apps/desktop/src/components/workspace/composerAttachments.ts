@@ -1,6 +1,6 @@
 import type { SessionPromptAnnotation } from '@/lib/tauri-ipc';
 
-export type ComposerAttachmentSource = 'drop' | 'paste' | 'recent' | 'search';
+export type ComposerAttachmentSource = 'drop' | 'paste' | 'picker' | 'recent' | 'search';
 
 export interface ComposerFileAttachment {
   id: string;

@@ -32,7 +32,6 @@ import {
   AlertCircle,
   ArrowUp,
   Box,
-  Check,
   Clock,
   Command,
   FolderTree,
@@ -40,12 +39,10 @@ import {
   LoaderCircle,
   MessageSquareQuote,
   Paperclip,
-  Plus,
   Square,
   X,
   Zap,
 } from '@/lib/lucide-react';
-import { Antigravity, Claude, Codex, OpenCode } from '@lobehub/icons';
 import { PromptArea } from '@/components/prompt-area';
 import { buildComposerRouteShortcutHandler } from '@/components/workspace/composerRouteShortcut';
 import {
@@ -82,9 +79,7 @@ import {
   Popover,
   PopoverAnchor,
   PopoverContent,
-  PopoverTrigger,
 } from '@/components/ui/popover';
-import { Switch } from '@/components/ui/switch';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import type {
   NativeQueuedInputSnapshotItem,
@@ -143,6 +138,7 @@ import {
 } from './composerModel';
 import { composerSegmentsReferenceImageAttachment } from './composerImageReferences';
 import { WorkspaceComposerAnnotations } from './WorkspaceAnnotations';
+import { ComposerEnginePicker, ComposerQuickMenu } from './ComposerToolbarMenus';
 import {
   WorkspaceRoutePill,
   ComposerRouteDraftRow,
@@ -483,137 +479,6 @@ function ComposerSkillInfoPanel({
         </div>
       </div>
     </div>
-  );
-}
-
-function ComposerQuickMenu({
-  codexInstalled,
-  agyInstalled,
-  opencodeInstalled,
-  planModeEnabled,
-  planButtonVisible,
-  planModeHint,
-  planModeKind,
-  provider,
-  routeDraft,
-  onRouteDraftChange,
-  onLaunchNewSession,
-  onPlanModeEnabledChange,
-}: {
-  codexInstalled: boolean;
-  agyInstalled: boolean;
-  opencodeInstalled: boolean;
-  planModeEnabled: boolean;
-  planButtonVisible: boolean;
-  planModeHint?: string;
-  planModeKind: 'session_permission' | 'command_prefix';
-  provider: WorkspaceComposerProvider;
-  routeDraft?: ComposerRouteDraft | null;
-  onRouteDraftChange?: (draft: ComposerRouteDraft) => void;
-  onLaunchNewSession?: (client: LaunchClient) => void;
-  onPlanModeEnabledChange?: (enabled: boolean) => void;
-}) {
-  const { t } = useLocale();
-  const [open, setOpen] = useState(false);
-
-  const sdkItems: { client: LaunchClient; icon: ReactNode; label: string; installed: boolean }[] = [
-    { client: 'claude', icon: <Claude.Color size={16} />, label: t('workspace.newSessionClaude'), installed: true },
-    { client: 'codex', icon: <Codex.Color size={16} />, label: t('workspace.newSessionCodex'), installed: codexInstalled },
-    { client: 'agy', icon: <Antigravity.Color size={16} />, label: t('workspace.newSessionAgy'), installed: agyInstalled },
-    { client: 'opencode', icon: <OpenCode size={16} />, label: t('workspace.newSessionOpenCode'), installed: opencodeInstalled },
-  ];
-
-  const resolvedPlanHint = planModeHint ?? (
-    provider === 'agy'
-      ? t('workspace.composerPlanModeHintAgy')
-      : planModeKind === 'session_permission'
-        ? t('workspace.composerPlanModeHintClaude')
-        : t('workspace.composerPlanModeHintCodex')
-  );
-
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          className="inline-flex h-8 w-8 items-center justify-center rounded-full text-muted-foreground outline-none transition-colors hover:bg-white/[0.06] hover:text-foreground focus-visible:ring-2 focus-visible:ring-primary/30"
-          aria-label={t('workspace.composerQuickMenuLabel')}
-        >
-          <Plus className="h-4 w-4" />
-        </button>
-      </PopoverTrigger>
-      <PopoverContent
-        align="end"
-        side="top"
-        sideOffset={6}
-        className="w-auto min-w-[200px] rounded-xl border border-border/40 bg-popover p-1.5 shadow-md"
-      >
-        {sdkItems.map((item) => (
-          <button
-            key={item.client}
-            type="button"
-            disabled={!item.installed}
-            className={cn(
-              'flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-sm outline-none',
-              'transition-colors glass-dropdown-item',
-              !item.installed && 'cursor-not-allowed opacity-50',
-            )}
-            onClick={() => {
-              if (item.installed && onLaunchNewSession) {
-                onLaunchNewSession(item.client);
-                setOpen(false);
-              }
-            }}
-          >
-            <span className="shrink-0">{item.icon}</span>
-            <span className="flex-1 text-left">{item.label}</span>
-            {item.client === provider && (
-              <Check className="h-3.5 w-3.5 shrink-0 text-foreground" />
-            )}
-            {!item.installed && (
-              <span className="text-2xs text-muted-foreground">({t('settings.cliNotInstalled')})</span>
-            )}
-          </button>
-        ))}
-
-        {planButtonVisible ? (
-          <>
-            <div className="mx-2 my-1.5 h-px border-t border-border/50" />
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <div
-                  className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-sm transition-colors glass-dropdown-item"
-                >
-                  <ListChecks className={cn(
-                    'h-4 w-4 shrink-0 text-muted-foreground transition-colors',
-                    planModeEnabled && 'text-foreground',
-                  )} />
-                  <span className={cn(
-                    'flex-1 text-left transition-colors',
-                    planModeEnabled && 'text-foreground',
-                  )}>
-                    {t('workspace.composerPlanModeShort')}
-                  </span>
-                  <Switch
-                    checked={planModeEnabled}
-                    onCheckedChange={(checked) => onPlanModeEnabledChange?.(checked)}
-                    aria-label={t('workspace.composerPlanModeShort')}
-                    className="data-[state=checked]:bg-foreground data-[state=unchecked]:bg-muted/85"
-                  />
-                </div>
-              </TooltipTrigger>
-              <TooltipContent side="left" className="max-w-[280px] text-[12px] leading-5">
-                {resolvedPlanHint}
-              </TooltipContent>
-            </Tooltip>
-          </>
-        ) : null}
-
-        {routeDraft != null && onRouteDraftChange && isRouteDraftRowVisible(provider) ? (
-          <ComposerRouteDraftRow draft={routeDraft} onDraftChange={onRouteDraftChange} />
-        ) : null}
-      </PopoverContent>
-    </Popover>
   );
 }
 
@@ -1022,6 +887,7 @@ export function WorkspaceSessionComposer({
   const attentionDockRef = useRef<HTMLDivElement | null>(null);
   const composerDropTargetRef = useRef<HTMLDivElement | null>(null);
   const attachmentStripRef = useRef<HTMLDivElement | null>(null);
+  const imagePickerInputRef = useRef<HTMLInputElement | null>(null);
   const primaryActionButtonRef = useRef<HTMLButtonElement | null>(null);
   const promptAreaRef = useRef<PromptAreaHandle | null>(null);
   const submitGuardRef = useRef<ReentryGuard | null>(null);
@@ -1036,6 +902,10 @@ export function WorkspaceSessionComposer({
   const [composerSegments, setComposerSegments] = useState<Segment[]>(() => restoreComposerSessionReferences(value));
   const [referencePreview, setReferencePreview] = useState<ComposerSessionReference | null>(null);
   const sessionReferences = useMemo(() => selectedSessionReferences(composerSegments), [composerSegments]);
+  const selectedSessionIds = useMemo(
+    () => new Set(sessionReferences.map((reference) => reference.runtime_id)),
+    [sessionReferences],
+  );
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const attachmentsRef = useRef(attachments);
   const annotationsRef = useRef(annotations);
@@ -1279,8 +1149,8 @@ export function WorkspaceSessionComposer({
     pruneUnreferencedImageAttachments(segments);
   }, [pruneUnreferencedImageAttachments, syncComposerSegments]);
 
-  const handleImagePaste = useCallback(async (files: File[]) => {
-    if (!capabilities.supportsImages) {
+  const handleImagePaste = useCallback(async (files: File[], source: 'paste' | 'picker' = 'paste') => {
+    if (!capabilities.supportsImages || files.length === 0) {
       return;
     }
 
@@ -1297,10 +1167,13 @@ export function WorkspaceSessionComposer({
 
       try {
         const placeholder = createComposerImagePlaceholder(firstImageIndex + imageAttachments.length);
+        const imageName = source === 'picker'
+          ? (file.name || t('workspace.composerImagePastedName'))
+          : t('workspace.composerImagePastedName');
         const attachment = await createComposerImageAttachment(
           file,
-          t('workspace.composerImagePastedName'),
-          'paste',
+          imageName,
+          source,
           placeholder,
         );
         imageAttachments.push(attachment);
@@ -1339,6 +1212,37 @@ export function WorkspaceSessionComposer({
     )]);
     return true;
   }, [addAttachments, t]);
+
+  const handleAttachFilesFromDialog = useCallback(async () => {
+    if (disabled) {
+      return;
+    }
+    try {
+      const paths = await invoke<string[]>('open_files_dialog', {
+        defaultDir: workingDir ?? null,
+      });
+      const validPaths = (paths ?? []).filter((entry) => entry.trim().length > 0);
+      if (validPaths.length > 0) {
+        addAttachments(validPaths.map((entry) => createComposerFileAttachment(entry, workingDir, 'picker')));
+      }
+      promptAreaRef.current?.focus();
+    } catch (error) {
+      console.error('Failed to attach files from dialog:', error);
+    }
+  }, [addAttachments, disabled, workingDir]);
+
+  const handleSelectSessionReference = useCallback((session: ComposerSessionReference) => {
+    if (disabled) {
+      return;
+    }
+    promptAreaRef.current?.insertChip({
+      trigger: '@',
+      value: session.runtime_id,
+      displayText: session.title,
+      data: { kind: 'session', session },
+    });
+    promptAreaRef.current?.focus();
+  }, [disabled]);
 
   const promptAreaTriggers = useMemo<TriggerConfig[]>(() => {
     const suggestionQuery = (kind: ComposerTokenKind, trigger: '$' | '/' | '@', query: string, files: WorkspaceFileSuggestion[] = []) => (
@@ -1945,7 +1849,7 @@ export function WorkspaceSessionComposer({
 
   // Compact (split-view panes) puts the prompt inline in the footer row,
   // between the icon-only options and the send button.
-  const promptAreaNode = (<div className={cn('relative', compact ? 'min-h-[24px] min-w-0 flex-1 py-1' : 'min-h-[72px]')}>
+  const promptAreaNode = (<div className={cn('relative', compact ? 'min-h-[24px] min-w-0 flex-1 py-1' : 'min-h-[44px]')}>
       <PromptArea
         ref={promptAreaRef}
         value={composerSegments}
@@ -1953,7 +1857,7 @@ export function WorkspaceSessionComposer({
         triggers={promptAreaTriggers}
         placeholder={placeholder}
         disabled={disabled}
-        minHeight={compact ? 24 : 72}
+        minHeight={compact ? 24 : 44}
         maxHeight={compact ? 160 : 260}
         autoGrow
         markdown={false}
@@ -2067,7 +1971,7 @@ export function WorkspaceSessionComposer({
           data-composer-shell-card
           data-composer-drop-active={isDragTarget || undefined}
           className={cn(
-            'relative z-20 rounded-[20px] border border-border/40 bg-surface-raised px-5 py-3 shadow-[0_40px_120px_-70px_rgba(0,0,0,0.38)] transition-[border-color,box-shadow] duration-300',
+            'relative z-20 rounded-[20px] border border-border/40 bg-surface-raised px-4 py-2.5 shadow-[0_40px_120px_-70px_rgba(0,0,0,0.38)] transition-[border-color,box-shadow] duration-300',
             compact && 'rounded-[14px] px-2 py-1.5 shadow-[0_1px_2px_hsl(var(--glass-shadow-base)/0.06)]',
             isDragTarget && 'border-primary/45 ring-4 ring-primary/10',
             planModeEnabled && 'border-primary/15',
@@ -2229,6 +2133,22 @@ export function WorkspaceSessionComposer({
               </div>
             </div>
           ) : null}
+          <input
+            ref={imagePickerInputRef}
+            data-testid="composer-image-picker-input"
+            type="file"
+            accept="image/png,image/jpeg,image/gif,image/webp"
+            multiple
+            className="hidden"
+            onChange={(event) => {
+              const files = Array.from(event.currentTarget.files ?? []);
+              event.currentTarget.value = '';
+              if (files.length > 0) {
+                void handleImagePaste(files, 'picker');
+              }
+              promptAreaRef.current?.focus();
+            }}
+          />
           {compact ? null : promptAreaNode}
 
           <div
@@ -2236,29 +2156,50 @@ export function WorkspaceSessionComposer({
             data-compact={compact || composerFooterCompact || undefined}
             className={cn(
               'group/composer-footer flex items-center',
-              compact ? 'flex-nowrap items-end gap-1.5' : 'mt-2 flex-wrap gap-2.5 border-t border-border/40 pt-2',
+              compact ? 'flex-nowrap items-end gap-1' : 'mt-1.5 flex-wrap gap-1.5 border-t border-border/40 pt-1.5',
             )}
           >
             <ComposerQuickMenu
-              codexInstalled={codexInstalled}
-              agyInstalled={agyInstalled}
-              opencodeInstalled={opencodeInstalled}
+              provider={provider}
+              disabled={disabled}
+              supportsImages={capabilities.supportsImages}
+              workingDir={workingDir}
+              currentRuntimeId={currentRuntimeId}
+              sessionReferencesClient={sessionReferencesClient}
+              selectedSessionIds={selectedSessionIds}
+              onAttachFiles={handleAttachFilesFromDialog}
+              onAttachImages={() => imagePickerInputRef.current?.click()}
+              onSelectSessionReference={handleSelectSessionReference}
               planModeEnabled={planModeEnabled}
               planButtonVisible={planButtonVisible}
               planModeHint={planModeHint}
               planModeKind={capabilities.planModeKind}
-              provider={provider}
-              routeDraft={routeDraft}
-              onRouteDraftChange={onRouteDraftChange}
-              onLaunchNewSession={onLaunchNewSession}
               onPlanModeEnabledChange={onPlanModeEnabledChange}
+              routeDraftRow={routeDraft != null && onRouteDraftChange && isRouteDraftRowVisible(provider) ? (
+                <ComposerRouteDraftRow
+                  draft={routeDraft}
+                  onDraftChange={onRouteDraftChange}
+                  showSeparator={false}
+                />
+              ) : null}
             />
+
+            {onLaunchNewSession ? (
+              <ComposerEnginePicker
+                provider={provider}
+                codexInstalled={codexInstalled}
+                agyInstalled={agyInstalled}
+                opencodeInstalled={opencodeInstalled}
+                disabled={disabled}
+                onLaunchNewSession={onLaunchNewSession}
+              />
+            ) : null}
 
             {controls}
 
             {compact ? promptAreaNode : null}
 
-            <div className={cn('flex shrink-0 items-center', compact ? 'gap-1' : 'ml-auto gap-2')}>
+            <div className={cn('flex shrink-0 items-center', compact ? 'gap-1' : 'ml-auto gap-1.5')}>
               {secondaryActions}
 
               <Button
@@ -2284,8 +2225,7 @@ export function WorkspaceSessionComposer({
                   void handleComposerSubmit();
                 }}
                 className={cn(
-                  'h-9 w-9 rounded-full shadow-[0_14px_36px_-18px_rgba(0,0,0,0.42)]',
-                  compact && 'h-8 w-8',
+                  'h-8 w-8 rounded-full shadow-[0_14px_36px_-18px_rgba(0,0,0,0.42)]',
                   primaryActionClassName,
                 )}
               >

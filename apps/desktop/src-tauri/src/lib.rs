@@ -3229,6 +3229,52 @@ async fn open_directory_dialog(app: tauri::AppHandle) -> Result<Option<String>, 
 }
 
 #[tauri::command]
+async fn open_files_dialog(
+    app: tauri::AppHandle,
+    default_dir: Option<String>,
+) -> Result<Vec<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    if let Some(raw_paths) = std::env::var("CCEM_TEST_FILE_PICKER_PATHS").ok() {
+        let paths = raw_paths
+            .lines()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        return Ok(paths);
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut dialog = app.dialog().file();
+    if let Some(dir) = default_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let dir_path = std::path::Path::new(dir);
+        if dir_path.is_dir() {
+            dialog = dialog.set_directory(dir_path);
+        }
+    }
+
+    dialog.pick_files(move |file_paths| {
+        let selected = file_paths
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| {
+                let fallback = p.to_string();
+                p.into_path()
+                    .map(|pb| pb.to_string_lossy().into_owned())
+                    .unwrap_or(fallback)
+            })
+            .collect::<Vec<_>>();
+        let _ = tx.send(selected);
+    });
+
+    rx.recv().map_err(|e| format!("Dialog error: {}", e))
+}
+
+#[tauri::command]
 fn sync_vscode_projects() -> Result<Vec<VSCodeProject>, String> {
     let home = dirs::home_dir().ok_or("Could not find home directory")?;
     let storage_path =
@@ -6403,6 +6449,7 @@ pub fn run_desktop_app() -> i32 {
             close_session,
             minimize_session,
             open_directory_dialog,
+            open_files_dialog,
             sync_vscode_projects,
             sync_jetbrains_projects,
             get_usage_stats,

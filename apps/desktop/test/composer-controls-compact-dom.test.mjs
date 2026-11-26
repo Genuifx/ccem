@@ -98,18 +98,42 @@ async function importHarness() {
         import { ComposerControls } from '@/components/workspace/ComposerControls';
         export { mergeQueuePresenceRows } from '@/components/workspace/composerQueueMotion';
 
-        export function mountCompactControls(container, { question = false, queue = false, steer = null } = {}) {
+        export function mountCompactControls(container, {
+          question = false,
+          queue = false,
+          steer = null,
+          provider = 'claude',
+          permMode = 'yolo',
+          codexInstalled = false,
+          agyInstalled = false,
+          opencodeInstalled = false,
+          onLaunchNewSession = null,
+          workingDir = null,
+          sessionReferencesClient = null,
+          onValueChange = null,
+        } = {}) {
           function Harness({ question, queue }) {
+            const [value, setValue] = React.useState('');
             return (
               <LocaleProvider>
               <TooltipProvider>
                 <WorkspaceSessionComposer
-                value=""
-                onValueChange={() => {}}
+                value={value}
+                onValueChange={(nextValue) => {
+                  setValue(nextValue);
+                  onValueChange?.(nextValue);
+                }}
                 onSubmit={() => {}}
                 placeholder="composer input"
                 canSubmit={false}
                 submitLabel="send message"
+                provider={provider}
+                workingDir={workingDir}
+                codexInstalled={codexInstalled}
+                agyInstalled={agyInstalled}
+                opencodeInstalled={opencodeInstalled}
+                onLaunchNewSession={onLaunchNewSession ?? undefined}
+                sessionReferencesClient={sessionReferencesClient ?? undefined}
                 aboveComposer={question ? <div style={{ height: 440 }}><button>answer question</button></div> : null}
                 queuedMessages={queue ? [{ id: 'queued', text: 'queued message', displayText: 'queued message', removable: true }] : []}
                 queueCanFlush
@@ -119,9 +143,9 @@ async function importHarness() {
                 onSteerQueuedMessages={steer ?? undefined}
                 controls={(
                   <ComposerControls
-                    provider="claude"
+                    provider={provider}
                     envName="DeepSeek-V4-Flash"
-                    permMode="yolo"
+                    permMode={permMode}
                     effort="high"
                     environments={[]}
                     onEnvChange={() => {}}
@@ -139,6 +163,7 @@ async function importHarness() {
           act(() => root.render(<Harness question={question} queue={queue} />));
 
           return {
+            act,
             setAttentionPanels({ question = false, queue = false } = {}) {
               act(() => root.render(<Harness question={question} queue={queue} />));
             },
@@ -176,7 +201,13 @@ async function importHarness() {
     logLevel: 'silent',
     external: ['jsdom'],
   });
-  const imported = await import(pathToFileURL(outputPath).href);
+  const restoreBootstrapDom = installDom();
+  let imported;
+  try {
+    imported = await import(pathToFileURL(outputPath).href);
+  } finally {
+    restoreBootstrapDom();
+  }
   return { ...imported, tempDir };
 }
 
@@ -188,6 +219,13 @@ function installDom() {
   // JSDOM has no layout/scroll implementation; the tests inspect the rendered
   // scroll ownership only; pixel geometry is not verified by JSDOM.
   window.HTMLElement.prototype.scrollIntoView = () => {};
+  window.HTMLElement.prototype.hasPointerCapture = () => false;
+  window.HTMLElement.prototype.setPointerCapture = () => {};
+  window.HTMLElement.prototype.releasePointerCapture = () => {};
+  Object.defineProperty(window, 'PointerEvent', {
+    configurable: true,
+    value: window.PointerEvent ?? window.MouseEvent,
+  });
   const previous = new Map();
 
   const expose = (name, value) => {
@@ -231,21 +269,37 @@ function installDom() {
     'Node',
     'NodeFilter',
     'Text',
+    'DocumentFragment',
     'Element',
     'HTMLElement',
+    'HTMLInputElement',
+    'HTMLButtonElement',
+    'HTMLTextAreaElement',
+    'SVGElement',
     'HTMLBRElement',
     'HTMLAnchorElement',
     'Event',
+    'UIEvent',
+    'FocusEvent',
+    'CustomEvent',
     'InputEvent',
     'CompositionEvent',
     'KeyboardEvent',
     'MouseEvent',
+    'PointerEvent',
+    'Blob',
+    'File',
+    'FileReader',
     'MutationObserver',
     'DOMRect',
     'Range',
   ]) {
     expose(name, window[name]);
   }
+  const previousCreateObjectUrl = URL.createObjectURL;
+  const previousRevokeObjectUrl = URL.revokeObjectURL;
+  URL.createObjectURL = () => 'blob:mock-image';
+  URL.revokeObjectURL = () => {};
 
   // Controllable ResizeObserver: the composer footer compact state is driven
   // through these captured callbacks so tests can simulate width changes
@@ -261,17 +315,36 @@ function installDom() {
     unobserve() {}
     disconnect() {}
   }
-  expose('ResizeObserver', ControllableResizeObserver);
-  let nextAnimationFrameHandle = 1;
-  const animationFrames = new Map();
-  expose('requestAnimationFrame', (callback) => {
-    const handle = nextAnimationFrameHandle++;
-    animationFrames.set(handle, callback);
-    return handle;
+  Object.defineProperty(window, 'ResizeObserver', {
+    configurable: true,
+    value: ControllableResizeObserver,
   });
-  expose('cancelAnimationFrame', (handle) => animationFrames.delete(handle));
+  expose('ResizeObserver', ControllableResizeObserver);
+  const animationTimers = new Set();
+  const rafStub = (callback) => {
+    const handle = setTimeout(() => {
+      animationTimers.delete(handle);
+      callback(Date.now());
+    }, 0);
+    animationTimers.add(handle);
+    return handle;
+  };
+  const cafStub = (handle) => {
+    animationTimers.delete(handle);
+    clearTimeout(handle);
+  };
+  Object.defineProperty(window, 'requestAnimationFrame', { configurable: true, value: rafStub });
+  Object.defineProperty(window, 'cancelAnimationFrame', { configurable: true, value: cafStub });
+  expose('requestAnimationFrame', rafStub);
+  expose('cancelAnimationFrame', cafStub);
 
   return () => {
+    for (const handle of animationTimers) {
+      clearTimeout(handle);
+    }
+    animationTimers.clear();
+    URL.createObjectURL = previousCreateObjectUrl;
+    URL.revokeObjectURL = previousRevokeObjectUrl;
     for (const [name, descriptor] of previous) {
       if (descriptor) {
         Object.defineProperty(globalThis, name, descriptor);
@@ -281,12 +354,6 @@ function installDom() {
     }
     delete globalThis.__composerCompactResizeCallbacks;
     delete globalThis.__composerAttentionTrigger;
-    while (animationFrames.size > 0) {
-      for (const [handle, callback] of [...animationFrames]) {
-        animationFrames.delete(handle);
-        callback();
-      }
-    }
   };
 }
 
@@ -452,38 +519,50 @@ test('composer controls collapse to icon-only when the footer goes narrow, and r
   const restore = installDom();
   try {
     const container = document.getElementById('root');
-    const mounted = mountCompactControls(container);
+    const mounted = mountCompactControls(container, {
+      onLaunchNewSession: () => {},
+      codexInstalled: true,
+      agyInstalled: true,
+    });
 
     const envLabel = spanByText(container, 'DeepSeek-V4-Flash');
-    const permLabel = spanByText(container, 'YOLO');
     assert.ok(envLabel, 'environment label span should render');
-    assert.ok(permLabel, 'permission label span should render');
+    assert.equal(
+      spanByText(container, 'YOLO'),
+      null,
+      'permission trigger must stay icon-only without visible YOLO text',
+    );
+    const permTrigger = container.querySelector('[data-testid="composer-permission-trigger"]');
+    assert.ok(permTrigger, 'permission trigger should render');
+    assert.equal(permTrigger.getAttribute('aria-label'), 'YOLO');
+    assert.match(permTrigger.className, /\btext-destructive\b/);
+    const engineTrigger = container.querySelector('[data-testid="composer-engine-trigger"]');
+    assert.ok(engineTrigger, 'engine trigger should render beside quick menu');
+    assert.equal(engineTrigger.querySelectorAll('span.truncate').length, 0, 'engine trigger stays icon-only');
+    assert.equal(engineTrigger.querySelectorAll('svg').length, 1, 'engine trigger omits dropdown chevron');
+    const modelTrigger = container.querySelector('[data-testid="composer-model-effort-trigger"]');
+    assert.ok(modelTrigger, 'model trigger should render');
+    assert.equal(modelTrigger.querySelectorAll('svg').length, 2, 'model trigger renders icon + effort gauge without dropdown chevron');
     const compactHidden = 'group-data-[compact]/composer-footer:hidden';
 
-    // Wide footer: full labels visible, no compact marker.
+    // Wide footer: full model/env label visible, no compact marker.
     mounted.driveResize(900);
     assert.equal(container.querySelector('[data-compact]'), null, 'wide footer must not be compact');
 
-    // Narrow footer: compact marker lands on the footer row and both label
-    // spans carry the compact-hidden variant. Icons stay rendered, and the
-    // chevron affordances collapse with them (icon-only triggers).
+    // Narrow footer: compact marker lands on the footer row and model/effort
+    // labels collapse (icon-only triggers).
     mounted.driveResize(500);
     const footer = container.querySelector('[data-compact]');
     assert.ok(footer, 'narrow footer should carry data-compact');
     assert.match(footer.className, /group\/composer-footer/);
     assert.ok(envLabel.className.includes(compactHidden), 'environment label must hide in compact mode');
-    assert.ok(permLabel.className.includes(compactHidden), 'permission label must hide in compact mode');
     assert.equal(envLabel.textContent, 'DeepSeek-V4-Flash', 'label content is untouched — only presentation hides');
-    const envChevron = [...footer.querySelectorAll('svg')].find(
-      (svg) => svg.getAttribute('class')?.includes('group-data-[compact]/composer-footer:hidden')
-      && !svg.getAttribute('class')?.includes('[&>svg]'),
-    );
-    assert.ok(envChevron, 'environment trigger chevron must carry the compact-hidden variant');
-    const permTrigger = footer.querySelector('[role="combobox"]');
+    const comboboxTrigger = footer.querySelector('[role="combobox"]');
+    assert.equal(comboboxTrigger, permTrigger);
     assert.match(
       permTrigger.className,
-      /group-data-\[compact\]\/composer-footer:\[&>svg\]:hidden/,
-      'permission trigger must hide its direct-child chevron svg in compact mode',
+      /\[&>svg\]:hidden/,
+      'permission trigger must hide its built-in chevron svg at all widths',
     );
 
     // Borderline: just at/above the 640px threshold stays expanded.
@@ -500,6 +579,189 @@ test('composer controls collapse to icon-only when the footer goes narrow, and r
 
     mounted.unmount();
   } finally {
+    restore();
+  }
+});
+
+test('ComposerEnginePicker renders outside quick menu and switches installed engines', async () => {
+  const harness = importedHarnessPromise ?? (importedHarnessPromise = importHarness());
+  const { mountCompactControls } = await harness;
+  const restore = installDom();
+  let mounted;
+  try {
+    const container = document.getElementById('root');
+    const launchedClients = [];
+    mounted = mountCompactControls(container, {
+      provider: 'claude',
+      codexInstalled: true,
+      agyInstalled: true,
+      opencodeInstalled: false,
+      onLaunchNewSession: (client) => launchedClients.push(client),
+    });
+
+    const engineTrigger = container.querySelector('[data-testid="composer-engine-trigger"]');
+    assert.ok(engineTrigger, 'engine trigger must render outside + menu');
+    assert.equal(engineTrigger.querySelector('.sr-only')?.textContent, 'Claude');
+    const visibleEngineTexts = [...engineTrigger.querySelectorAll('*')]
+      .flatMap((el) => [...el.childNodes])
+      .filter((node) => (
+        node.nodeType === Node.TEXT_NODE
+        && node.textContent.trim().length > 0
+        && !node.parentElement?.closest('svg, .sr-only')
+      ));
+    assert.equal(
+      visibleEngineTexts.length,
+      0,
+      'engine trigger shows icon only without visible label text',
+    );
+    assert.equal(engineTrigger.querySelectorAll('svg').length, 1);
+
+    await mounted.act(async () => {
+      engineTrigger.dispatchEvent(new window.PointerEvent('pointerdown', { bubbles: true, button: 0 }));
+      engineTrigger.click();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    const codexOption = document.querySelector('[data-composer-engine-option="codex"]');
+    const agyOption = document.querySelector('[data-composer-engine-option="agy"]');
+    const opencodeOption = document.querySelector('[data-composer-engine-option="opencode"]');
+    assert.ok(codexOption && agyOption && opencodeOption, 'engine dropdown must render all engines');
+    assert.ok(opencodeOption.hasAttribute('data-disabled') || opencodeOption.getAttribute('aria-disabled') === 'true');
+
+    await mounted.act(async () => {
+      codexOption.click();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    assert.deepEqual(launchedClients, ['codex']);
+
+    const quickTrigger = container.querySelector('[data-testid="composer-quick-menu-trigger"]');
+    assert.ok(quickTrigger, '+ menu trigger must render');
+    await mounted.act(async () => {
+      quickTrigger.click();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    assert.equal(
+      document.querySelectorAll('[data-composer-engine-option]').length,
+      0,
+      'quick menu must no longer contain engine options',
+    );
+    assert.ok(document.querySelector('[data-testid="composer-quick-attach-files"]'));
+    assert.ok(document.querySelector('[data-testid="composer-quick-attach-images"]'));
+    assert.ok(document.querySelector('[data-testid="composer-quick-reference-session"]'));
+  } finally {
+    if (mounted) {
+      mounted.unmount();
+      await mounted.act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+    }
+    restore();
+  }
+});
+
+test('ComposerQuickMenu attaches files via open_files_dialog, images via picker input, and inserts session references', async () => {
+  const harness = importedHarnessPromise ?? (importedHarnessPromise = importHarness());
+  const { mountCompactControls } = await harness;
+  const restore = installDom();
+  const previousInvoke = globalThis.__acceptanceInvoke;
+  let mounted;
+  try {
+    const invokeCalls = [];
+    globalThis.__acceptanceInvoke = async (command, args) => {
+      invokeCalls.push({ command, args });
+      if (command === 'open_files_dialog') {
+        return ['/tmp/project/src/app.ts'];
+      }
+      return [];
+    };
+
+    const draftUpdates = [];
+    const container = document.getElementById('root');
+    mounted = mountCompactControls(container, {
+      provider: 'claude',
+      workingDir: '/tmp/project',
+      onValueChange: (value) => draftUpdates.push(value),
+      sessionReferencesClient: {
+        list: async () => [
+          { runtime_id: 'rt-design', title: '设计方案', provider: 'claude', can_send: true },
+        ],
+        read: async () => ({ runtime_id: 'rt-design', title: '设计方案', text: 'context', truncated: false }),
+        send: async () => {},
+      },
+    });
+
+    const quickTrigger = container.querySelector('[data-testid="composer-quick-menu-trigger"]');
+    await mounted.act(async () => {
+      quickTrigger.click();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    const attachFilesBtn = document.querySelector('[data-testid="composer-quick-attach-files"]');
+    assert.ok(attachFilesBtn);
+    await mounted.act(async () => {
+      attachFilesBtn.click();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    assert.deepEqual(
+      invokeCalls.filter((call) => call.command === 'open_files_dialog'),
+      [{ command: 'open_files_dialog', args: { defaultDir: '/tmp/project' } }],
+    );
+    assert.match(container.textContent, /app\.ts/);
+
+    const imageInput = container.querySelector('[data-testid="composer-image-picker-input"]');
+    assert.ok(imageInput, 'hidden image file input must render');
+    let imageInputClicked = false;
+    imageInput.click = () => { imageInputClicked = true; };
+    await mounted.act(async () => {
+      quickTrigger.click();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    const attachImagesBtn = document.querySelector('[data-testid="composer-quick-attach-images"]');
+    assert.ok(attachImagesBtn);
+    await mounted.act(async () => {
+      attachImagesBtn.click();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    assert.equal(imageInputClicked, true, 'clicking attach images must open file input');
+
+    const pngBytes = Uint8Array.from([137, 80, 78, 71, 13, 10, 26, 10]);
+    const imageFile = new window.File([pngBytes], 'diagram.png', { type: 'image/png' });
+    Object.defineProperty(imageInput, 'files', { configurable: true, value: [imageFile] });
+    await mounted.act(async () => {
+      imageInput.dispatchEvent(new window.Event('change', { bubbles: true }));
+      for (let i = 0; i < 20; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        if (/diagram\.png/.test(container.textContent)) break;
+      }
+    });
+    assert.match(container.textContent, /diagram\.png/);
+
+    await mounted.act(async () => {
+      quickTrigger.click();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    const refTrigger = document.querySelector('[data-testid="composer-quick-reference-session"]');
+    assert.ok(refTrigger);
+    await mounted.act(async () => {
+      refTrigger.click();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    const sessionOption = document.querySelector('[data-composer-session-option="rt-design"]');
+    assert.ok(sessionOption, 'session reference picker should list matching project sessions');
+    await mounted.act(async () => {
+      sessionOption.click();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    assert.ok(container.querySelector('[data-session-reference-strip]'), 'selecting a session inserts @session chip');
+    assert.ok(draftUpdates.some((entry) => entry.includes('ccem-session:rt-design')));
+  } finally {
+    globalThis.__acceptanceInvoke = previousInvoke;
+    if (mounted) {
+      mounted.unmount();
+      await mounted.act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+    }
     restore();
   }
 });
@@ -521,7 +783,7 @@ test('composer footer compact threshold is wired through the shared footer row u
   const occurrences = controls.match(/group-data-\[compact\]\/composer-footer:hidden/g) ?? [];
   assert.equal(
     occurrences.length,
-    6,
-    'env name, separator, gauge, effort text, permission label and env chevron all collapse',
+    2,
+    'env name and effort cluster collapse',
   );
 });

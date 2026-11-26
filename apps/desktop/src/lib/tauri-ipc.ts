@@ -627,6 +627,7 @@ export interface TauriCommands {
   sync_vscode_projects: [void, VSCodeProject[]];
   sync_jetbrains_projects: [void, JetBrainsProject[]];
   open_directory_dialog: [void, string | null];
+  open_files_dialog: [{ defaultDir?: string | null } | void, string[]];
   save_file_dialog: [{ content: string; defaultName: string }, boolean];
 
   // 远程加载

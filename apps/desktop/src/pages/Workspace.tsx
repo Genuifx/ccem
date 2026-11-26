@@ -4383,7 +4383,7 @@ export function Workspace({
                     type="button"
                     size="icon"
                     variant="ghost"
-                    className="h-9 w-9 rounded-full"
+                    className="h-8 w-8 rounded-full"
                     aria-label={t('workspace.nativeOpenTerminal')}
                     disabled={isLaunchingComposeTerminal}
                     onClick={() => void handleLaunchComposeTerminal()}
@@ -4546,7 +4546,7 @@ export function Workspace({
                         type="button"
                         size="icon"
                         variant="ghost"
-                        className="h-9 w-9 rounded-full"
+                        className="h-8 w-8 rounded-full"
                         aria-label={t('workspace.nativeOpenTerminal')}
                         onClick={() => {
                           void launchClaudeCode(

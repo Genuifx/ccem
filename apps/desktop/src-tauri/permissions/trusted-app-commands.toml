@@ -143,6 +143,7 @@ commands.allow = [
   "close_session",
   "minimize_session",
   "open_directory_dialog",
+  "open_files_dialog",
   "sync_vscode_projects",
   "sync_jetbrains_projects",
   "get_tray_usage_stats",

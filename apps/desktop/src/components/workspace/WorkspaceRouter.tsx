@@ -558,15 +558,17 @@ export { RoutePopoverBody };
 export function ComposerRouteDraftRow({
   draft,
   onDraftChange,
+  showSeparator = true,
 }: {
   draft: ComposerRouteDraft;
   onDraftChange: (draft: ComposerRouteDraft) => void;
+  showSeparator?: boolean;
 }) {
   const { t } = useLocale();
 
   return (
     <>
-      <div className="mx-2 my-1.5 h-px border-t border-border/50" />
+      {showSeparator ? <div className="mx-2 my-1.5 h-px border-t border-border/50" /> : null}
       <Tooltip>
         <TooltipTrigger asChild>
           <div className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-sm transition-colors glass-dropdown-item">

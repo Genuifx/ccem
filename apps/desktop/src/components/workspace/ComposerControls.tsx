@@ -2,7 +2,6 @@ import { memo, useState, useEffect, useLayoutEffect, useMemo, useRef } from 'rea
 import {
   Brain,
   Check,
-  ChevronDown,
   ChevronRight,
   Gauge,
   Lock,
@@ -507,7 +506,7 @@ function ComposerControlsView({
   const agyTriggerLabel = selectedAgyModel?.name ?? selectedAgyModelId ?? 'Antigravity';
 
   return (
-    <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2">
+    <div className="flex min-w-0 max-w-full flex-wrap items-center gap-1.5">
       <DropdownMenu
         modal={false}
         open={envEffortOpen}
@@ -525,18 +524,17 @@ function ComposerControlsView({
             type="button"
             data-testid="composer-model-effort-trigger"
             className={cn(
-              'flex h-8 min-w-0 max-w-full items-center gap-2 rounded-xl px-2.5 text-[12px] text-foreground',
+              'flex h-8 min-w-0 max-w-full items-center gap-1.5 rounded-xl px-2.5 max-[760px]:px-2 group-data-[compact]/composer-footer:w-8 group-data-[compact]/composer-footer:justify-center group-data-[compact]/composer-footer:px-0 text-[12px] text-foreground',
               // Transition colors/shadow only: animating layout props (padding,
               // width) lets the compact/expanded swap get stuck mid-transition
               // when the state flips before the composer is first painted.
               'cursor-pointer outline-none transition-[background-color,box-shadow] duration-150',
-              'hover:bg-white/[0.06] focus:ring-2 focus:ring-primary/30',
-              'max-[760px]:px-1.5 group-data-[compact]/composer-footer:px-2',
+              'hover:bg-foreground/[0.05] focus:ring-2 focus:ring-primary/30',
             )}
           >
             <span
               className={cn(
-                'flex min-w-0 items-center gap-2',
+                'flex min-w-0 items-center gap-1.5',
                 !isAgyProvider && isEnvironmentLocked && 'text-muted-foreground/65',
               )}
             >
@@ -550,7 +548,7 @@ function ComposerControlsView({
               <span
                 className={cn(
                   'min-w-0 truncate max-[760px]:hidden group-data-[compact]/composer-footer:hidden',
-                  isAgyProvider ? 'max-w-[160px]' : 'max-w-[120px]',
+                  isAgyProvider ? 'max-w-[148px]' : 'max-w-[112px]',
                 )}
               >
                 {isAgyProvider ? agyTriggerLabel : envName}
@@ -569,17 +567,14 @@ function ComposerControlsView({
               )}
             </span>
             {showEffortControl && (
-              <>
-                <span className="text-muted-foreground/60 max-[760px]:hidden group-data-[compact]/composer-footer:hidden">·</span>
-                <Gauge className="h-3 w-3 shrink-0 text-muted-foreground max-[760px]:hidden group-data-[compact]/composer-footer:hidden" />
-                <span className="shrink-0 whitespace-nowrap text-muted-foreground max-[760px]:hidden group-data-[compact]/composer-footer:hidden">
+              <span className="inline-flex shrink-0 items-center gap-1 max-[760px]:hidden group-data-[compact]/composer-footer:hidden">
+                <span className="text-muted-foreground/60">·</span>
+                <Gauge className="h-3 w-3 shrink-0 text-muted-foreground" />
+                <span className="shrink-0 whitespace-nowrap text-muted-foreground">
                   {t(EFFORT_I18N_KEYS[displayEffort])}
                 </span>
-              </>
+              </span>
             )}
-            {/* Compact mode keeps just the model glyph: the affordance moves
-                into the icon itself (whole trigger stays clickable). */}
-            <ChevronDown className="h-3 w-3 shrink-0 opacity-50 group-data-[compact]/composer-footer:hidden" />
           </button>
         </DropdownMenuTrigger>
         <DropdownMenuContent
@@ -892,40 +887,46 @@ function ComposerControlsView({
           setPermissionPreviewMode(mode);
         }}
       >
-        <SelectTrigger
-          variant="plain"
-          className={cn(
-            'h-8 w-auto min-w-[112px] shrink-0 rounded-xl px-2.5 text-[12px] text-foreground',
-            'max-[760px]:min-w-0 max-[760px]:px-1.5',
-            'group-data-[compact]/composer-footer:min-w-0 group-data-[compact]/composer-footer:px-2',
-            // Compact mode drops the trigger's chevron too (icon-only); the
-            // direct-child svg is the SelectTrigger's built-in ChevronDown —
-            // the mode icon lives inside the label span.
-            'group-data-[compact]/composer-footer:[&>svg]:hidden',
-            // Narrow the shared SelectTrigger's transition-all to colors/shadow
-            // so the compact min-width/padding swap applies instantly instead
-            // of animating (and potentially sticking) layout properties.
-            'transition-[background-color,box-shadow]',
-            isRiskyPermissionMode(normalizedPermMode) && 'text-destructive',
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <SelectTrigger
+              variant="plain"
+              data-testid="composer-permission-trigger"
+              aria-label={getWorkspacePermissionModeDisplayName(normalizedPermMode)}
+              className={cn(
+                'h-8 w-8 min-w-0 shrink-0 justify-center rounded-xl p-0 text-[12px] text-foreground',
+                'hover:bg-foreground/[0.05]',
+                '[&>svg]:hidden',
+                // Narrow the shared SelectTrigger's transition-all to colors/shadow
+                // so layout properties never animate or get stuck.
+                'transition-[background-color,box-shadow]',
+                isRiskyPermissionMode(normalizedPermMode) && 'text-destructive',
+              )}
+            >
+              {(() => {
+                const ModeIcon = getModeIcon(normalizedPermMode);
+                return (
+                  <span className="flex items-center">
+                    <ModeIcon
+                      className={cn(
+                        'h-4 w-4 shrink-0 text-muted-foreground',
+                        isRiskyPermissionMode(normalizedPermMode) && 'text-destructive',
+                      )}
+                    />
+                    <span className="sr-only">
+                      {getWorkspacePermissionModeDisplayName(normalizedPermMode)}
+                    </span>
+                  </span>
+                );
+              })()}
+            </SelectTrigger>
+          </TooltipTrigger>
+          {!permissionSelectOpen && (
+            <TooltipContent side="top">
+              {getWorkspacePermissionModeDisplayName(normalizedPermMode)}
+            </TooltipContent>
           )}
-        >
-          {(() => {
-            const ModeIcon = getModeIcon(normalizedPermMode);
-            return (
-              <span className="flex min-w-0 items-center gap-2">
-                <ModeIcon
-                  className={cn(
-                    'h-3.5 w-3.5 shrink-0 text-muted-foreground',
-                    isRiskyPermissionMode(normalizedPermMode) && 'text-destructive',
-                  )}
-                />
-                <span className="truncate max-[760px]:hidden group-data-[compact]/composer-footer:hidden">
-                  {getWorkspacePermissionModeDisplayName(normalizedPermMode)}
-                </span>
-              </span>
-            );
-          })()}
-        </SelectTrigger>
+        </Tooltip>
         <SelectContent
           align="start"
           className="overflow-visible"
