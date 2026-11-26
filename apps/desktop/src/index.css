@@ -143,6 +143,32 @@
     --workspace-reading-inline-border: hsl(var(--border) / 0.85);
     --workspace-reading-inline-text: hsl(var(--foreground) / 0.86);
 
+    /* Pele Mermaid diagram theme tokens (dark mode) */
+    --pele-card-bg: hsl(var(--surface));
+    --pele-bg: hsl(var(--surface));
+    --pele-fg: hsl(var(--foreground));
+    --pele-fg-on-light: #18181b;
+    --pele-fg-on-dark: #f4f4f5;
+    --pele-muted: hsl(var(--muted-foreground));
+    --pele-line: hsl(var(--foreground) / 0.56);
+    --pele-surface: hsl(var(--surface-raised));
+    --pele-surface-alt: hsl(var(--surface-overlay));
+    --pele-border: hsl(var(--border-strong));
+    --pele-accent: hsl(var(--primary));
+    --pele-critical: hsl(var(--destructive));
+    --pele-error: hsl(var(--destructive));
+    --pele-font: Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    --pele-font-mono: 'JetBrains Mono', 'SF Mono', 'Cascadia Code', monospace;
+    --pele-radius: 8px;
+    --pele-series-1: hsl(var(--chart-1));
+    --pele-series-2: hsl(var(--chart-2));
+    --pele-series-3: hsl(var(--chart-3));
+    --pele-series-4: hsl(var(--chart-4));
+    --pele-series-5: hsl(var(--warning));
+    --pele-series-6: hsl(var(--chart-6));
+    --pele-series-7: hsl(var(--info));
+    --pele-series-8: hsl(var(--chart-5));
+
     /* Segmented control — selected pill */
     --seg-active-bg: 0 0% 100% / 0.18;
     --seg-hover-bg: 0 0% 100% / 0.10;
@@ -273,6 +299,29 @@
     --workspace-reading-inline-bg: #eef0ee;
     --workspace-reading-inline-border: #d9ddd8;
     --workspace-reading-inline-text: #334155;
+
+    /* Pele Mermaid diagram theme tokens (light mode — warm paper) */
+    --pele-card-bg: #faf9f6;
+    --pele-bg: #faf9f6;
+    --pele-fg: hsl(var(--foreground));
+    --pele-fg-on-light: #181b20;
+    --pele-fg-on-dark: #ffffff;
+    --pele-muted: hsl(var(--muted-foreground));
+    --pele-line: #525866;
+    --pele-surface: #ffffff;
+    --pele-surface-alt: #f2f1ec;
+    --pele-border: #d2cfc6;
+    --pele-accent: hsl(var(--primary));
+    --pele-critical: hsl(var(--destructive));
+    --pele-error: hsl(var(--destructive));
+    --pele-series-1: hsl(var(--chart-1));
+    --pele-series-2: hsl(var(--chart-2));
+    --pele-series-3: hsl(var(--chart-3));
+    --pele-series-4: hsl(var(--chart-4));
+    --pele-series-5: hsl(var(--warning));
+    --pele-series-6: hsl(var(--chart-6));
+    --pele-series-7: hsl(var(--info));
+    --pele-series-8: hsl(var(--chart-5));
 
     /* Segmented control — selected pill */
     --seg-active-bg: 0 0% 100% / 0.60;
@@ -3001,6 +3050,22 @@ html[data-native-browser-hole='true'] [data-ccem-native-browser-viewport]::befor
 /* Keep live workspace transcripts stable while scrolling. */
 .workspace-transcript-scroll [data-radix-scroll-area-viewport] {
   overflow-anchor: none;
+}
+
+/* Pele Mermaid SVG surface refinements */
+.pele-diagram-host > svg {
+  display: block;
+  margin-inline: auto;
+  max-width: 100%;
+  height: auto;
+}
+
+.pele-diagram-host .pele-zoom {
+  box-shadow: 0 2px 8px hsl(var(--glass-shadow-base) / 0.14);
+}
+
+.pele-diagram-host .pele-zoom button:hover:not(:disabled) {
+  background: hsl(var(--muted) / 0.65) !important;
 }
 
 /* Live workspace transcript items stream and auto-scroll; browser paint skipping

@@ -59,7 +59,7 @@ export const WorkspaceNextStepsCard = memo(function WorkspaceNextStepsCard({
     <section
       data-workspace-next-steps="true"
       aria-label={t('workspace.nextStepsTitle')}
-      className="mt-3 max-w-[560px] rounded-xl bg-muted/35 px-3.5 py-3"
+      className="mt-3 max-w-[680px] rounded-xl bg-muted/35 px-3.5 py-3"
     >
       <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground/70">
         <Lightbulb className="h-3 w-3" />

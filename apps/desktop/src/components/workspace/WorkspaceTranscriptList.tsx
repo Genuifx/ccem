@@ -815,7 +815,7 @@ export function WorkspaceTranscriptList({
               key={item.key}
               data-transcript-item-key={item.key}
               className={cn(
-                'max-w-[760px] workspace-tool-digest-virtualized',
+                'w-full workspace-tool-digest-virtualized',
                 getWorkspaceTranscriptSpacing(prevRole, item.role, item.type),
               )}
             >
@@ -834,7 +834,7 @@ export function WorkspaceTranscriptList({
               key={item.key}
               data-transcript-item-key={item.key}
               className={cn(
-                'max-w-[760px]',
+                'w-full',
                 getWorkspaceTranscriptSpacing(prevRole, item.role, item.type),
               )}
             >

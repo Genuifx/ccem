@@ -4767,7 +4767,15 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
       ) : null}
 
       <ScrollArea viewportRef={containerRef} className="workspace-transcript-scroll flex-1 bg-background/30">
-        <div ref={contentRef} className={cn('relative mx-auto max-w-[960px]', compact ? 'px-5 py-5' : 'px-8 py-8')}>
+        <div className={cn(compact ? 'px-3' : 'px-2 sm:px-4')}>
+          <div
+            ref={contentRef}
+            data-workspace-transcript-column="true"
+            className={cn(
+              'relative mx-auto w-full max-w-5xl',
+              compact ? 'px-2 py-5' : 'px-4 py-8',
+            )}
+          >
           <WorkspaceTranscriptSelection
             rootRef={containerRef}
             contentRef={contentRef}
@@ -4829,6 +4837,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
               nextStepActions={nextStepActions}
             />
           )}
+          </div>
         </div>
       </ScrollArea>
 

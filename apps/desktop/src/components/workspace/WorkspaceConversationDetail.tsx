@@ -51,6 +51,8 @@ interface WorkspaceConversationDetailProps {
     appearance?: Partial<WorkspaceAnnotationAppearance>,
   ) => boolean;
   onRemoveAnnotation?: (id: string) => void;
+  /** Dense layout for split-view panes, matching WorkspaceNativeSessionView. */
+  compact?: boolean;
   /** Fork-session-from-turn action for model-output bubbles (stable callback). */
   onForkTurn?: (message: ConversationMessageData) => void;
 }
@@ -75,6 +77,7 @@ export function WorkspaceConversationDetail({
   onAddAnnotation,
   onUpdateAnnotation,
   onRemoveAnnotation,
+  compact = false,
   onForkTurn,
 }: WorkspaceConversationDetailProps) {
   const { t } = useLocale();
@@ -291,7 +294,15 @@ export function WorkspaceConversationDetail({
   return (
     <>
       <ScrollArea viewportRef={messagesContainerRef} className="workspace-transcript-scroll flex-1 bg-background/30">
-        <div ref={contentRef} className="relative mx-auto max-w-[860px] px-8 py-8">
+        <div className={cn(compact ? 'px-3' : 'px-2 sm:px-4')}>
+          <div
+            ref={contentRef}
+            data-workspace-transcript-column="true"
+            className={cn(
+              'relative mx-auto w-full max-w-5xl',
+              compact ? 'px-2 py-5' : 'px-4 py-8',
+            )}
+          >
           {onAddAnnotation && onUpdateAnnotation && onRemoveAnnotation ? (
             <WorkspaceTranscriptSelection
               rootRef={messagesContainerRef}
@@ -336,6 +347,7 @@ export function WorkspaceConversationDetail({
               <WorkspaceTranscriptList messages={displayedMessages} onForkTurn={onForkTurn} todos={sessionTodos} />
             </div>
           )}
+          </div>
         </div>
       </ScrollArea>
     </>

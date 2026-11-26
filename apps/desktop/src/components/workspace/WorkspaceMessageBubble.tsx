@@ -1062,7 +1062,7 @@ function WorkspaceToolDigestComponent({
   }, { dependencies: [open, hasRenderedBody], scope: digestBodyRef, revertOnUpdate: true });
 
   return (
-    <div className={cn('max-w-[760px]', className)}>
+    <div className={cn('w-full', className)}>
       <button
         type="button"
         aria-expanded={open}

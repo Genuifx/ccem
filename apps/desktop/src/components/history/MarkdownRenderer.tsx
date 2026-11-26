@@ -9,6 +9,7 @@ import { cn } from '@/lib/utils';
 import { useLocale } from '@/locales';
 import { getPerformanceMode } from '@/lib/performance';
 import { isMarkdownCodeBlock } from './markdownCodeBlocks';
+import { PeleMermaidBlock } from './PeleMermaidBlock';
 import { Dialog, DialogContent, DialogOverlay, DialogPortal } from '@/components/ui/dialog';
 import { useWorkspaceFileLinks } from '@/components/workspace/WorkspaceFileLinkContext';
 import { resolveWorkspaceDocumentLink, workspaceFileLinkPath } from '@/components/workspace/workspaceFileLinks';
@@ -344,7 +345,7 @@ function CodeBlockFrame({
   return (
     <div
       className={cn(
-        'my-2 overflow-hidden rounded-lg border',
+        'my-3 overflow-hidden rounded-xl border',
         isReading ? 'shadow-[0_1px_2px_rgb(15_23_42/0.04)]' : 'border-[#1e1e2e]/50 bg-[#1e1e2e]'
       )}
       style={isReading ? {
@@ -364,7 +365,7 @@ function CodeBlockFrame({
       >
         <span
           className={cn(
-            'text-[10px] font-mono uppercase tracking-wider',
+            'text-[10.5px] font-mono uppercase tracking-wider',
             !isReading && 'text-white/30'
           )}
           style={isReading ? { color: 'var(--workspace-reading-code-label)' } : undefined}
@@ -515,32 +516,35 @@ function getMarkdownComponents(
   const components: Components = {
           // Headings
           h1: ({ children }) => (
-            <h1 className={cn('text-[17px] font-semibold mt-4 mb-2 first:mt-0', isUser ? 'text-inherit' : 'text-foreground')}>{children}</h1>
+            <h1 className={cn(
+              'text-[19px] font-semibold tracking-[-0.015em] leading-[1.35] mt-6 mb-2.5 first:mt-0',
+              isUser ? 'text-inherit' : 'text-foreground pb-1.5 border-b border-border/50'
+            )}>{children}</h1>
           ),
           h2: ({ children }) => (
-            <h2 className={cn('text-[15px] font-semibold mt-3 mb-1.5 first:mt-0', isUser ? 'text-inherit' : 'text-foreground')}>{children}</h2>
+            <h2 className={cn('text-[16.5px] font-semibold tracking-[-0.01em] leading-[1.4] mt-5 mb-2 first:mt-0', isUser ? 'text-inherit' : 'text-foreground')}>{children}</h2>
           ),
           h3: ({ children }) => (
-            <h3 className={cn('text-[13px] font-semibold mt-2.5 mb-1 first:mt-0', isUser ? 'text-inherit' : 'text-foreground')}>{children}</h3>
+            <h3 className={cn('text-[14.5px] font-semibold leading-[1.45] mt-4 mb-1.5 first:mt-0', isUser ? 'text-inherit' : 'text-foreground')}>{children}</h3>
           ),
           h4: ({ children }) => (
-            <h4 className={cn('text-[13px] font-medium mt-2 mb-1 first:mt-0', isUser ? 'text-inherit' : 'text-foreground')}>{children}</h4>
+            <h4 className={cn('text-[13.5px] font-semibold leading-[1.5] mt-3 mb-1 first:mt-0', isUser ? 'text-inherit' : 'text-foreground')}>{children}</h4>
           ),
 
           // Paragraph
           p: ({ children }) => (
-            <p className="text-[13.5px] leading-[1.75] mb-3 last:mb-0">{children}</p>
+            <p className="text-[14px] leading-[1.75] mb-3 last:mb-0">{children}</p>
           ),
 
           // Lists
           ul: ({ children }) => (
-            <ul className="pl-5 list-disc text-[13.5px] leading-[1.75] mb-3 last:mb-0 space-y-1">{children}</ul>
+            <ul className="pl-5 list-disc text-[14px] leading-[1.75] mb-3 last:mb-0 space-y-1 [&_ul]:mt-1 [&_ol]:mt-1 [&_ul]:mb-0 [&_ol]:mb-0">{children}</ul>
           ),
           ol: ({ children }) => (
-            <ol className="pl-5 list-decimal text-[13.5px] leading-[1.75] mb-3 last:mb-0 space-y-1">{children}</ol>
+            <ol className="pl-5 list-decimal text-[14px] leading-[1.75] mb-3 last:mb-0 space-y-1 [&_ul]:mt-1 [&_ol]:mt-1 [&_ul]:mb-0 [&_ol]:mb-0">{children}</ol>
           ),
           li: ({ children }) => (
-            <li className="text-[13.5px] leading-[1.75]">{children}</li>
+            <li className="text-[14px] leading-[1.75]">{children}</li>
           ),
 
           // Links
@@ -559,15 +563,15 @@ function getMarkdownComponents(
           // Blockquote
           blockquote: ({ children }) => (
             <blockquote className={cn(
-              'border-l-[3px] pl-4 my-3 italic',
-              isUser ? 'border-white/40 text-white/70' : 'border-primary/30 text-muted-foreground'
+              'my-3 rounded-r-lg border-l-[3px] py-1.5 pl-4 pr-3',
+              isUser ? 'border-white/40 text-white/80' : 'border-primary/35 bg-muted/30 text-muted-foreground'
             )}>
               {children}
             </blockquote>
           ),
 
           // Horizontal rule
-          hr: () => <hr className="border-border my-4" />,
+          hr: () => <hr className="border-border/60 my-5" />,
 
           // Strong / emphasis
           strong: ({ children }) => (
@@ -577,15 +581,18 @@ function getMarkdownComponents(
             <em className="italic">{children}</em>
           ),
 
-          // Code — inline and block
+          // Code — inline, Mermaid diagrams (Pele), and fenced blocks
           code: ({ className: codeClassName, children }) => {
-            const match = /language-(\w+)/.exec(codeClassName || '');
+            const match = /language-([^\s]+)/.exec(codeClassName || '');
             const rawCodeString = String(children);
             const codeString = rawCodeString.replace(/\n$/, '');
             const isBlock = isMarkdownCodeBlock(codeClassName, rawCodeString);
 
             if (isBlock) {
               const language = match?.[1] || 'text';
+              if (language.toLowerCase() === 'mermaid') {
+                return <PeleMermaidBlock code={codeString} codeTone={codeTone} />;
+              }
               return (
                 <CodeBlockFrame language={language} code={codeString} codeTone={codeTone}>
                   {shouldReduceCodeRendering || language === 'text' ? (
@@ -602,7 +609,7 @@ function getMarkdownComponents(
             // Inline code
             return (
               <code className={cn(
-                'rounded px-1.5 py-0.5 text-[12px] font-mono',
+                'box-decoration-clone break-words rounded-[5px] px-1.5 py-[0.125rem] text-[12.5px] font-mono leading-[1.55]',
                 isUser
                   ? 'bg-white/20 text-inherit'
                   : isReadingCode
@@ -619,20 +626,22 @@ function getMarkdownComponents(
 
           // Table
           table: ({ children }) => (
-            <div className="my-2 rounded-lg overflow-hidden border border-border">
-              <table className="w-full text-[12px]">{children}</table>
+            <div className="my-3 overflow-x-auto rounded-xl border border-border/75 bg-background/40">
+              <table className="w-full border-collapse text-[13px] leading-[1.65] [&_tbody_tr:last-child_td]:border-b-0 [&_tbody_tr]:transition-[background-color] [&_tbody_tr:hover]:bg-muted/25">
+                {children}
+              </table>
             </div>
           ),
           thead: ({ children }) => (
-            <thead className="bg-muted/50">{children}</thead>
+            <thead className="bg-muted/45">{children}</thead>
           ),
           th: ({ children }) => (
-            <th className="px-3 py-1.5 text-left font-medium text-foreground/80 border-b border-border">
+            <th className="px-3.5 py-2 text-left text-[12px] font-semibold text-foreground/75 border-b border-border/75 whitespace-nowrap">
               {children}
             </th>
           ),
           td: ({ children }) => (
-            <td className="px-3 py-1.5 border-b border-border-subtle">{children}</td>
+            <td className="px-3.5 py-2.5 align-top border-b border-border-subtle/75 text-foreground/90">{children}</td>
           ),
 
           // Task list items (GFM)
