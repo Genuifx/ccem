@@ -777,12 +777,14 @@ function ComposerTriggerSuggestionPanel({
 }
 
 /**
- * Below this composer footer width the model/permission controls collapse to
- * icon-only triggers (their text labels carry the
- * `group-data-[compact]/composer-footer:hidden` variant). Sized so the full
- * labels, quick menu and right-side actions still fit comfortably above it.
+ * Container-width breakpoints for the composer footer row:
+ * - Below `COMPOSER_FOOTER_NARROW_WIDTH` (440px): `data-narrow` hides the
+ *   secondary effort label while keeping the model/environment name visible.
+ * - Below `COMPOSER_FOOTER_COMPACT_WIDTH` (340px) or when `compact={true}`:
+ *   `data-compact` collapses text labels into compact icon/capsule triggers.
  */
-const COMPOSER_FOOTER_COMPACT_WIDTH = 640;
+const COMPOSER_FOOTER_NARROW_WIDTH = 440;
+const COMPOSER_FOOTER_COMPACT_WIDTH = 340;
 
 export function WorkspaceSessionComposer({
   value,
@@ -870,12 +872,16 @@ export function WorkspaceSessionComposer({
   // the controls themselves would oscillate once their text collapses.
   const composerFooterRef = useRef<HTMLDivElement | null>(null);
   const [composerFooterCompact, setComposerFooterCompact] = useState(false);
+  const [composerFooterNarrow, setComposerFooterNarrow] = useState(false);
   useEffect(() => {
     const footer = composerFooterRef.current;
     if (!footer) return;
     const applyWidth = (width: number) => {
       // 0 = not yet measurable (hidden or no layout yet); never compact on unknown width.
-      setComposerFooterCompact(width > 0 && width < COMPOSER_FOOTER_COMPACT_WIDTH);
+      const isCompact = width > 0 && width < COMPOSER_FOOTER_COMPACT_WIDTH;
+      const isNarrow = width >= COMPOSER_FOOTER_COMPACT_WIDTH && width < COMPOSER_FOOTER_NARROW_WIDTH;
+      setComposerFooterCompact(isCompact);
+      setComposerFooterNarrow(isNarrow);
     };
     applyWidth(footer.clientWidth);
     const observer = new ResizeObserver((entries) => {
@@ -2154,9 +2160,10 @@ export function WorkspaceSessionComposer({
           <div
             ref={composerFooterRef}
             data-compact={compact || composerFooterCompact || undefined}
+            data-narrow={!compact && !composerFooterCompact && composerFooterNarrow ? '' : undefined}
             className={cn(
               'group/composer-footer flex items-center',
-              compact ? 'flex-nowrap items-end gap-1' : 'mt-1.5 flex-wrap gap-1.5 border-t border-border/40 pt-1.5',
+              compact ? 'flex-nowrap items-end gap-1' : 'mt-1.5 flex-wrap gap-1.5 data-[compact]:gap-1 border-t border-border/40 pt-1.5',
             )}
           >
             <ComposerQuickMenu

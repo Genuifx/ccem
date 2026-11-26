@@ -103,6 +103,8 @@ async function importHarness() {
           queue = false,
           steer = null,
           provider = 'claude',
+          envName = 'DeepSeek-V4-Flash',
+          compact = false,
           permMode = 'yolo',
           codexInstalled = false,
           agyInstalled = false,
@@ -125,6 +127,7 @@ async function importHarness() {
                 }}
                 onSubmit={() => {}}
                 placeholder="composer input"
+                compact={compact}
                 canSubmit={false}
                 submitLabel="send message"
                 provider={provider}
@@ -144,7 +147,7 @@ async function importHarness() {
                 controls={(
                   <ComposerControls
                     provider={provider}
-                    envName="DeepSeek-V4-Flash"
+                    envName={envName}
                     permMode={permMode}
                     effort="high"
                     environments={[]}
@@ -513,7 +516,7 @@ test('queue dock unmounts once every row has left', async () => {
   }
 });
 
-test('composer controls collapse to icon-only when the footer goes narrow, and restore when it widens', async () => {
+test('composer controls narrow and compact thresholds preserve model identity across breakpoints', async () => {
   const harness = importedHarnessPromise ?? (importedHarnessPromise = importHarness());
   const { mountCompactControls } = await harness;
   const restore = installDom();
@@ -527,6 +530,11 @@ test('composer controls collapse to icon-only when the footer goes narrow, and r
 
     const envLabel = spanByText(container, 'DeepSeek-V4-Flash');
     assert.ok(envLabel, 'environment label span should render');
+    assert.equal(
+      envLabel.className.includes('max-[760px]:hidden'),
+      false,
+      'model label must not collapse from window-width media queries',
+    );
     assert.equal(
       spanByText(container, 'YOLO'),
       null,
@@ -542,43 +550,103 @@ test('composer controls collapse to icon-only when the footer goes narrow, and r
     assert.equal(engineTrigger.querySelectorAll('svg').length, 1, 'engine trigger omits dropdown chevron');
     const modelTrigger = container.querySelector('[data-testid="composer-model-effort-trigger"]');
     assert.ok(modelTrigger, 'model trigger should render');
+    assert.equal(modelTrigger.getAttribute('aria-label'), 'DeepSeek-V4-Flash · 高');
     assert.equal(modelTrigger.querySelectorAll('svg').length, 2, 'model trigger renders icon + effort gauge without dropdown chevron');
-    const compactHidden = 'group-data-[compact]/composer-footer:hidden';
+    assert.match(modelTrigger.className, /group-data-\[compact\]\/composer-footer:bg-foreground\/\[0\.045\]/);
+    assert.match(modelTrigger.className, /group-data-\[compact\]\/composer-footer:ring-1/);
 
-    // Wide footer: full model/env label visible, no compact marker.
-    mounted.driveResize(900);
-    assert.equal(container.querySelector('[data-compact]'), null, 'wide footer must not be compact');
-
-    // Narrow footer: compact marker lands on the footer row and model/effort
-    // labels collapse (icon-only triggers).
-    mounted.driveResize(500);
-    const footer = container.querySelector('[data-compact]');
-    assert.ok(footer, 'narrow footer should carry data-compact');
-    assert.match(footer.className, /group\/composer-footer/);
-    assert.ok(envLabel.className.includes(compactHidden), 'environment label must hide in compact mode');
-    assert.equal(envLabel.textContent, 'DeepSeek-V4-Flash', 'label content is untouched — only presentation hides');
-    const comboboxTrigger = footer.querySelector('[role="combobox"]');
-    assert.equal(comboboxTrigger, permTrigger);
-    assert.match(
-      permTrigger.className,
-      /\[&>svg\]:hidden/,
-      'permission trigger must hide its built-in chevron svg at all widths',
+    const effortTextSpan = [...modelTrigger.querySelectorAll('span')]
+      .find((node) => node.textContent === '高') ?? null;
+    assert.ok(effortTextSpan, 'effort text span should render');
+    const effortCluster = effortTextSpan.parentElement;
+    assert.ok(effortCluster, 'effort cluster wrapper should render');
+    assert.ok(
+      effortCluster.className.includes('group-data-[narrow]/composer-footer:hidden'),
+      'effort cluster hides at data-narrow so model label keeps priority',
     );
+    assert.equal(
+      effortCluster.className.includes('max-[760px]:hidden'),
+      false,
+      'effort cluster must not collapse from window-width media queries',
+    );
+    const compactHidden = 'group-data-[compact]/composer-footer:hidden';
+    assert.ok(envLabel.className.includes(compactHidden), 'environment label hides only in compact mode');
+    assert.ok(effortTextSpan.className.includes(compactHidden), 'effort text hides in compact mode while gauge icon remains');
 
-    // Borderline: just at/above the 640px threshold stays expanded.
-    mounted.driveResize(640);
-    assert.equal(container.querySelector('[data-compact]'), null, '640px footer stays expanded');
+    // Sidebar-open small window (~556px footer): stays expanded with model + effort visible.
+    mounted.driveResize(556);
+    assert.equal(container.querySelector('[data-compact]'), null, '556px footer must not be compact');
+    assert.equal(container.querySelector('[data-narrow]'), null, '556px footer must not be narrow');
 
-    // Below the threshold compact mode returns.
-    mounted.driveResize(639);
-    assert.ok(container.querySelector('[data-compact]'), '639px footer goes compact');
+    // Narrow band (340..439): marks data-narrow to hide effort text while preserving model label.
+    mounted.driveResize(400);
+    assert.ok(container.querySelector('[data-narrow]'), '400px footer should carry data-narrow');
+    assert.equal(container.querySelector('[data-compact]'), null, '400px footer stays non-compact');
 
-    // Widening again removes the marker.
+    // Boundary: 340px stays in narrow band (non-compact); 339px and 300px enter compact capsule mode.
+    mounted.driveResize(340);
+    assert.ok(container.querySelector('[data-narrow]'), '340px footer stays in data-narrow');
+    assert.equal(container.querySelector('[data-compact]'), null, '340px footer must not go compact');
+
+    for (const width of [339, 300]) {
+      mounted.driveResize(width);
+      const footer = container.querySelector('[data-compact]');
+      assert.ok(footer, `${width}px footer should carry data-compact`);
+      assert.equal(container.querySelector('[data-narrow]'), null, `${width}px compact footer clears data-narrow`);
+      assert.match(footer.className, /group\/composer-footer/);
+      assert.equal(envLabel.textContent, 'DeepSeek-V4-Flash', 'label content is untouched — only presentation hides');
+      assert.equal(modelTrigger.querySelectorAll('svg').length, 2, 'compact model capsule retains icon + effort glyph');
+      const comboboxTrigger = footer.querySelector('[role="combobox"]');
+      assert.equal(comboboxTrigger, permTrigger);
+      assert.match(
+        permTrigger.className,
+        /\[&>svg\]:hidden/,
+        'permission trigger must hide its built-in chevron svg at all widths',
+      );
+    }
+
+    // Widening again clears both compact and narrow markers.
     mounted.driveResize(800);
     assert.equal(container.querySelector('[data-compact]'), null, 'widening restores full labels');
+    assert.equal(container.querySelector('[data-narrow]'), null, 'widening clears data-narrow');
 
     mounted.unmount();
   } finally {
+    restore();
+  }
+});
+
+test('compact composer distinguishes same-vendor Engine and Model triggers visually and via aria-label', async () => {
+  const harness = importedHarnessPromise ?? (importedHarnessPromise = importHarness());
+  const { mountCompactControls } = await harness;
+  const restore = installDom();
+  let mounted;
+  try {
+    const container = document.getElementById('root');
+    mounted = mountCompactControls(container, {
+      provider: 'claude',
+      envName: 'Claude-Opus',
+      compact: true,
+      codexInstalled: true,
+      agyInstalled: true,
+      onLaunchNewSession: () => {},
+    });
+
+    const footer = container.querySelector('[data-compact]');
+    assert.ok(footer, 'compact split composer sets data-compact');
+    const engineTrigger = container.querySelector('[data-testid="composer-engine-trigger"]');
+    const modelTrigger = container.querySelector('[data-testid="composer-model-effort-trigger"]');
+    assert.ok(engineTrigger && modelTrigger);
+
+    // Engine keeps a borderless single-icon trigger; Model becomes a dual-icon paired capsule.
+    assert.equal(engineTrigger.querySelectorAll('svg').length, 1);
+    assert.equal(engineTrigger.className.includes('ring-1'), false);
+    assert.equal(modelTrigger.getAttribute('aria-label'), 'Claude-Opus · 高');
+    assert.equal(modelTrigger.querySelectorAll('svg').length, 2);
+    assert.match(modelTrigger.className, /group-data-\[compact\]\/composer-footer:bg-foreground\/\[0\.045\]/);
+    assert.match(modelTrigger.className, /group-data-\[compact\]\/composer-footer:ring-1/);
+  } finally {
+    mounted?.unmount();
     restore();
   }
 });
@@ -766,24 +834,30 @@ test('ComposerQuickMenu attaches files via open_files_dialog, images via picker 
   }
 });
 
-test('composer footer compact threshold is wired through the shared footer row used by every composer surface', async () => {
+test('composer footer narrow and compact thresholds are wired through the shared footer row used by every composer surface', async () => {
   const component = await fs.readFile(
     path.join(desktopDir, 'src', 'components', 'workspace', 'WorkspaceSessionComposer.tsx'),
     'utf8',
   );
   // Every ComposerControls consumer (workspace home, history, native session
-  // view) renders through this single footer row, so the compact contract has
-  // one anchor.
+  // view) renders through this single footer row, so the narrow + compact
+  // contract has one anchor.
   assert.match(component, /group\/composer-footer/);
   assert.match(component, /data-compact=\{compact \|\| composerFooterCompact \|\| undefined\}/);
+  assert.match(component, /data-narrow=\{!compact && !composerFooterCompact && composerFooterNarrow \? '' : undefined\}/);
   const controls = await fs.readFile(
     path.join(desktopDir, 'src', 'components', 'workspace', 'ComposerControls.tsx'),
     'utf8',
   );
-  const occurrences = controls.match(/group-data-\[compact\]\/composer-footer:hidden/g) ?? [];
+  const compactOccurrences = controls.match(/group-data-\[compact\]\/composer-footer:hidden/g) ?? [];
   assert.equal(
-    occurrences.length,
-    2,
-    'env name and effort cluster collapse',
+    compactOccurrences.length,
+    4,
+    'env name, lock badge, middot, and effort text collapse at data-compact while the gauge glyph remains',
+  );
+  assert.match(
+    controls,
+    /group-data-\[narrow\]\/composer-footer:hidden/,
+    'effort cluster hides first at data-narrow before compact mode',
   );
 });

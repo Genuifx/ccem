@@ -504,9 +504,14 @@ function ComposerControlsView({
     ? clampEffortToSupportedLevels(effort, effortLevels)
     : effort;
   const agyTriggerLabel = selectedAgyModel?.name ?? selectedAgyModelId ?? 'Antigravity';
+  const primaryTriggerLabel = isAgyProvider ? agyTriggerLabel : envName;
+  const effortLabel = showEffortControl ? t(EFFORT_I18N_KEYS[displayEffort]) : null;
+  const modelTriggerSummary = effortLabel
+    ? `${primaryTriggerLabel} · ${effortLabel}`
+    : primaryTriggerLabel;
 
   return (
-    <div className="flex min-w-0 max-w-full flex-wrap items-center gap-1.5">
+    <div className="flex min-w-0 max-w-full flex-wrap items-center gap-1.5 group-data-[compact]/composer-footer:gap-1">
       <DropdownMenu
         modal={false}
         open={envEffortOpen}
@@ -519,64 +524,81 @@ function ComposerControlsView({
           setEnvEffortOpen(open);
         }}
       >
-        <DropdownMenuTrigger asChild>
-          <button
-            type="button"
-            data-testid="composer-model-effort-trigger"
-            className={cn(
-              'flex h-8 min-w-0 max-w-full items-center gap-1.5 rounded-xl px-2.5 max-[760px]:px-2 group-data-[compact]/composer-footer:w-8 group-data-[compact]/composer-footer:justify-center group-data-[compact]/composer-footer:px-0 text-[12px] text-foreground',
-              // Transition colors/shadow only: animating layout props (padding,
-              // width) lets the compact/expanded swap get stuck mid-transition
-              // when the state flips before the composer is first painted.
-              'cursor-pointer outline-none transition-[background-color,box-shadow] duration-150',
-              'hover:bg-foreground/[0.05] focus:ring-2 focus:ring-primary/30',
-            )}
-          >
-            <span
-              className={cn(
-                'flex min-w-0 items-center gap-1.5',
-                !isAgyProvider && isEnvironmentLocked && 'text-muted-foreground/65',
-              )}
-            >
-              <span className={cn('flex shrink-0', !isAgyProvider && isEnvironmentLocked && 'opacity-45 grayscale')}>
-                {isAgyProvider
-                  ? (selectedAgyModelId
-                    ? <EnvironmentLobeIcon hint={selectedAgyModelId} />
-                    : <Antigravity.Color size={14} className="shrink-0" />)
-                  : <EnvironmentLobeIcon hint={currentEnvironmentIconHint} />}
-              </span>
-              <span
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                data-testid="composer-model-effort-trigger"
+                aria-label={modelTriggerSummary}
                 className={cn(
-                  'min-w-0 truncate max-[760px]:hidden group-data-[compact]/composer-footer:hidden',
-                  isAgyProvider ? 'max-w-[148px]' : 'max-w-[112px]',
+                  'flex h-8 min-w-0 max-w-full items-center gap-1.5 rounded-xl px-2.5 text-[12px] text-foreground',
+                  'group-data-[narrow]/composer-footer:px-2',
+                  'group-data-[compact]/composer-footer:gap-1 group-data-[compact]/composer-footer:bg-foreground/[0.045] group-data-[compact]/composer-footer:px-2 group-data-[compact]/composer-footer:ring-1 group-data-[compact]/composer-footer:ring-inset group-data-[compact]/composer-footer:ring-border/50',
+                  // Transition colors/shadow only: animating layout props (padding,
+                  // width) lets the compact/expanded swap get stuck mid-transition
+                  // when the state flips before the composer is first painted.
+                  'cursor-pointer outline-none transition-[background-color,box-shadow] duration-150',
+                  'hover:bg-foreground/[0.05] group-data-[compact]/composer-footer:hover:bg-foreground/[0.08] focus:ring-2 focus:ring-primary/30',
                 )}
               >
-                {isAgyProvider ? agyTriggerLabel : envName}
-              </span>
-              {!isAgyProvider && isEnvironmentLocked && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-muted/50 text-muted-foreground">
+                <span
+                  className={cn(
+                    'flex min-w-0 items-center gap-1.5',
+                    !isAgyProvider && isEnvironmentLocked && 'text-muted-foreground/65',
+                  )}
+                >
+                  <span className={cn('flex shrink-0', !isAgyProvider && isEnvironmentLocked && 'opacity-45 grayscale')}>
+                    {isAgyProvider
+                      ? (selectedAgyModelId
+                        ? <EnvironmentLobeIcon hint={selectedAgyModelId} />
+                        : <Antigravity.Color size={14} className="shrink-0" />)
+                      : <EnvironmentLobeIcon hint={currentEnvironmentIconHint} />}
+                  </span>
+                  <span
+                    className={cn(
+                      'min-w-0 truncate group-data-[compact]/composer-footer:hidden',
+                      isAgyProvider
+                        ? 'max-w-[148px] group-data-[narrow]/composer-footer:max-w-[112px]'
+                        : 'max-w-[112px] group-data-[narrow]/composer-footer:max-w-[92px]',
+                    )}
+                  >
+                    {primaryTriggerLabel}
+                  </span>
+                  {!isAgyProvider && isEnvironmentLocked && (
+                    <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-muted/50 text-muted-foreground group-data-[compact]/composer-footer:hidden">
                       <Lock className="h-2.5 w-2.5" />
                     </span>
-                  </TooltipTrigger>
-                  <TooltipContent side="top" className="max-w-[260px] text-[12px] leading-5">
-                    {environmentLockedHint}
-                  </TooltipContent>
-                </Tooltip>
-              )}
-            </span>
-            {showEffortControl && (
-              <span className="inline-flex shrink-0 items-center gap-1 max-[760px]:hidden group-data-[compact]/composer-footer:hidden">
-                <span className="text-muted-foreground/60">·</span>
-                <Gauge className="h-3 w-3 shrink-0 text-muted-foreground" />
-                <span className="shrink-0 whitespace-nowrap text-muted-foreground">
-                  {t(EFFORT_I18N_KEYS[displayEffort])}
+                  )}
                 </span>
-              </span>
-            )}
-          </button>
-        </DropdownMenuTrigger>
+                {showEffortControl ? (
+                  <span className="inline-flex shrink-0 items-center gap-1 group-data-[narrow]/composer-footer:hidden">
+                    <span className="text-muted-foreground/60 group-data-[compact]/composer-footer:hidden">·</span>
+                    <Gauge className="h-3 w-3 shrink-0 text-muted-foreground" />
+                    <span className="shrink-0 whitespace-nowrap text-muted-foreground group-data-[compact]/composer-footer:hidden">
+                      {effortLabel}
+                    </span>
+                  </span>
+                ) : (
+                  <Brain
+                    data-testid="composer-model-compact-glyph"
+                    className="hidden h-3 w-3 shrink-0 text-muted-foreground group-data-[compact]/composer-footer:inline-flex"
+                  />
+                )}
+              </button>
+            </DropdownMenuTrigger>
+          </TooltipTrigger>
+          {!envEffortOpen && (
+            <TooltipContent side="top" className="max-w-[260px] text-[12px] leading-5">
+              <div>{modelTriggerSummary}</div>
+              {!isAgyProvider && isEnvironmentLocked && (
+                <div className="mt-0.5 text-[11px] text-muted-foreground">
+                  {environmentLockedHint}
+                </div>
+              )}
+            </TooltipContent>
+          )}
+        </Tooltip>
         <DropdownMenuContent
           ref={envEffortContentRef}
           align="start"
