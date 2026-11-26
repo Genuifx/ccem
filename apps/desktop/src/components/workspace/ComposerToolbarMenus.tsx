@@ -160,6 +160,7 @@ export interface ComposerQuickMenuProps {
   planModeKind: 'session_permission' | 'command_prefix';
   onPlanModeEnabledChange?: (enabled: boolean) => void;
   routeDraftRow?: ReactNode;
+  triggerClassName?: string;
 }
 
 export function ComposerQuickMenu({
@@ -179,6 +180,7 @@ export function ComposerQuickMenu({
   planModeKind,
   onPlanModeEnabledChange,
   routeDraftRow,
+  triggerClassName,
 }: ComposerQuickMenuProps) {
   const { t } = useLocale();
   const [open, setOpen] = useState(false);
@@ -283,6 +285,7 @@ export function ComposerQuickMenu({
             'transition-colors hover:bg-foreground/[0.05] hover:text-foreground',
             'focus-visible:ring-2 focus-visible:ring-primary/30',
             'disabled:pointer-events-none disabled:opacity-45',
+            triggerClassName,
           )}
           aria-label={t('workspace.composerQuickMenuLabel')}
         >

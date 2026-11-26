@@ -4351,6 +4351,7 @@ export function Workspace({
 
       <div className="w-full max-w-3xl">
         <WorkspaceSessionComposer
+          hero
           value={composePrompt}
           valueRevision={composePromptRevision}
           onValueChange={handleComposePromptChange}

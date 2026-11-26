@@ -105,6 +105,7 @@ async function importHarness() {
           provider = 'claude',
           envName = 'DeepSeek-V4-Flash',
           compact = false,
+          hero = false,
           permMode = 'yolo',
           codexInstalled = false,
           agyInstalled = false,
@@ -128,6 +129,7 @@ async function importHarness() {
                 onSubmit={() => {}}
                 placeholder="composer input"
                 compact={compact}
+                hero={hero}
                 canSubmit={false}
                 submitLabel="send message"
                 provider={provider}
@@ -860,4 +862,50 @@ test('composer footer narrow and compact thresholds are wired through the shared
     /group-data-\[narrow\]\/composer-footer:hidden/,
     'effort cluster hides first at data-narrow before compact mode',
   );
+});
+
+test('composer differentiates hero and docked proportions, omits footer divider, and aligns corner controls', async () => {
+  const harness = importedHarnessPromise ?? (importedHarnessPromise = importHarness());
+  const { mountCompactControls } = await harness;
+  const restore = installDom();
+  let mounted;
+  try {
+    const container = document.getElementById('root');
+    mounted = mountCompactControls(container, { hero: false, compact: false });
+
+    const dockedCard = container.querySelector('[data-composer-shell-card]');
+    const dockedEditor = container.querySelector('.prompt-area-editor');
+    const dockedQuick = container.querySelector('[data-testid="composer-quick-menu-trigger"]');
+    const dockedFooter = dockedQuick?.parentElement;
+    const dockedSubmit = container.querySelector('[data-workspace-composer-submit]');
+    const dockedRightGroup = dockedSubmit?.parentElement;
+    assert.ok(dockedCard && dockedEditor && dockedQuick && dockedFooter && dockedRightGroup);
+    assert.equal(dockedEditor.style.minHeight, '40px');
+    assert.ok(dockedCard.className.includes('rounded-[20px]'));
+    assert.ok(dockedCard.className.includes('px-4') && dockedCard.className.includes('pt-3.5') && dockedCard.className.includes('pb-2.5'));
+    assert.equal(dockedFooter.className.includes('border-t'), false, 'docked composer removes inner footer divider');
+    assert.ok(dockedFooter.className.includes('mt-1.5'));
+    assert.ok(dockedQuick.className.includes('-ml-1.5'));
+    assert.ok(dockedRightGroup.className.includes('-mr-1.5'));
+    mounted.unmount();
+
+    mounted = mountCompactControls(container, { hero: true, compact: false });
+    const heroCard = container.querySelector('[data-composer-shell-card]');
+    const heroEditor = container.querySelector('.prompt-area-editor');
+    const heroQuick = container.querySelector('[data-testid="composer-quick-menu-trigger"]');
+    const heroFooter = heroQuick?.parentElement;
+    const heroSubmit = container.querySelector('[data-workspace-composer-submit]');
+    const heroRightGroup = heroSubmit?.parentElement;
+    assert.ok(heroCard && heroEditor && heroQuick && heroFooter && heroRightGroup);
+    assert.equal(heroEditor.style.minHeight, '68px');
+    assert.ok(heroCard.className.includes('rounded-[22px]'));
+    assert.ok(heroCard.className.includes('px-5') && heroCard.className.includes('pt-4') && heroCard.className.includes('pb-3'));
+    assert.equal(heroFooter.className.includes('border-t'), false, 'hero composer removes inner footer divider');
+    assert.ok(heroFooter.className.includes('mt-2'));
+    assert.ok(heroQuick.className.includes('-ml-2'));
+    assert.ok(heroRightGroup.className.includes('-mr-2'));
+  } finally {
+    mounted?.unmount();
+    restore();
+  }
 });

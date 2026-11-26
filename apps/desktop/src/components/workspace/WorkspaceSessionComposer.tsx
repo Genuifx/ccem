@@ -191,6 +191,8 @@ interface WorkspaceSessionComposerProps {
   placeholder: string;
   /** Dense layout for split-view panes: short prompt area, tight chrome. */
   compact?: boolean;
+  /** Spacious centerpiece proportions for the empty-workspace landing view. */
+  hero?: boolean;
   disabled?: boolean;
   canSubmit: boolean;
   isSubmitting?: boolean;
@@ -794,6 +796,7 @@ export function WorkspaceSessionComposer({
   onSubmit,
   placeholder,
   compact = false,
+  hero = false,
   disabled = false,
   canSubmit,
   isSubmitting = false,
@@ -1855,7 +1858,8 @@ export function WorkspaceSessionComposer({
 
   // Compact (split-view panes) puts the prompt inline in the footer row,
   // between the icon-only options and the send button.
-  const promptAreaNode = (<div className={cn('relative', compact ? 'min-h-[24px] min-w-0 flex-1 py-1' : 'min-h-[44px]')}>
+  const defaultEditorMinHeight = compact ? 24 : hero ? 68 : 40;
+  const promptAreaNode = (<div className={cn('relative', compact ? 'min-h-[24px] min-w-0 flex-1 py-1' : hero ? 'min-h-[68px]' : 'min-h-[40px]')}>
       <PromptArea
         ref={promptAreaRef}
         value={composerSegments}
@@ -1863,7 +1867,7 @@ export function WorkspaceSessionComposer({
         triggers={promptAreaTriggers}
         placeholder={placeholder}
         disabled={disabled}
-        minHeight={compact ? 24 : 44}
+        minHeight={defaultEditorMinHeight}
         maxHeight={compact ? 160 : 260}
         autoGrow
         markdown={false}
@@ -1977,8 +1981,12 @@ export function WorkspaceSessionComposer({
           data-composer-shell-card
           data-composer-drop-active={isDragTarget || undefined}
           className={cn(
-            'relative z-20 rounded-[20px] border border-border/40 bg-surface-raised px-4 py-2.5 shadow-[0_40px_120px_-70px_rgba(0,0,0,0.38)] transition-[border-color,box-shadow] duration-300',
-            compact && 'rounded-[14px] px-2 py-1.5 shadow-[0_1px_2px_hsl(var(--glass-shadow-base)/0.06)]',
+            'relative z-20 border border-border/40 bg-surface-raised shadow-[0_40px_120px_-70px_rgba(0,0,0,0.38)] transition-[border-color,box-shadow] duration-300',
+            compact
+              ? 'rounded-[14px] px-2 py-1.5 shadow-[0_1px_2px_hsl(var(--glass-shadow-base)/0.06)]'
+              : hero
+                ? 'rounded-[22px] px-5 pt-4 pb-3'
+                : 'rounded-[20px] px-4 pt-3.5 pb-2.5',
             isDragTarget && 'border-primary/45 ring-4 ring-primary/10',
             planModeEnabled && 'border-primary/15',
           )}
@@ -2163,7 +2171,9 @@ export function WorkspaceSessionComposer({
             data-narrow={!compact && !composerFooterCompact && composerFooterNarrow ? '' : undefined}
             className={cn(
               'group/composer-footer flex items-center',
-              compact ? 'flex-nowrap items-end gap-1' : 'mt-1.5 flex-wrap gap-1.5 data-[compact]:gap-1 border-t border-border/40 pt-1.5',
+              compact
+                ? 'flex-nowrap items-end gap-1'
+                : cn(hero ? 'mt-2' : 'mt-1.5', 'flex-wrap gap-1.5 data-[compact]:gap-1'),
             )}
           >
             <ComposerQuickMenu
@@ -2182,6 +2192,7 @@ export function WorkspaceSessionComposer({
               planModeHint={planModeHint}
               planModeKind={capabilities.planModeKind}
               onPlanModeEnabledChange={onPlanModeEnabledChange}
+              triggerClassName={!compact ? (hero ? '-ml-2' : '-ml-1.5') : undefined}
               routeDraftRow={routeDraft != null && onRouteDraftChange && isRouteDraftRowVisible(provider) ? (
                 <ComposerRouteDraftRow
                   draft={routeDraft}
@@ -2206,7 +2217,7 @@ export function WorkspaceSessionComposer({
 
             {compact ? promptAreaNode : null}
 
-            <div className={cn('flex shrink-0 items-center', compact ? 'gap-1' : 'ml-auto gap-1.5')}>
+            <div className={cn('flex shrink-0 items-center', compact ? 'gap-1' : cn('ml-auto gap-1.5', hero ? '-mr-2' : '-mr-1.5'))}>
               {secondaryActions}
 
               <Button

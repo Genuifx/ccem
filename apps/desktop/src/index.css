@@ -1201,7 +1201,7 @@
 }
 
 .ccem-prompt-area .prompt-area-editor {
-  min-height: 44px;
+  min-height: 40px;
   color: hsl(var(--foreground));
   font-size: 14px;
   line-height: 26px;
