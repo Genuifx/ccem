@@ -44,9 +44,12 @@ pub(super) fn model_config(env: &str) -> Result<Value, String> {
             .unwrap_or(selected),
         _ => selected,
     };
-    if selected.trim().is_empty() || ["opus", "sonnet", "haiku"].contains(&selected) {
-        return Err("hermes_concrete_model_required".into());
-    }
+    let selected = match selected.trim() {
+        "" | "sonnet" => "claude-sonnet-4-20250514",
+        "opus" => "claude-opus-4-20250514",
+        "haiku" => "claude-3-5-haiku-20241022",
+        concrete => concrete,
+    };
     Ok(
         json!({"provider":"custom","apiMode":"anthropic_messages","baseUrl":base,"apiKey":key,"model":selected,"authStyle":"bearer"}),
     )
@@ -58,6 +61,45 @@ pub(super) fn available_models() -> Vec<Value> {
     }).collect::<Vec<_>>()).unwrap_or_default();
     models.sort_by_key(|m| m["envName"].as_str().unwrap_or("").to_owned());
     models
+}
+
+pub(super) fn unavailable_model_reasons() -> Vec<Value> {
+    let Ok(cfg) = config::read_config() else {
+        return Vec::new();
+    };
+    let mut skipped = Vec::new();
+    for name in cfg.registries.keys() {
+        if model_config(name).is_ok() {
+            continue;
+        }
+        let reason = if name == "official" {
+            "oauth_not_supported"
+        } else {
+            match config::resolve_claude_env(name) {
+                Ok(resolved) => {
+                    let has_token = resolved
+                        .env_vars
+                        .get("ANTHROPIC_AUTH_TOKEN")
+                        .is_some_and(|v| !v.trim().is_empty());
+                    let has_url = resolved
+                        .upstream_base_url
+                        .as_ref()
+                        .is_some_and(|v| v.starts_with("https://") || v.starts_with("http://"));
+                    if !has_token {
+                        "missing_api_key"
+                    } else if !has_url {
+                        "missing_base_url"
+                    } else {
+                        "incompatible_env"
+                    }
+                }
+                Err(_) => "incompatible_env",
+            }
+        };
+        skipped.push(json!({"envName": name, "reason": reason}));
+    }
+    skipped.sort_by_key(|m| m["envName"].as_str().unwrap_or("").to_owned());
+    skipped
 }
 
 impl HermesBridgeManager {
@@ -132,13 +174,21 @@ impl HermesBridgeManager {
         let mut targets = self.cron_notification_targets()?;
         if let Some(targets) = targets.as_array_mut() {
             for target in targets {
-                let snapshot = target["accountRef"]
-                    .as_str()
+                let account_ref = target["accountRef"].as_str().map(str::to_owned);
+                let snapshot = account_ref
+                    .as_deref()
                     .and_then(|id| self.connection_process(id).ok())
                     .map(|p| p.snapshot());
                 target["handoffReady"] = json!(snapshot
                     .as_ref()
                     .is_some_and(|s| s["state"] == "running" && s["sessionHandoff"] == 1));
+                if let Some(account) = account_ref.as_deref() {
+                    if let Ok(pref) = self.conversation_model(account) {
+                        if let Some(env_name) = pref["envName"].as_str() {
+                            target["modelEnv"] = json!(env_name);
+                        }
+                    }
+                }
             }
         }
         let mut models = Vec::new();

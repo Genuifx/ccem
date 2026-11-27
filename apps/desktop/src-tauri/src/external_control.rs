@@ -929,6 +929,34 @@ impl ExternalControlManager {
         }))
     }
 
+    pub(crate) fn create_managed_session(
+        &self,
+        app: AppHandle,
+        cwd: String,
+        prompt: String,
+    ) -> Result<String, String> {
+        self.create_session(
+            app,
+            CreateSessionParams {
+                provider: "claude".to_string(),
+                cwd: Some(cwd),
+                prompt,
+                env_name: None,
+                permission_mode: None,
+                runtime_permission_mode: None,
+                provider_session_id: None,
+                effort: None,
+                model: None,
+                open: Some(false),
+                router_launch_draft: None,
+                routes: None,
+                allowed_envs: None,
+                dynamic_routing: None,
+            },
+        )
+        .map(|result| result.runtime_id)
+    }
+
     fn create_session(
         &self,
         app: AppHandle,

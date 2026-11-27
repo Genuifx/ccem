@@ -110,6 +110,8 @@ export interface ConversationMessageData {
   isCompactBoundary: boolean;
   planContent?: string;
   annotations?: Array<{ quote: string; note: string }>;
+  /** True when the user prompt was submitted remotely through a Hermes bot. */
+  fromHermes?: boolean;
 }
 
 export type ConversationMessageList = ConversationMessageData[] & {

@@ -292,6 +292,33 @@ class NativePairingProvenance(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(host.pending), 1)
         self.assertIsNone(host.pairing)
 
+    async def test_numbered_short_confirm_cancel_all_and_fence_safe_markdown_chunks(self):
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageEvent
+        from gateway.session import SessionSource
+        host = host_module.Host({"protocolVersion": 1, "token": "x" * 48,
+            "accountRef": "a" * 48, "endpoint": "http://127.0.0.1:1/rpc", "platform": "wecom"},
+            Path(os.environ["HERMES_HOME"]))
+        source_dm = SessionSource(platform=Platform("wecom"), chat_id="chat", user_id="user", chat_type="dm")
+        self.assertEqual(
+            host.pairing_hook(event=MessageEvent(text="确认 2", message_id="m1", source=source_dm)),
+            {"action": "rewrite", "text": "/ccem shortReply confirm:2"},
+        )
+        self.assertEqual(
+            host.pairing_hook(event=MessageEvent(text="取消全部", message_id="m2", source=source_dm)),
+            {"action": "rewrite", "text": "/ccem shortReply cancelAll"},
+        )
+        self.assertEqual(
+            host.pairing_hook(event=MessageEvent(text="/ccem cancel all", message_id="m3", source=source_dm)),
+            {"action": "rewrite", "text": "/ccem cancelAll"},
+        )
+        code_doc = "说明段落\n\n```python\n" + "".join(f"print('line-{i:03d}')\n" for i in range(60)) + "```\n结尾"
+        chunks = host_module._conversation_module.split_markdown_chunks(code_doc, 400)
+        self.assertGreater(len(chunks), 2)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk.encode("utf-8")), 400)
+            self.assertEqual(chunk.count("```") % 2, 0, f"Unbalanced code fence in chunk: {chunk!r}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

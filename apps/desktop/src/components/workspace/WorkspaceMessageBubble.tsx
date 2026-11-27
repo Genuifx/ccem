@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import {
   AlertCircle,
+  Bot,
   Brain,
   Check,
   ChevronDown,
@@ -2038,6 +2039,12 @@ function WorkspaceMessageBubbleComponent({ message, turnMetrics, prevRole, onFor
             onBlurCapture={handleActionRegionBlur}
           >
             <div className="rounded-[24px] border border-border/30 bg-[hsl(var(--chat-assistant-bg)/0.7)] px-5 py-4 text-foreground">
+              {message.fromHermes ? (
+                <div className="mb-2 flex items-center gap-1.5 text-[11px] font-medium text-primary/85" data-hermes-origin-badge>
+                  <Bot className="h-3 w-3" />
+                  <span>{t('workspace.fromHermesBot')}</span>
+                </div>
+              ) : null}
               {message.annotations?.length ? (
                 <div className="mb-3 border-b border-border/25 pb-2">
                   <WorkspaceMessageAnnotationsPopover annotations={message.annotations} />

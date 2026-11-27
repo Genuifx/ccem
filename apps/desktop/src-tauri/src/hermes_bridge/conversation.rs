@@ -39,7 +39,7 @@ impl HermesBridgeManager {
     }
 
     pub(super) fn conversation_model(&self, account: &str) -> Result<Value, String> {
-        self.with_store(|s| {
+        let from_store = self.with_store(|s| {
             if let Some(saved) = s.setting(&format!("conversation_model:{account}"))? {
                 return serde_json::from_str(&saved).map_err(|_| "hermes_model_environment_unavailable".into());
             }
@@ -55,7 +55,24 @@ impl HermesBridgeManager {
                 s.set_setting(&format!("conversation_model:{account}"), &inferred.to_string())?;
             }
             Ok(inferred)
-        })
+        })?;
+        if !from_store.is_null() {
+            return Ok(from_store);
+        }
+        // Auto-fallback to CCEM's active API environment or the sole compatible API environment
+        // so newly paired bots can chat immediately without hitting a wall on the first message.
+        if let Ok(cfg) = crate::config::read_config() {
+            if let Some(current_env) = cfg.current.as_deref() {
+                if let Ok(resolved) = model_config(current_env) {
+                    return Ok(json!({"envName": current_env, "model": resolved["model"], "autoDefault": true}));
+                }
+            }
+        }
+        let available = super::session_handoff::available_models();
+        if let Some(first) = available.first() {
+            return Ok(json!({"envName": first["envName"], "model": first["model"], "autoDefault": true}));
+        }
+        Ok(Value::Null)
     }
 
     pub(super) fn conversation_snapshot(&self, route: &Route) -> Result<Value, String> {
@@ -72,6 +89,7 @@ impl HermesBridgeManager {
             let notifications = s.deliveries()?.into_iter().filter(|d| d.route_id == route.id && d.generation == route.generation && d.status == "sent" && d.conversation_scope.is_none())
                 .take(5).map(|d| json!({"id":d.id,"text":d.text,"createdAt":d.created_at})).collect::<Vec<_>>();
             Ok(json!({"scope":scope(route),"model":model,"modelError":model_error,"bindings":bindings,"recentNotifications":notifications,
+                "authorizedWorkspaces":route.workspaces,"allowInput":route.allow_input,
                 "hasPendingCcemInput":!s.pending_chat_inputs(route)?.is_empty()}))
         })
     }
@@ -99,11 +117,21 @@ impl HermesBridgeManager {
         let challenge = input["challenge"].as_str().ok_or("challenge_required")?;
         let runtime = input["runtimeId"].as_str().ok_or("runtime_id_required")?;
         let text = input["text"].as_str().ok_or("input_text_required")?;
-        let title = self.native.get_session_summary(runtime)?.and_then(|s| s.display_title).unwrap_or_else(|| "当前任务".into());
-        let title: String = title.chars().take(80).collect();
-        let preview = format!("准备交给「{title}」执行：\n\n{text}\n\n回复“确认”后开始，回复“取消”放弃。两分钟内有效。");
+        let header = if let Some(cwd) = runtime.strip_prefix("create:") {
+            let folder = std::path::Path::new(cwd)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| cwd.to_string());
+            let folder: String = folder.chars().take(80).collect();
+            format!("准备在工作区「{folder}」新建会话并执行：")
+        } else {
+            let title = self.native.get_session_summary(runtime)?.and_then(|s| s.display_title).unwrap_or_else(|| "当前任务".into());
+            let title: String = title.chars().take(80).collect();
+            format!("准备交给「{title}」执行：")
+        };
+        let preview = format!("{header}\n\n{text}\n\n回复“确认”后开始，回复“取消”放弃（如有多条待确认可回复“取消全部”）。5 分钟内有效。");
         // The preview must contain the entire frozen instruction on every supported channel.
-        if preview.len() > 1900 { return Err("confirmation_preview_too_large".into()); }
+        if preview.len() > 1950 { return Err("confirmation_preview_too_large".into()); }
         self.with_store(|s| {
             let id = digest(&format!("confirmation-preview:{challenge}"));
             if s.delivery(&id)?.is_none() {
@@ -118,9 +146,9 @@ impl HermesBridgeManager {
         })
     }
 
-    pub(super) fn short_confirmation(&self, route: &Route, owner: &str, message: &str, action: &str, received_at_ns: Option<u64>) -> Result<String, String> {
+    pub(super) fn short_confirmation(&self, route: &Route, owner: &str, message: &str, action: &str, index: Option<usize>, received_at_ns: Option<u64>) -> Result<String, String> {
         let presented = self.presented_inputs.lock().map_err(|_| "bridge_lock_poisoned")?;
-        self.with_store(|s| select_confirmation(s, route, owner, message, action, received_at_ns, &presented))
+        self.with_store(|s| select_confirmation_indexed(s, route, owner, message, action, index, received_at_ns, &presented))
     }
 
     pub(super) fn enqueue_conversation_reply(&self, route: &Route, message: &str, text: &str, delivery_key: Option<&str>) -> Result<Value, String> {
@@ -183,11 +211,20 @@ fn presented_from_delivery(store: &super::store::Store, id: &str) -> Result<Opti
 }
 
 fn select_confirmation(store: &super::store::Store, route: &Route, owner: &str, message: &str, action: &str, received_at_ns: Option<u64>, presented: &std::collections::HashMap<String, PresentedInput>) -> Result<String, String> {
-        let remembered = store.short_reply_choice(route, message, action, None)?;
-        let candidates = presented.values()
+    select_confirmation_indexed(store, route, owner, message, action, None, received_at_ns, presented)
+}
+
+fn select_confirmation_indexed(store: &super::store::Store, route: &Route, owner: &str, message: &str, action: &str, index: Option<usize>, received_at_ns: Option<u64>, presented: &std::collections::HashMap<String, PresentedInput>) -> Result<String, String> {
+        let action_key = match index {
+            Some(idx) => format!("{action}:{idx}"),
+            None => action.to_owned(),
+        };
+        let remembered = store.short_reply_choice(route, message, &action_key, None)?;
+        let mut candidates = presented.values()
             .filter(|p| p.owner == digest(owner) && p.scope == scope(route) && p.expires > now()
                 && received_at_ns.is_some_and(|t| t > p.shown_at_ns))
             .cloned().collect::<Vec<_>>();
+        candidates.sort_by_key(|p| p.shown_at_ns);
         let mut pending = Vec::new();
         for p in candidates {
             if let Ok((input_route, _)) = store.confirmation_route(route, &p.challenge) {
@@ -203,16 +240,24 @@ fn select_confirmation(store: &super::store::Store, route: &Route, owner: &str, 
             if state == "confirmed" || pending.contains(&choice) { return Ok(choice); }
             return Err("challenge_expired_or_revoked".into());
         }
+        if let Some(idx) = index {
+            if idx == 0 || idx > pending.len() {
+                store.reject_short_reply(route, message, &action_key, "no_presented_confirmation")?;
+                return Err("no_presented_confirmation".into());
+            }
+            return store.short_reply_choice(route, message, &action_key, Some(&pending[idx - 1]))?
+                .ok_or_else(|| "no_presented_confirmation".into());
+        }
         if pending.len() != 1 {
             let reason = if pending.is_empty() {"no_presented_confirmation"} else {"ambiguous_confirmation"};
-            store.reject_short_reply(route, message, action, reason)?;
+            store.reject_short_reply(route, message, &action_key, reason)?;
             return Err(reason.into());
         }
         if store.pending_chat_inputs(route)? != pending {
-            store.reject_short_reply(route, message, action, "ambiguous_confirmation")?;
+            store.reject_short_reply(route, message, &action_key, "ambiguous_confirmation")?;
             return Err("ambiguous_confirmation".into());
         }
-        store.short_reply_choice(route, message, action, Some(&pending[0]))?
+        store.short_reply_choice(route, message, &action_key, Some(&pending[0]))?
             .ok_or_else(|| "no_presented_confirmation".into())
 }
 

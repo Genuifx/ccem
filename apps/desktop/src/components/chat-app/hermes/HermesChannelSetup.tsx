@@ -5,9 +5,10 @@ import { ArrowRight, CheckCircle2, ChevronDown, ExternalLink, KeyRound, Lock, Qr
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { useLocale } from '@/locales';
 import type { HermesConnection, HermesPlatform, HermesRunAction, HermesSetup } from '@/lib/hermes-ipc';
-import { errorText, platformAvailabilityKey, platformDisplayName, SETUP_CANCELLABLE } from './hermes-presentation';
+import { errorText, fieldDisplayLabel, platformAvailabilityKey, platformDisplayName, SETUP_CANCELLABLE } from './hermes-presentation';
 import { HermesPlatformIcon } from './HermesVisuals';
 
 function SetupDocs({ platform }: { platform: HermesPlatform }) {
@@ -95,10 +96,22 @@ export function HermesChannelForm({ platform, connection, disabled, run, onSaved
       <div className="hermes-form-heading"><h3>{t('hermes.manualTitle')}</h3><p>{t('hermes.manualDescription', { platform: platformDisplayName(platform.id, platform.label, t) })}</p></div>
       {unavailable && <p role="status" className="hermes-caption">{t(unavailable)}</p>}
       {platform.fields.map((field) => <div key={field.key} className="hermes-field">
-        <Label htmlFor={`hermes-field-${field.key}`}>{field.label}{!field.required && <span className="hermes-optional">{t('hermes.optional')}</span>}</Label>
-        <Input id={`hermes-field-${field.key}`} type={field.secret ? 'password' : 'text'} autoComplete="off" spellCheck={false}
-          value={fields[field.key] ?? ''} disabled={disabled || Boolean(unavailable)} placeholder={configured.includes(field.key) ? t('hermes.alreadyConfigured') : undefined}
-          onChange={(event) => setFields((current) => ({ ...current, [field.key]: event.target.value }))} />
+        <Label htmlFor={`hermes-field-${field.key}`}>{fieldDisplayLabel(field, t)}{!field.required && <span className="hermes-optional">{t('hermes.optional')}</span>}</Label>
+        {field.key === 'FEISHU_DOMAIN' ? (
+          <Select value={fields[field.key] ?? ''} onValueChange={(value) => setFields((current) => ({ ...current, [field.key]: value }))} disabled={disabled || Boolean(unavailable)}>
+            <SelectTrigger id={`hermes-field-${field.key}`}>
+              <SelectValue placeholder={configured.includes(field.key) ? t('hermes.alreadyConfigured') : t('hermes.feishuDomainCn')} />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="feishu">{t('hermes.feishuDomainCn')}</SelectItem>
+              <SelectItem value="lark">{t('hermes.feishuDomainGlobal')}</SelectItem>
+            </SelectContent>
+          </Select>
+        ) : (
+          <Input id={`hermes-field-${field.key}`} type={field.secret ? 'password' : 'text'} autoComplete="off" spellCheck={false}
+            value={fields[field.key] ?? ''} disabled={disabled || Boolean(unavailable)} placeholder={configured.includes(field.key) ? t('hermes.alreadyConfigured') : undefined}
+            onChange={(event) => setFields((current) => ({ ...current, [field.key]: event.target.value }))} />
+        )}
       </div>)}
       <div className="hermes-field"><Label htmlFor="hermes-connection-label">{t('hermes.connectionLabel')}</Label>
         <Input id="hermes-connection-label" value={label} maxLength={128} disabled={disabled} placeholder={platformDisplayName(platform.id, platform.label, t)} onChange={(event) => setLabel(event.target.value)} />

@@ -1,10 +1,10 @@
 import { useState } from 'react';
-import { FolderOpen } from '@/lib/lucide-react';
+import { FolderOpen, Plus } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 import { useLocale } from '@/locales';
-import type { HermesRoute, HermesRunAction } from '@/lib/hermes-ipc';
+import { openDirectoryDialog, type HermesRoute, type HermesRunAction } from '@/lib/hermes-ipc';
 import { workspaceName } from './HermesVisuals';
 
 export type WorkspaceAccess = { workspaces: string[]; allowInput: boolean; notifications: boolean };
@@ -17,10 +17,22 @@ export function WorkspaceAccessFields({ id, workspaces, value, onChange, disable
 }) {
   const { t } = useLocale();
   const [query, setQuery] = useState('');
-  const visible = workspaces.filter((workspace) => workspace.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()));
+  const [customWorkspaces, setCustomWorkspaces] = useState<string[]>([]);
+  const allWorkspaces = [...new Set([...workspaces, ...customWorkspaces, ...value.workspaces])];
+  const visible = allWorkspaces.filter((workspace) => workspace.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()));
   return <fieldset disabled={disabled} className="hermes-workspaces">
-    <legend>{t('hermes.authorizedWorkspaces')}</legend>
-    {workspaces.length === 0 ? <p className="hermes-caption">{t('hermes.noWorkspaces')}</p> : <>
+    <div className="flex items-center justify-between gap-2">
+      <legend>{t('hermes.authorizedWorkspaces')}</legend>
+      <Button type="button" size="sm" variant="outline" disabled={disabled} data-hermes-pick-folder onClick={() => {
+        void openDirectoryDialog().then((picked) => {
+          const folder = picked?.trim();
+          if (!folder) return;
+          setCustomWorkspaces((prev) => [...new Set([...prev, folder])]);
+          onChange({ ...value, workspaces: [...new Set([...value.workspaces, folder])] });
+        }).catch(() => {});
+      }}><Plus className="h-3.5 w-3.5" aria-hidden="true" />{t('hermes.addWorkspaceFolder')}</Button>
+    </div>
+    {allWorkspaces.length === 0 ? <p className="hermes-caption">{t('hermes.noWorkspaces')}</p> : <>
       <Input id={`hermes-workspace-search-${id}`} type="search" value={query} placeholder={t('hermes.searchWorkspaces')}
         aria-label={t('hermes.searchWorkspaces')} onChange={(event) => setQuery(event.target.value)} />
       <p className="hermes-caption" aria-live="polite">{t('hermes.selectedWorkspaces', { count: value.workspaces.length })}</p>
@@ -30,7 +42,7 @@ export function WorkspaceAccessFields({ id, workspaces, value, onChange, disable
       <Switch aria-label={workspace} checked={value.workspaces.includes(workspace)} disabled={disabled}
         onCheckedChange={(checked) => onChange({ ...value, workspaces: checked ? [...new Set([...value.workspaces, workspace])] : value.workspaces.filter((item) => item !== workspace) })} />
     </label>)}</div>
-    {workspaces.length > 0 && visible.length === 0 && <p className="hermes-caption">{t('hermes.noMatchingWorkspaces')}</p>}
+    {allWorkspaces.length > 0 && visible.length === 0 && <p className="hermes-caption">{t('hermes.noMatchingWorkspaces')}</p>}
     {value.workspaces.length === 0 && <p className="hermes-caption">{t('hermes.noWorkspaceAccessHint')}</p>}
     <label className="hermes-permission-option"><span>{t('hermes.allowInput')}</span><Switch checked={value.workspaces.length > 0 && value.allowInput}
       onCheckedChange={(allowInput) => onChange({ ...value, allowInput })} disabled={disabled || value.workspaces.length === 0} aria-label={t('hermes.allowInput')} /></label>
@@ -53,8 +65,13 @@ export function RouteAccessEditor({ route, workspaces, disabled, run, onClose }:
   return <form tabIndex={-1} aria-label={t('hermes.manageWorkspaceAccess')} className="hermes-route-editor" data-hermes-route-editor={route.id} onSubmit={(event) => {
     event.preventDefault();
     if (disabled || !changed) return;
-    void run('updateRoute', { accountRef: route.source.accountRef, id: route.id, generation: route.generation, ...effective })
-      .then((result) => { if (result) onClose(); });
+    void run('updateRoute', {
+      accountRef: route.source.accountRef,
+      id: route.id,
+      generation: route.generation,
+      ...(route.revision !== undefined ? { revision: route.revision } : {}),
+      ...effective,
+    }).then((result) => { if (result) onClose(); });
   }}>
     <WorkspaceAccessFields id={route.id} workspaces={available} value={value} onChange={setValue} disabled={disabled} />
     <div className="flex gap-2"><Button type="submit" size="sm" disabled={disabled || !changed}>{t('hermes.saveWorkspaceAccess')}</Button>

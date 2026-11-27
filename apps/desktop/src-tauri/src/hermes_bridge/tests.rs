@@ -365,10 +365,11 @@ fn paired_identity_can_gain_and_remove_all_access_without_pairing_again() {
         .is_err());
     let granted = f
         .store()
-        .update_route_access(
+        .update_route_access_with_revision(
             &account,
             &empty.id,
             empty.generation,
+            Some(empty.revision),
             vec![path.clone()],
             true,
             true,
@@ -376,6 +377,11 @@ fn paired_identity_can_gain_and_remove_all_access_without_pairing_again() {
         )
         .unwrap();
     assert_eq!(empty.id, granted.id);
+    assert_eq!(
+        empty.generation, granted.generation,
+        "workspace edits preserve identity generation so chat memory, cron and handoffs stay alive"
+    );
+    assert!(granted.revision > empty.revision);
     assert_eq!(granted.source, identity);
     assert!(granted.permits(&path));
     assert_eq!(
@@ -386,10 +392,11 @@ fn paired_identity_can_gain_and_remove_all_access_without_pairing_again() {
     );
     assert!(f
         .store()
-        .update_route_access(
+        .update_route_access_with_revision(
             &account,
             &empty.id,
             empty.generation,
+            Some(empty.revision),
             vec![],
             false,
             false,
@@ -450,6 +457,91 @@ fn paired_identity_can_gain_and_remove_all_access_without_pairing_again() {
         )
         .is_err());
     assert!(f.store().connection(&other).unwrap().enabled);
+    // Disabled routes can be removed cleanly without affecting active connections.
+    f.store().remove_route(&unbound.id).unwrap();
+    assert!(f.store().routes().unwrap().is_empty());
+}
+
+#[test]
+fn workspace_access_edit_preserves_conversation_scope_handoff_and_cron_targets() {
+    let mut f = Fixture::new();
+    let account = f
+        .store()
+        .save_connection(None, "wecom", Some("Dev Bot"), "cipher", &[], true)
+        .unwrap()
+        .account_ref;
+    let mut identity = source();
+    identity.account_ref = account.clone();
+    identity.platform = "wecom".into();
+    let initial = f
+        .store()
+        .approve_route_with_meta(
+            identity,
+            Some("Alice".into()),
+            vec![],
+            false,
+            false,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(initial.user_name.as_deref(), Some("Alice"));
+    let initial_scope = super::conversation::scope(&initial);
+    let binding = f
+        .store()
+        .bind_session(
+            SessionBinding {
+                id: String::new(),
+                runtime_id: "native-bound".into(),
+                route_id: initial.id.clone(),
+                generation: initial.generation,
+                title: "Bound session".into(),
+                model_env: "api".into(),
+                model: "claude-sonnet-4-20250514".into(),
+                cursor: 10,
+                input_context: None,
+                created_at: 0,
+                last_decision_at: None,
+                last_decision: None,
+                error: None,
+            },
+            &initial,
+        )
+        .unwrap();
+    let workspace = f.root.join("workspace").to_string_lossy().into_owned();
+    let updated = f
+        .store()
+        .update_route_access_with_revision(
+            &account,
+            &initial.id,
+            initial.generation,
+            Some(initial.revision),
+            vec![workspace],
+            true,
+            true,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(updated.generation, initial.generation);
+    assert_eq!(updated.user_name.as_deref(), Some("Alice"));
+    assert_eq!(super::conversation::scope(&updated), initial_scope);
+    assert!(f.store().binding_route(&binding).unwrap().is_some());
+    let c1 = f
+        .store()
+        .prepare(&updated, "msg-1", "runtime-1", "task 1")
+        .unwrap()["challenge"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let c2 = f
+        .store()
+        .prepare(&updated, "msg-2", "runtime-2", "task 2")
+        .unwrap()["challenge"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(f.store().cancel_all_pending(&updated).unwrap(), 2);
+    assert!(f.store().confirm(&updated, "c-1", &c1, "runtime-1").is_err());
+    assert!(f.store().confirm(&updated, "c-2", &c2, "runtime-2").is_err());
 }
 
 #[test]

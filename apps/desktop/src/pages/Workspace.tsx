@@ -4108,6 +4108,10 @@ export function Workspace({
     onNavigate('environments');
   }, [onNavigate]);
 
+  const handleNavigateChatApp = useCallback(() => {
+    onNavigate('chat-app');
+  }, [onNavigate]);
+
   const selectedHistorySupportsInline = selectedSession?.source !== 'opencode';
 
   useEffect(() => {
@@ -4946,6 +4950,7 @@ export function Workspace({
                           onStartNextStepSession={handleStartNextStepSession}
                           onOpenSessionKey={handleOpenSessionKey}
                           onNavigateEnvironments={handleNavigateEnvironments}
+                          onNavigateChatApp={handleNavigateChatApp}
                           onStartNew={handleLiveStartNew}
                           reviewWorkingDir={
                             historyCwdByProviderSessionId.get(entry.session.provider_session_id ?? '')

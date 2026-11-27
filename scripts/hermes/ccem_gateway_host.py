@@ -71,11 +71,13 @@ def confirmation_reply(text, prefix):
     The normal gateway admission and Rust challenge checks still run afterward.
     """
     value = text.strip()
-    hint = re.match(r"^(两分钟内发送|取消)\s*[:：]\s*", value)
+    hint = re.match(r"^(两分钟内发送|五分钟内发送|5\s*分钟内发送|取消)\s*[:：]\s*", value)
     if hint:
         value = value[hint.end():]
     # Slack translates a leading !ccem to /ccem before gateway dispatch.
     accepted_prefix = r"(?:!ccem|/ccem)" if prefix == "!ccem" else re.escape(prefix)
+    if re.fullmatch(accepted_prefix + r"\s+cancel\s+all", value, flags=re.IGNORECASE):
+        return "cancelAll"
     match = re.fullmatch(accepted_prefix + r"\s+(confirm|cancel)\s+([0-9a-fA-F\s]+)", value)
     if match:
         action, wrapped = match.groups()
@@ -91,11 +93,11 @@ def confirmation_reply(text, prefix):
 
 def command_error(code, prefix):
     if code == "no_presented_confirmation":
-        return "当前没有待确认的操作。可以直接告诉我你想做什么。"
+        return "当前没有待确认的操作，可以直接告诉我你想做什么。"
     if code == "ambiguous_confirmation":
-        return "现在有多条待确认操作，不能确定你指哪条。请等待它们过期后重新提出需要执行的任务。"
+        return "当前有多条待确认操作。请回复“确认 1”、“确认 2”指定要执行哪一条，或回复“取消全部”清空后再重新发送。"
     if code == "conversation_scope_changed":
-        return "这段对话的授权已更新，请重新发送你的消息。"
+        return "这段对话的配对状态已更新，请重新发送你的消息。"
     if code in {"challenge_expired_or_revoked", "challenge_not_found", "challenge_scope_mismatch"}:
         return "这条确认已过期或失效，没有提交新的执行。请重新发送原任务内容，收到新预览后再确认。"
     if code in {"session_not_found", "session_not_active"}:
@@ -105,7 +107,9 @@ def command_error(code, prefix):
     if code == "challenge_not_pending":
         return "这条请求已处理，不能再取消；如果任务已提交，取消确认不会停止正在执行的任务。"
     if code in {"input_not_allowed", "workspace_not_authorized"}:
-        return "当前会话尚未允许机器人继续执行。请先在 CCEM 授权后再试。"
+        return "当前尚未授权机器人执行该工作区操作。请先在电脑端 CCEM 开启工作区与后续指令权限，或将当前会话「交给机器人」。"
+    if code == "workspace_not_found":
+        return "未找到对应的本机工作区目录，请检查目录路径是否存在。"
     return f"CCEM 请求未完成。请稍后重试；已提交任务可用 {prefix} operation 查询。"
 
 
@@ -362,6 +366,33 @@ class Host:
             shutil.copytree(bundled, target)
         self._prepared_conversation_homes.add(home)
 
+    def _schedule_pairing_feedback(self, source, text):
+        if not self.runner or not source or not getattr(source, "chat_id", None):
+            return
+        adapters = getattr(self.runner, "adapters", None)
+        if not isinstance(adapters, dict):
+            return
+        platform = str(getattr(source.platform, "value", source.platform))
+        live = any(
+            str(getattr(key, "value", key)) == platform and callable(getattr(adapter, "send", None))
+            for key, adapter in adapters.items()
+        )
+        if not live:
+            return
+        async def _send():
+            try:
+                from gateway.managed_contracts import send_strict, StrictTarget
+                from hermes_cli.profiles import get_active_profile_name
+                target_profile = getattr(self.runner, "_primary_profile_name", None) or source.profile or get_active_profile_name()
+                target = StrictTarget(profile=target_profile, platform=platform, chat_id=source.chat_id, thread_id=source.thread_id)
+                await send_strict(self.runner, target, text, timeout=10.0)
+            except Exception:
+                pass
+        try:
+            self.loop.create_task(_send())
+        except Exception:
+            pass
+
     def pairing_hook(self, *args, **kwargs):
         event = kwargs.get("event")
         if not event or getattr(event, "internal", True) or not getattr(event, "allow_gateway_control", False):
@@ -377,8 +408,14 @@ class Host:
         if not event.is_command():
             # Exact control replies are authenticated by normal native admission.
             # All other messages stay intact for Hermes's conversation loop.
-            if event.text.strip() in ("确认", "取消"):
-                return {"action": "rewrite", "text": "/ccem shortReply " + ("confirm" if event.text.strip() == "确认" else "cancel")}
+            stripped = event.text.strip() if isinstance(event.text, str) else ""
+            if stripped in ("确认", "取消"):
+                return {"action": "rewrite", "text": "/ccem shortReply " + ("confirm" if stripped == "确认" else "cancel")}
+            if stripped in ("取消全部", "全部取消"):
+                return {"action": "rewrite", "text": "/ccem shortReply cancelAll"}
+            numbered = re.fullmatch(r"确认\s*([1-9][0-9]?)", stripped)
+            if numbered:
+                return {"action": "rewrite", "text": f"/ccem shortReply confirm:{numbered.group(1)}"}
             return None
         if event.get_command() != "ccem":
             return None
@@ -388,13 +425,18 @@ class Host:
         source = event.source
         # Pairing is an observation only. It cannot read a task or authorize input.
         from gateway.managed_contracts import native_source_message_id
-        if not source or not source.user_id or not source.chat_id or source.chat_type != "dm" or source.thread_id or not native_source_message_id(event):
+        has_native_id = bool(native_source_message_id(event))
+        if not source or not source.user_id or not source.chat_id or source.chat_type != "dm" or source.thread_id or not has_native_id:
+            if has_native_id and source and (source.chat_type != "dm" or source.thread_id):
+                self._schedule_pairing_feedback(source, "账号配对仅支持与机器人的直接私聊（暂不支持群聊或话题），请在私聊窗口发送配对指令。")
             return {"action": "skip", "reason": "invalid_pairing_source"}
         with self.lock:
             self.snapshot()
-            if len(pieces) != 2 or not self.pairing or not secrets.compare_digest(pieces[1], self.pairing["code"]):
-                return {"action": "skip", "reason": "pairing_window_not_open"}
             platform = str(source.platform.value)
+            prefix = command_prefix(platform)
+            if len(pieces) != 2 or not self.pairing or not secrets.compare_digest(pieces[1], self.pairing["code"]):
+                self._schedule_pairing_feedback(source, f"配对码无效或已过期。请在电脑端 CCEM 机器人详情中点击「关联账号」，复制最新 {prefix} connect 指令重新发送。")
+                return {"action": "skip", "reason": "pairing_window_not_open"}
             if platform != self.boot.get("platform"):
                 return {"action": "skip", "reason": "pairing_platform_mismatch"}
             native_source = dataclasses.replace(source)
@@ -412,6 +454,7 @@ class Host:
             if not approved and not request_id and not code:
                 self.error = "pairing_rate_limited"
                 self.publish()
+                self._schedule_pairing_feedback(source, "配对请求过于频繁，请稍候一分钟再试。")
                 return {"action": "skip", "reason": "pairing_rate_limited"}
             from hermes_cli.profiles import get_active_profile_name
             profile = source.profile or get_active_profile_name()
@@ -419,14 +462,17 @@ class Host:
             identity = {"accountRef": self.boot["accountRef"], "platform": platform, "profile": profile, "transportProfile": target_profile,
                         "userId": source.user_id, "chatId": source.chat_id,
                         "threadId": source.thread_id, "chatType": source.chat_type}
+            user_name = (getattr(source, "user_name", None) or "").strip()[:120] or None
             identifier = secrets.token_hex(24)
-            self.pending[identifier] = {"id": identifier, "source": identity, "expiresAt": int(time.time()*1000)+120_000,
+            self.pending[identifier] = {"id": identifier, "source": identity, "userName": user_name,
+                                        "expiresAt": int(time.time()*1000)+300_000,
                                         "nativeCode": code, "nativeRequestId": request_id, "nativeApproved": approved,
                                         "nativeSource": native_source}
             if self.error == "pairing_rate_limited":
                 self.error = None
             self.pairing = None  # one native sender per desktop pairing window
             self.publish()
+        self._schedule_pairing_feedback(source, "已收到配对请求，请回到电脑端 CCEM 点击「确认配对」完成绑定。")
         return {"action": "skip", "reason": "awaiting_desktop_approval"}
 
     def rpc(self, method, params):
@@ -458,7 +504,11 @@ class Host:
         from gateway.managed_contracts import send_strict, StrictTarget, retain_managed_control_ingress
         # Pin before waiting for a command slot or resolving scope. A timeout
         # must not let a later transport retry acquire a post-preview timestamp.
-        if raw_args.strip().split() in (["shortReply", "confirm"], ["shortReply", "cancel"]):
+        raw_parts = raw_args.strip().split()
+        is_short_reply = len(raw_parts) == 2 and raw_parts[0] == "shortReply" and (
+            raw_parts[1] in ("confirm", "cancel", "cancelAll") or bool(re.fullmatch(r"confirm:[1-9][0-9]?", raw_parts[1]))
+        )
+        if is_short_reply:
             retain_managed_control_ingress(self.runner, context)
         target = StrictTarget(profile=context.transport_profile, platform=context.platform,
                               chat_id=context.chat_id, thread_id=context.thread_id)
@@ -472,22 +522,28 @@ class Host:
                 method = args[0] if args else "help"
                 params = {"source": source_value(context, self.boot["accountRef"]), "sourceMessageId": context.source_message_id}
                 if method == "confirmation-help":
-                    await send_strict(self.runner, target, f"请单独发送一条确认或取消指令，例如：\n{prefix} confirm <确认码>\n请只复制预览中的确认指令，不要连同任务正文或取消指令一起发送。")
+                    await send_strict(self.runner, target, f"请单独发送一条确认或取消指令，例如：\n{prefix} confirm <确认码>\n（也可以直接回复“确认”、“取消”或“取消全部”；请不要连同任务正文一起发送。）")
                     return None
-                elif method == "shortReply" and len(args) == 2 and args[1] in ("confirm", "cancel"):
+                elif is_short_reply:
                     params["text"] = args[1]
                     scope = await asyncio.to_thread(self.rpc, "conversation", {k: v for k, v in params.items() if k != "text"})
                     params["conversationScope"] = scope["scope"]
                     # This frozen transport timestamp predates command-slot waits.
                     # Missing timing stays missing so the authority can fail closed.
                     params["receivedAtNs"] = context.received_at_ns
-                elif method in ("list",):
+                elif method in ("list", "cancelAll"):
                     pass
                 elif method == "chat":
                     text = raw_args.strip().partition(" ")[2]
                     if not text.strip() or len(text.encode("utf-8")) > input_limit:
                         raise ValueError("input_text_required")
                     params["text"] = text
+                elif method == "create" and len(args) == 3:
+                    if len(args[2].encode("utf-8")) > input_limit:
+                        await send_strict(self.runner, target, f"新建会话的指令太长，请缩短到 {input_limit} UTF-8 字节以内后重试。")
+                        return None
+                    params["cwd"] = args[1]
+                    params["text"] = args[2]
                 elif method in ("status", "events", "input") and len(args) >= 2:
                     params["runtimeId"] = args[1]
                     if method == "input":
@@ -499,16 +555,25 @@ class Host:
                         params["text"] = args[2]
                     elif method == "events" and len(args) == 3:
                         params["cursor"] = int(args[2])
+                elif method == "cancel" and len(args) == 2 and args[1].lower() == "all":
+                    method = "cancelAll"
                 elif method in ("confirm", "cancel") and len(args) == 2:
                     params["challenge"] = args[1]
                 elif method == "operation" and len(args) == 2:
                     params["operationId"] = args[1]
                 else:
-                    await send_strict(self.runner, target, "\n".join(prefix + " " + line for line in ("list", "status <runtime>", "events <runtime> [cursor]", "input <runtime> <text>", "confirm <challenge>", "cancel <challenge>", "operation <operation>")))
+                    await send_strict(self.runner, target, "\n".join(prefix + " " + line for line in ("list", "status <runtime>", "events <runtime> [cursor]", "input <runtime> <text>", "create <workspace> <text>", "confirm <challenge>", "cancel <challenge|all>", "operation <operation>")))
                     return None
                 result = await asyncio.to_thread(self.rpc, method, params)
                 if method == "shortReply":
-                    text = "已取消这次操作。" if result.get("state") == "cancelled" else ("任务是否收到还不能确认，请先让我查询状态。" if result.get("state") == "unknown" else "已交给任务继续处理，有结果时会告诉你。")
+                    if args[1] == "cancelAll":
+                        count = result.get("cancelledCount", 0)
+                        text = f"已清空 {count} 条待确认操作。" if count else "当前没有待取消的操作。"
+                    else:
+                        text = "已取消这次操作。" if result.get("state") == "cancelled" else ("任务是否收到还不能确认，请先让我查询状态。" if result.get("state") == "unknown" else "已交给任务继续处理，有进展时会告诉你。")
+                elif method == "cancelAll":
+                    count = result.get("cancelledCount", 0)
+                    text = f"已清空 {count} 条待确认操作。" if count else "当前没有待取消的操作。"
                 else:
                     text = render_result(result, maximum, prefix)
             except ValueError as error:
@@ -569,7 +634,7 @@ class Host:
                 raise ValueError("gateway_not_running")
             with self.lock:
                 self.pending.clear()
-                self.pairing = {"code": secrets.token_hex(12), "expiresAt": int(time.time()*1000)+120_000}
+                self.pairing = {"code": secrets.token_hex(12), "expiresAt": int(time.time()*1000)+300_000}
             self.publish()
             return self.pairing
         if method == "approvePairing":
@@ -589,7 +654,7 @@ class Host:
             if not approved or str(approved["user_id"]) != pending["source"]["userId"]:
                 raise ValueError("pairing_approval_failed")
             self.publish()
-            return {"source": pending["source"]}
+            return {"source": pending["source"], "userName": pending.get("userName")}
         if method == "sendStrict":
             from gateway.managed_contracts import send_strict, StrictTarget
             if self.state != "running":
@@ -719,7 +784,8 @@ def render_result(result, maximum=3500, prefix="/ccem"):
     if not isinstance(result, dict):
         return "CCEM：请求已处理。"
     if "challenge" in result:
-        preview = f"继续任务 {result['runtimeId']}\n\n{result['text']}\n\n两分钟内发送：\n{prefix} confirm {result['challenge']}\n\n取消：\n{prefix} cancel {result['challenge']}"
+        target_label = f"在工作区 {result['runtimeId'][7:]} 新建任务" if str(result.get("runtimeId", "")).startswith("create:") else f"继续任务 {result['runtimeId']}"
+        preview = f"{target_label}\n\n{result['text']}\n\n5 分钟内发送：\n{prefix} confirm {result['challenge']}\n\n取消：\n{prefix} cancel {result['challenge']}"
         if len(preview.encode("utf-8")) > maximum:
             # Never ask a user to approve a truncated instruction.
             raise ValueError("confirmation_preview_too_large")

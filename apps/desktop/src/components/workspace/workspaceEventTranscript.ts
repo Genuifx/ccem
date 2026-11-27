@@ -49,6 +49,7 @@ export interface LocalUserPrompt {
    */
   queuedBehindTurn?: boolean;
   queuedDeliveryState?: NativeQueuedPromptDeliveryState;
+  fromHermes?: boolean;
 }
 
 interface PendingAssistantTurn {
@@ -106,6 +107,7 @@ function createUserMessage(prompt: LocalUserPrompt): ConversationMessageData {
       segmentIndex: 0,
       isCompactBoundary: false,
       ...(prompt.annotations?.length ? { annotations: prompt.annotations } : {}),
+      ...(prompt.fromHermes ? { fromHermes: true } : {}),
     };
   }
 
@@ -117,6 +119,7 @@ function createUserMessage(prompt: LocalUserPrompt): ConversationMessageData {
     segmentIndex: 0,
     isCompactBoundary: false,
     ...(prompt.annotations?.length ? { annotations: prompt.annotations } : {}),
+    ...(prompt.fromHermes ? { fromHermes: true } : {}),
   };
 }
 
@@ -1311,6 +1314,7 @@ function foldTranscriptEvents(
           images,
           annotations: event.payload.annotations ?? undefined,
           timestamp: occurredAt,
+          fromHermes: Boolean(event.payload.client_message_id?.startsWith('hermes:')),
         }));
         foldConsumeMatchingPrompt(
           state,

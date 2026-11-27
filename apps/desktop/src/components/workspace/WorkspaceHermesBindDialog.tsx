@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Bot, LoaderCircle, RefreshCw } from '@/lib/lucide-react';
+import { ArrowRight, Bot, LoaderCircle, RefreshCw } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
@@ -15,6 +15,13 @@ function botLabel(target: { label: string; platform: string }, t: (key: string) 
   return target.label && target.label !== target.platform ? target.label : platformDisplayName(target.platform, target.label, t);
 }
 
+function resolvePreferredModelEnv(data: HermesSessionHandoff, chosen?: HermesSessionHandoff['targets'][number]): string {
+  if (data.binding?.modelEnv) return data.binding.modelEnv;
+  if (chosen?.modelEnv && data.models.some((m) => m.envName === chosen.modelEnv)) return chosen.modelEnv;
+  if (data.models.some((m) => m.envName === data.defaultModelEnv)) return data.defaultModelEnv;
+  return '';
+}
+
 function handoffIssue(snapshot: HermesSessionHandoff): string | null {
   const binding = snapshot.binding;
   if (!binding) return null;
@@ -27,11 +34,12 @@ function handoffIssue(snapshot: HermesSessionHandoff): string | null {
   return null;
 }
 
-export function WorkspaceHermesBindDialog({ open, onOpenChange, session, onLegacyOpen }: {
+export function WorkspaceHermesBindDialog({ open, onOpenChange, session, onLegacyOpen, onNavigateChatApp }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   session: NativeSessionSummary;
   onLegacyOpen: () => void;
+  onNavigateChatApp?: () => void;
 }) {
   const { t } = useLocale();
   const [snapshot, setSnapshot] = useState<HermesSessionHandoff | null>(null);
@@ -50,7 +58,7 @@ export function WorkspaceHermesBindDialog({ open, onOpenChange, session, onLegac
       ? data.targets.find((r) => r.routeId === data.binding?.routeId && r.generation === data.binding?.generation)
       : data.targets.length === 1 ? data.targets[0] : undefined;
     setTarget(chosen ? `${chosen.routeId}:${chosen.generation}` : '');
-    setModelEnv(data.binding?.modelEnv ?? (data.models.some((m) => m.envName === data.defaultModelEnv) ? data.defaultModelEnv : ''));
+    setModelEnv(resolvePreferredModelEnv(data, chosen));
     setError(false);
     initialized.current = true;
   }, []);
@@ -120,11 +128,20 @@ export function WorkspaceHermesBindDialog({ open, onOpenChange, session, onLegac
         </div>}
         {snapshot && <>
           <div className="space-y-2"><Label htmlFor="hermes-handoff-target">{t('workspace.hermesHandoffBot')}</Label>
-            <Select value={selected ? target : ''} onValueChange={setTarget} disabled={busy || loading}><SelectTrigger id="hermes-handoff-target"><SelectValue placeholder={t('workspace.hermesHandoffChoose')} /></SelectTrigger>
+            <Select value={selected ? target : ''} onValueChange={(nextKey) => {
+              setTarget(nextKey);
+              const nextTarget = snapshot.targets.find((r) => `${r.routeId}:${r.generation}` === nextKey);
+              if (!modelEnv && nextTarget?.modelEnv && snapshot.models.some((m) => m.envName === nextTarget.modelEnv)) {
+                setModelEnv(nextTarget.modelEnv);
+              }
+            }} disabled={busy || loading}><SelectTrigger id="hermes-handoff-target"><SelectValue placeholder={t('workspace.hermesHandoffChoose')} /></SelectTrigger>
               <SelectContent>{snapshot.targets.map((r) => <SelectItem key={`${r.routeId}:${r.generation}`} value={`${r.routeId}:${r.generation}`}>
-                <span className="flex items-center gap-2 [&_.hermes-platform-icon]:h-6 [&_.hermes-platform-icon]:w-6 [&_img]:h-4 [&_img]:w-4"><HermesPlatformIcon platform={r.platform} /><span className="truncate">{botLabel(r, t)} · …{r.chatId.slice(-8)}</span></span>
+                <span className="flex items-center gap-2 [&_.hermes-platform-icon]:h-6 [&_.hermes-platform-icon]:w-6 [&_img]:h-4 [&_img]:w-4"><HermesPlatformIcon platform={r.platform} /><span className="truncate">{botLabel(r, t)}{r.userName?.trim() ? ` · ${r.userName.trim()}` : ''} · …{r.chatId.slice(-8)}</span></span>
               </SelectItem>)}</SelectContent></Select>
-            {!snapshot.targets.length && <p className="text-xs text-muted-foreground">{t('cron.hermesNoTargets')}</p>}
+            {!snapshot.targets.length && <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-xs text-muted-foreground">{t('cron.hermesNoTargets')}</p>
+              {onNavigateChatApp && <Button type="button" size="sm" variant="outline" className="h-7 gap-1 text-xs" data-hermes-go-setup onClick={() => { onOpenChange(false); onNavigateChatApp(); }}>{t('workspace.hermesHandoffGoSetup')}<ArrowRight className="h-3.5 w-3.5" /></Button>}
+            </div>}
             {target && !selected && <p className="text-xs text-amber-600 dark:text-amber-400" role="status">{t('cron.hermesStaleTarget')}</p>}
             {selected && !selected.handoffReady && <p className="text-xs text-amber-600" role="status">{t('workspace.hermesHandoffNotReady')}</p>}
           </div>
@@ -170,7 +187,9 @@ export function WorkspaceHermesSessionBadge({ runtimeId, dialogOpen, onClick }: 
     };
     void refresh();
     const timer = window.setInterval(() => void refresh(), 15000);
-    return () => { cancelled = true; window.clearInterval(timer); };
+    const onFocus = () => void refresh();
+    window.addEventListener('focus', onFocus);
+    return () => { cancelled = true; window.clearInterval(timer); window.removeEventListener('focus', onFocus); };
   }, [runtimeId, dialogOpen]);
   if (!status?.binding) return null;
   const target = status.targets.find((r) => r.routeId === status.binding?.routeId && r.generation === status.binding?.generation);

@@ -18,6 +18,7 @@ export interface HermesNotificationTarget extends CronHermesNotification {
   chatId: string;
   threadId?: string | null;
   userId: string;
+  userName?: string | null;
   chatType: string;
 }
 
@@ -41,7 +42,7 @@ export interface HermesSessionHandoff {
   binding: HermesSessionBinding | null;
   bindingValid: boolean;
   deliveryStatus: string | null;
-  targets: (HermesNotificationTarget & { handoffReady: boolean })[];
+  targets: (HermesNotificationTarget & { handoffReady: boolean; modelEnv?: string | null })[];
   models: { envName: string; model: string }[];
   defaultModelEnv: string;
 }
@@ -104,12 +105,15 @@ export interface HermesConnection {
 export interface HermesPendingPairing {
   id: string;
   source: HermesSource;
+  userName?: string | null;
   expiresAt: string | number;
 }
 
 export interface HermesRoute {
   id: string;
   generation: number;
+  revision?: number;
+  userName?: string | null;
   source: HermesSource;
   workspaces: string[];
   enabled: boolean;
@@ -119,6 +123,7 @@ export interface HermesRoute {
 
 export interface HermesStatus {
   conversationModels?: { envName: string; model: string }[];
+  unavailableModels?: { envName: string; reason: string }[];
   // Receipt on configureChannel responses only; never infer it from list order.
   configuredAccountRef?: string;
   installer: {
@@ -140,8 +145,25 @@ export interface HermesStatus {
   connections: HermesConnection[];
   setup?: HermesSetup | null;
   routes: HermesRoute[];
-  operations: Array<{ id: string; runtimeId: string; state: string; detail: string; updatedAt: string | number }>;
-  deliveries: Array<{ id: string; status: string; createdAt: string | number }>;
+  operations: Array<{
+    id: string;
+    runtimeId: string;
+    state: string;
+    detail: string;
+    updatedAt: string | number;
+    botLabel?: string;
+    platform?: string;
+    sessionTitle?: string | null;
+  }>;
+  deliveries: Array<{
+    id: string;
+    status: string;
+    createdAt: string | number;
+    botLabel?: string;
+    platform?: string;
+    preview?: string;
+    retryable?: boolean;
+  }>;
   workspaces: string[];
 }
 
@@ -160,8 +182,10 @@ export interface HermesActionPayloads {
   removeChannel: { accountRef: string };
   openPairing: { accountRef: string };
   approvePairing: { accountRef: string; id: string; workspaces: string[]; allowInput: boolean; notifications: boolean };
-  updateRoute: { accountRef: string; id: string; generation: number; workspaces: string[]; allowInput: boolean; notifications: boolean };
+  updateRoute: { accountRef: string; id: string; generation: number; revision?: number; workspaces: string[]; allowInput: boolean; notifications: boolean };
   disableRoute: { id: string };
+  removeRoute: { id: string };
+  retryDelivery: { id: string };
 }
 
 export type HermesAction = keyof HermesActionPayloads;
@@ -177,4 +201,8 @@ export function performHermesAction<A extends HermesAction>(
   payload?: HermesActionPayloads[A],
 ): Promise<HermesStatus> {
   return invoke<HermesStatus>('hermes_action', { action, ...(payload ? { payload } : {}) });
+}
+
+export function openDirectoryDialog(): Promise<string | null> {
+  return invoke<string | null>('open_directory_dialog');
 }

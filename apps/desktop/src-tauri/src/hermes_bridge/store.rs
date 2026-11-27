@@ -85,6 +85,10 @@ impl Source {
 pub struct Route {
     pub id: String,
     pub generation: i64,
+    #[serde(default)]
+    pub revision: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
     pub source: Source,
     pub identity_ref: String,
     pub target_ref: String,
@@ -203,7 +207,7 @@ impl Store {
         for mut op in store.operations()? {
             if ["submitting", "running"].contains(&op.state.as_str()) {
                 op.state = "unknown".into();
-                op.detail = "CCEM restarted before a verified terminal event".into();
+                op.detail = "CCEM 重启前未收到终态回执，请在桌面端查看任务状态。".into();
                 store.save_operation(&op)?;
             }
         }
@@ -270,13 +274,30 @@ impl Store {
         notifications: bool,
         baselines: &[(String, String, u64)],
     ) -> Result<Route, String> {
+        self.approve_route_with_meta(source, None, workspaces, allow_input, notifications, baselines)
+    }
+    pub fn approve_route_with_meta(
+        &mut self,
+        source: Source,
+        user_name: Option<String>,
+        workspaces: Vec<String>,
+        allow_input: bool,
+        notifications: bool,
+        baselines: &[(String, String, u64)],
+    ) -> Result<Route, String> {
         source.validate()?;
         let scopes = Self::canonical_workspaces(workspaces)?;
         let has_access = !scopes.is_empty();
         let old = self.routes()?.into_iter().find(|r| r.source == source);
+        let clean_name = user_name
+            .map(|n| n.trim().chars().take(120).collect::<String>())
+            .filter(|n| !n.is_empty() && !n.chars().any(char::is_control))
+            .or_else(|| old.as_ref().and_then(|r| r.user_name.clone()));
         let route = Route {
             id: old.as_ref().map(|r| r.id.clone()).unwrap_or_else(random_id),
             generation: old.as_ref().map_or(1, |r| r.generation + 1),
+            revision: old.as_ref().map_or(1, |r| r.revision + 1),
+            user_name: clean_name,
             identity_ref: digest(&format!(
                 "{}:{}:{}:{}",
                 source.account_ref, source.profile, source.platform, source.user_id
@@ -321,8 +342,30 @@ impl Store {
         notifications: bool,
         baselines: &[(String, String, u64)],
     ) -> Result<Route, String> {
+        self.update_route_access_with_revision(
+            account,
+            id,
+            generation,
+            None,
+            workspaces,
+            allow_input,
+            notifications,
+            baselines,
+        )
+    }
+    pub fn update_route_access_with_revision(
+        &mut self,
+        account: &str,
+        id: &str,
+        generation: i64,
+        expected_revision: Option<i64>,
+        workspaces: Vec<String>,
+        allow_input: bool,
+        notifications: bool,
+        baselines: &[(String, String, u64)],
+    ) -> Result<Route, String> {
         let connection = self.connection(account)?;
-        let route = self
+        let mut route = self
             .routes()?
             .into_iter()
             .find(|r| r.id == id)
@@ -333,16 +376,49 @@ impl Store {
         {
             return Err("account_not_authorized".into());
         }
-        if !route.enabled || route.generation != generation {
+        if !route.enabled
+            || route.generation != generation
+            || expected_revision.is_some_and(|rev| route.revision != rev)
+        {
             return Err("route_authority_changed".into());
         }
-        self.approve_route_with_baselines(
-            route.source,
-            workspaces,
-            allow_input,
-            notifications,
-            baselines,
+        let scopes = Self::canonical_workspaces(workspaces)?;
+        let has_access = !scopes.is_empty();
+        route.workspaces = scopes;
+        route.allow_input = has_access && allow_input;
+        route.notifications = has_access && notifications;
+        route.revision += 1;
+        let tx = self.db.transaction().map_err(err)?;
+        tx.execute(
+            "INSERT INTO routes VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET source_key=excluded.source_key,data=excluded.data",
+            params![route.id, route.source.key(), serde_json::to_string(&route).map_err(err)?],
         )
+        .map_err(err)?;
+        tx.execute(
+            "UPDATE challenges SET state='revoked' WHERE route_id=?1 AND state='pending'",
+            [&route.id],
+        )
+        .map_err(err)?;
+        if !route.notifications {
+            tx.execute(
+                "UPDATE outbox SET data=json_set(data,'$.status','revoked') WHERE route_id=?1 AND json_extract(data,'$.status')='pending' AND json_extract(data,'$.cron') IS NULL AND json_extract(data,'$.sessionBindingId') IS NULL AND json_extract(data,'$.conversationScope') IS NULL",
+                [&route.id],
+            )
+            .map_err(err)?;
+        }
+        for (runtime, project, seq) in baselines
+            .iter()
+            .filter(|(_, project, _)| route.permits(project))
+        {
+            let _ = project;
+            tx.execute(
+                "INSERT OR IGNORE INTO cursors VALUES(?1,?2)",
+                params![format!("{}:{}:{runtime}", route.id, route.generation), seq],
+            )
+            .map_err(err)?;
+        }
+        tx.commit().map_err(err)?;
+        Ok(route)
     }
     fn write_route(&mut self, route: &Route) -> Result<(), String> {
         self.write_route_with_baselines(route, &[])
@@ -380,7 +456,27 @@ impl Store {
             .ok_or("route_not_found")?;
         route.enabled = false;
         route.generation += 1;
+        route.revision += 1;
         self.write_route(&route)
+    }
+    pub fn remove_route(&mut self, id: &str) -> Result<(), String> {
+        let route = self
+            .routes()?
+            .into_iter()
+            .find(|r| r.id == id)
+            .ok_or("route_not_found")?;
+        if route.enabled {
+            return Err("route_still_enabled".into());
+        }
+        let tx = self.db.transaction().map_err(err)?;
+        tx.execute("DELETE FROM routes WHERE id=?1", [id])
+            .map_err(err)?;
+        tx.execute(
+            "UPDATE challenges SET state='revoked' WHERE route_id=?1 AND state='pending'",
+            [id],
+        )
+        .map_err(err)?;
+        tx.commit().map_err(err)
     }
     pub fn prepare(
         &mut self,
@@ -406,7 +502,7 @@ impl Store {
             return Ok(reply);
         }
         let challenge = random_id();
-        let expires = now() + 120_000;
+        let expires = now() + 300_000;
         let reply = json!({"challenge":challenge,"runtimeId":runtime,"text":text,"expiresAt":expires,"state":"confirmation_required"});
         tx.execute(
             "INSERT INTO challenges VALUES(?1,?2,?3,?4,?5,?6,?7,'pending',NULL)",
@@ -481,7 +577,7 @@ impl Store {
                 runtime_id: row.2,
                 text: row.3,
                 state: "submitting".into(),
-                detail: "Confirmed; submission reserved".into(),
+                detail: "已确认，正在提交给会话执行".into(),
                 invocation_id: None,
                 ambiguous_invocation: false,
                 created_at: now(),
@@ -584,6 +680,26 @@ impl Store {
             return Err("challenge_not_pending".into());
         }
         Ok(())
+    }
+    pub fn cancel_all_pending(&self, paired: &Route) -> Result<usize, String> {
+        let mut routes = vec![paired.id.clone()];
+        routes.extend(
+            self.session_bindings()?
+                .into_iter()
+                .filter(|b| b.route_id == paired.id && b.generation == paired.generation)
+                .map(|b| b.id),
+        );
+        let mut cancelled = 0usize;
+        for route_id in routes {
+            cancelled += self
+                .db
+                .execute(
+                    "UPDATE challenges SET state='cancelled' WHERE route_id=?1 AND generation=?2 AND state='pending'",
+                    params![route_id, paired.generation],
+                )
+                .map_err(err)?;
+        }
+        Ok(cancelled)
     }
     pub fn operations(&self) -> Result<Vec<Operation>, String> {
         self.list("SELECT data FROM operations ORDER BY rowid DESC")

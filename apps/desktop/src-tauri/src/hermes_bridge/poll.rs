@@ -335,7 +335,10 @@ fn project_page(
                             &format!("operation:{id}:{operation_id}:{stage}"),
                             format!(
                                 "CCEM · {}\n{}\n{}\n/ccem operation {}",
-                                session.title, op.state, op.detail, id
+                                session.title,
+                                human_stage_label(&op.state),
+                                human_operation_detail(&op.detail, &op.state),
+                                id
                             ),
                         ));
                     }
@@ -345,7 +348,10 @@ fn project_page(
                             &format!("input:{operation_id}:terminal"),
                             format!(
                                 "CCEM · {}\n{}\n{}\n/ccem status {}",
-                                session.title, stage, detail, session.runtime_id
+                                session.title,
+                                human_stage_label(stage),
+                                human_operation_detail(detail, stage),
+                                session.runtime_id
                             ),
                         ));
                     }
@@ -451,9 +457,35 @@ fn project_generic(
             &projected.event_id,
             format!(
                 "CCEM · {}\n{}\n{}\n/ccem status {}",
-                session.title, projected.title, projected.text, session.runtime_id
+                session.title,
+                human_stage_label(&projected.title),
+                projected.text,
+                session.runtime_id
             ),
         ));
+    }
+}
+
+fn human_stage_label(stage: &str) -> &str {
+    match stage {
+        "completed" | "Turn completed" => "✅ 已完成",
+        "failed" | "Error" => "⚠️ 执行异常",
+        "unknown" => "ℹ️ 状态待确认",
+        "running" | "started" => "⏳ 执行中",
+        other => other,
+    }
+}
+
+fn human_operation_detail<'a>(detail: &'a str, state: &str) -> &'a str {
+    match detail.trim() {
+        "" | "Confirmed; submission reserved" | "已确认，正在提交给会话执行" => match state {
+            "completed" => "本轮远程指令已执行完毕。",
+            "failed" => "执行过程中断，请查看任务详情。",
+            _ => "状态已更新。",
+        },
+        "CCEM restarted before a verified terminal event" => "CCEM 重启前未收到终态回执，请在桌面端确认。",
+        "Submission could not be verified. Inspect the task in CCEM." => "提交状态未能确认，请在桌面端查看任务。",
+        other => other,
     }
 }
 

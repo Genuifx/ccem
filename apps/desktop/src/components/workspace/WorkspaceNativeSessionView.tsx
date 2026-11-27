@@ -358,6 +358,7 @@ interface WorkspaceNativeSessionViewProps {
     target: { turnPreview: string },
   ) => void;
   onNavigateEnvironments?: () => void;
+  onNavigateChatApp?: () => void;
   /** Actual working directory for review/diff (worktree-aware for history-backed live sessions). */
   reviewWorkingDir?: string | null;
 }
@@ -1529,6 +1530,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
   onLaunchNewSession,
   onForkTurnRequest,
   onNavigateEnvironments,
+  onNavigateChatApp,
   reviewWorkingDir,
   startedNextStepChildKeys,
   onStartNextStepSession,
@@ -5217,7 +5219,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
         </DialogFooter>
       </DialogContent>
     </Dialog>
-    <WorkspaceHermesBindDialog open={isHermesBindDialogOpen} onOpenChange={setIsHermesBindDialogOpen} session={session} onLegacyOpen={() => setIsWecomBindDialogOpen(true)} />
+    <WorkspaceHermesBindDialog open={isHermesBindDialogOpen} onOpenChange={setIsHermesBindDialogOpen} session={session} onLegacyOpen={() => setIsWecomBindDialogOpen(true)} onNavigateChatApp={onNavigateChatApp} />
     <WorkspaceWecomBindDialog
       open={isWecomBindDialogOpen}
       onOpenChange={setIsWecomBindDialogOpen}

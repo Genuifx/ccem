@@ -96,12 +96,13 @@ export function ChatApp() {
   return (
     <div ref={chatMotionRef} className="mx-auto w-full max-w-[1040px] space-y-4">
       <HermesPanel>
-      <section className="border-t border-border-subtle pt-2">
-        <Button variant="ghost" className="w-full justify-between px-1 text-xs text-muted-foreground" aria-expanded={legacyOpen}
+      <section className="border-t border-border-subtle pt-3">
+        <Button variant="ghost" className="w-full justify-between px-2 text-xs font-medium text-foreground/80" aria-expanded={legacyOpen}
           aria-controls="existing-chat-connections" onClick={() => setLegacyOpen((current) => !current)}>
           {t('hermes.existingConnections')}
-          <ChevronDown className={`h-4 w-4 transition-transform ${legacyOpen ? 'rotate-180' : ''}`} />
+          <ChevronDown className={`h-4 w-4 shrink-0 transition-transform ${legacyOpen ? 'rotate-180' : ''}`} />
         </Button>
+        <p className="px-2 pt-0.5 text-[11px] text-muted-foreground">{t('hermes.existingConnectionsHint')}</p>
         {legacyOpen && <div id="existing-chat-connections" className="mt-4 space-y-5">
       {/* tmux warning */}
       {showTmuxNotice && (

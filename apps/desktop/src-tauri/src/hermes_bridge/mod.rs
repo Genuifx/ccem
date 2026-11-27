@@ -79,6 +79,8 @@ struct BridgeParams {
     #[serde(default)]
     runtime_id: Option<String>,
     #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
     text: Option<String>,
     #[serde(default)]
     challenge: Option<String>,
@@ -175,13 +177,47 @@ impl HermesBridgeManager {
         if self.root.join("bridge.sqlite3").exists() {
             let records = self.with_store(|s| {
                 let routes = s.routes()?;
+                let conns = s.connections()?;
                 result["operations"] = json!(s.operations()?.into_iter().take(30).map(|op| {
-                    let account = routes.iter().find(|r| r.id == op.route_id).map(|r| &r.source.account_ref);
-                    json!({"id":op.id,"accountRef":account,"runtimeId":op.runtime_id,"state":op.state,"detail":op.detail,"updatedAt":op.updated_at})
+                    let route = routes.iter().find(|r| r.id == op.route_id);
+                    let account = route.map(|r| &r.source.account_ref);
+                    let conn = account.and_then(|acc| conns.iter().find(|c| &c.account_ref == acc));
+                    let session_title = self.native.get_session_summary(&op.runtime_id).ok().flatten().and_then(|sum| sum.display_title);
+                    json!({
+                        "id": op.id,
+                        "accountRef": account,
+                        "botLabel": conn.map(|c| &c.label),
+                        "platform": conn.map(|c| &c.platform).or_else(|| route.map(|r| &r.source.platform)),
+                        "runtimeId": op.runtime_id,
+                        "sessionTitle": session_title,
+                        "state": op.state,
+                        "detail": op.detail,
+                        "updatedAt": op.updated_at
+                    })
                 }).collect::<Vec<_>>());
                 result["routes"] = json!(routes);
-                result["deliveries"] = json!(s.deliveries()?.into_iter().take(30).collect::<Vec<_>>());
-                s.connections()
+                result["deliveries"] = json!(s.deliveries()?.into_iter().take(30).map(|d| {
+                    let route = routes.iter().find(|r| r.id == d.route_id);
+                    let conn = route.and_then(|r| conns.iter().find(|c| c.account_ref == r.source.account_ref));
+                    let preview = if d.confirmation_preview.is_some() {
+                        d.text.lines().next().unwrap_or("待确认操作预览").chars().take(80).collect::<String>()
+                    } else {
+                        d.text.lines().find(|line| !line.trim().is_empty()).unwrap_or("").chars().take(80).collect::<String>()
+                    };
+                    let retryable = d.status == "not_sent" && d.confirmation_preview.is_none();
+                    json!({
+                        "id": d.id,
+                        "routeId": d.route_id,
+                        "generation": d.generation,
+                        "status": d.status,
+                        "createdAt": d.created_at,
+                        "botLabel": conn.map(|c| &c.label),
+                        "platform": conn.map(|c| &c.platform).or_else(|| route.map(|r| &r.source.platform)),
+                        "preview": preview,
+                        "retryable": retryable,
+                    })
+                }).collect::<Vec<_>>());
+                Ok(conns)
             });
             match records {
                 Ok(records) => {
@@ -221,17 +257,31 @@ impl HermesBridgeManager {
                 Err(error) => result["gateway"]["error"] = json!(error),
             }
         }
-        let mut workspaces: Vec<_> = self
+        let mut candidate_dirs: Vec<String> = self
             .native
             .list_sessions()
             .into_iter()
             .map(|s| s.project_dir)
-            .filter(|p| std::path::Path::new(p).is_dir())
+            .collect();
+        if let Ok(app_cfg) = config::read_app_config() {
+            candidate_dirs.extend(app_cfg.favorites.into_iter().map(|f| f.path));
+            candidate_dirs.extend(app_cfg.recent.into_iter().map(|r| r.path));
+            candidate_dirs.extend(app_cfg.vscode_projects.into_iter().map(|p| p.path));
+            candidate_dirs.extend(app_cfg.jetbrains_projects.into_iter().map(|p| p.path));
+            if let Some(default_dir) = app_cfg.default_working_dir {
+                candidate_dirs.push(default_dir);
+            }
+        }
+        let mut workspaces: Vec<_> = candidate_dirs
+            .into_iter()
+            .filter(|p| !p.trim().is_empty() && std::path::Path::new(p).is_dir())
+            .filter_map(|p| std::fs::canonicalize(&p).ok().map(|c| c.to_string_lossy().into_owned()).or(Some(p)))
             .collect();
         workspaces.sort();
         workspaces.dedup();
         result["workspaces"] = json!(workspaces);
         result["conversationModels"] = json!(session_handoff::available_models());
+        result["unavailableModels"] = json!(session_handoff::unavailable_model_reasons());
         result
     }
     // Discovery has no registered bridge capability and never owns a connection.
@@ -271,8 +321,7 @@ impl HermesBridgeManager {
     ) -> Result<OwnedGateway, String> {
         let port = app
             .state::<Arc<ExternalControlManager>>()
-            .current_port()
-            .ok_or("control_server_not_running")?;
+            .start(app.clone())?;
         let instance = self.with_store(|s| {
             let instance = s.setting("instance")?.unwrap_or_else(random_id);
             s.set_setting("instance", &instance)?;
@@ -438,7 +487,7 @@ impl HermesBridgeManager {
                     .map(|s| (s.runtime_id, s.project_dir, s.last_event_seq.unwrap_or(0)))
                     .collect();
                 self.with_store(|s| {
-                    s.update_route_access(
+                    s.update_route_access_with_revision(
                         payload["accountRef"]
                             .as_str()
                             .ok_or("account_ref_required")?,
@@ -446,6 +495,7 @@ impl HermesBridgeManager {
                         payload["generation"]
                             .as_i64()
                             .ok_or("route_generation_required")?,
+                        payload["revision"].as_i64(),
                         serde_json::from_value(payload["workspaces"].clone())
                             .map_err(|_| "workspace_scope_required")?,
                         payload["allowInput"] == true,
@@ -459,6 +509,32 @@ impl HermesBridgeManager {
                 self.with_store(|s| {
                     s.disable_route(payload["id"].as_str().ok_or("route_id_required")?)
                 })?;
+            }
+            "removeRoute" => {
+                self.with_store(|s| {
+                    s.remove_route(payload["id"].as_str().ok_or("route_id_required")?)
+                })?;
+            }
+            "retryDelivery" => {
+                let id = payload["id"].as_str().ok_or("delivery_id_required")?;
+                let account = self.with_store(|s| {
+                    let mut d = s.delivery(id)?.ok_or("delivery_not_found")?;
+                    if d.status != "not_sent" || d.confirmation_preview.is_some() {
+                        return Err("delivery_not_retryable".into());
+                    }
+                    let route = s
+                        .routes()?
+                        .into_iter()
+                        .find(|r| r.id == d.route_id && r.generation == d.generation && r.enabled)
+                        .ok_or("route_disabled")?;
+                    d.status = "pending".into();
+                    d.receipt = None;
+                    s.save_delivery(&d)?;
+                    Ok(route.source.account_ref)
+                })?;
+                drop(_lifecycle);
+                self.schedule_poll(&account);
+                return Ok(self.status());
             }
             _ => return Err("unknown_hermes_action".into()),
         }
@@ -503,7 +579,7 @@ impl HermesBridgeManager {
         Ok(session)
     }
     pub fn handle_rpc(
-        &self,
+        self: &Arc<Self>,
         app: &AppHandle,
         authorization: &str,
         method: &str,
@@ -520,8 +596,10 @@ impl HermesBridgeManager {
             "ccem.bridge.status",
             "ccem.bridge.events",
             "ccem.bridge.input",
+            "ccem.bridge.create",
             "ccem.bridge.confirm",
             "ccem.bridge.cancel",
+            "ccem.bridge.cancelAll",
             "ccem.bridge.operation",
             "ccem.bridge.conversation",
             "ccem.bridge.validateConversation",
@@ -543,10 +621,13 @@ impl HermesBridgeManager {
         }
         if p.conversation_scope.as_ref().is_some_and(|s| s != &conversation::scope(&route)) {
             if method == "ccem.bridge.shortReply" {
-                let action = match p.text.as_deref() {
-                    Some("confirm") => "ccem.bridge.confirm",
-                    Some("cancel") => "ccem.bridge.cancel",
-                    _ => return Err("invalid_confirmation_reply".into()),
+                let raw_text = p.text.as_deref().unwrap_or("");
+                let action = if raw_text == "confirm" || raw_text.starts_with("confirm:") {
+                    "ccem.bridge.confirm"
+                } else if raw_text == "cancel" || raw_text == "cancelAll" {
+                    "ccem.bridge.cancel"
+                } else {
+                    return Err("invalid_confirmation_reply".into());
                 };
                 self.with_store(|s| s.reject_short_reply(&route, p.source_message_id.as_deref().unwrap_or(""), action, "conversation_scope_changed"))?;
             }
@@ -557,14 +638,34 @@ impl HermesBridgeManager {
         }
         let short_action;
         let method = if method == "ccem.bridge.shortReply" {
-            short_action = match p.text.as_deref() { Some("confirm") => "ccem.bridge.confirm", Some("cancel") => "ccem.bridge.cancel", _ => return Err("invalid_confirmation_reply".into()) };
-            p.challenge = Some(self.short_confirmation(&route, authorization, p.source_message_id.as_deref().unwrap_or(""), short_action, p.received_at_ns)?);
-            short_action
+            let raw_text = p.text.as_deref().unwrap_or("");
+            if raw_text == "cancelAll" {
+                "ccem.bridge.cancelAll"
+            } else {
+                let (act, idx) = if raw_text == "confirm" {
+                    ("ccem.bridge.confirm", None)
+                } else if let Some(num) = raw_text.strip_prefix("confirm:") {
+                    let parsed = num.parse::<usize>().map_err(|_| "invalid_confirmation_reply")?;
+                    ("ccem.bridge.confirm", Some(parsed))
+                } else if raw_text == "cancel" {
+                    ("ccem.bridge.cancel", None)
+                } else {
+                    return Err("invalid_confirmation_reply".into());
+                };
+                short_action = act;
+                p.challenge = Some(self.short_confirmation(&route, authorization, p.source_message_id.as_deref().unwrap_or(""), short_action, idx, p.received_at_ns)?);
+                short_action
+            }
         } else { method };
-        match method {
+        let mut wake_outbox = false;
+        let rpc_result = match method {
             "ccem.bridge.conversation" => self.conversation_snapshot(&route),
             "ccem.bridge.validateConversation" => Ok(json!({"ok":true})),
-            "ccem.bridge.replyConversation" => self.enqueue_conversation_reply(&route, p.source_message_id.as_deref().unwrap_or(""), p.text.as_deref().unwrap_or(""), p.delivery_key.as_deref()),
+            "ccem.bridge.replyConversation" => {
+                let res = self.enqueue_conversation_reply(&route, p.source_message_id.as_deref().unwrap_or(""), p.text.as_deref().unwrap_or(""), p.delivery_key.as_deref());
+                if res.is_ok() { wake_outbox = true; }
+                res
+            }
             "ccem.bridge.list" => {
                 let attached: HashSet<_> = self
                     .with_store(|s| s.session_bindings())?
@@ -580,7 +681,7 @@ impl HermesBridgeManager {
                     .collect();
                 sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
                 Ok(
-                    json!({"sessions":sessions.into_iter().take(20).map(|s|json!({"runtimeId":s.runtime_id,"title":s.display_title,"status":s.status,"updatedAt":s.updated_at})).collect::<Vec<_>>()}),
+                    json!({"sessions":sessions.into_iter().take(20).map(|s|json!({"runtimeId":s.runtime_id,"title":s.display_title,"projectDir":s.project_dir,"status":s.status,"updatedAt":s.updated_at})).collect::<Vec<_>>()}),
                 )
             }
             "ccem.bridge.status" | "ccem.bridge.events" => {
@@ -596,6 +697,36 @@ impl HermesBridgeManager {
                         p.cursor,
                     ))
                 }
+            }
+            "ccem.bridge.create" => {
+                if !route.allow_input {
+                    return Err("input_not_allowed".into());
+                }
+                let raw_cwd = p.cwd.as_deref().ok_or("workspace_scope_required")?.trim();
+                let canonical = std::fs::canonicalize(raw_cwd)
+                    .map_err(|_| "workspace_not_found")?
+                    .to_string_lossy()
+                    .into_owned();
+                if !route.permits(&canonical) {
+                    return Err("workspace_not_authorized".into());
+                }
+                if p.conversation_scope.is_some() && p.text.as_deref().unwrap_or("").len() > 1400 {
+                    return Err("invalid_input_size".into());
+                }
+                let create_target = format!("create:{canonical}");
+                let prepared = self.with_store(|s| {
+                    s.prepare(
+                        &route,
+                        p.source_message_id.as_deref().unwrap_or(""),
+                        &create_target,
+                        p.text.as_deref().unwrap_or(""),
+                    )
+                })?;
+                if p.conversation_scope.is_some() {
+                    self.enqueue_confirmation_preview(&route, authorization, &prepared)?;
+                    wake_outbox = true;
+                }
+                Ok(prepared)
             }
             "ccem.bridge.input" | "ccem.bridge.chat" => {
                 let chosen;
@@ -636,49 +767,115 @@ impl HermesBridgeManager {
                 })?;
                 if p.conversation_scope.is_some() {
                     self.enqueue_confirmation_preview(&route, authorization, &prepared)?;
+                    wake_outbox = true;
                 }
                 Ok(prepared)
             }
             "ccem.bridge.confirm" => {
                 let challenge = p.challenge.as_deref().ok_or("challenge_required")?;
                 let (confirmed_route, id) = self.confirmation_route(&route, challenge)?;
-                self.scoped_session(&route, &id)?;
-                let (mut op, submit) = self.with_store(|s| {
-                    s.confirm(
-                        &confirmed_route,
-                        p.source_message_id.as_deref().unwrap_or(""),
-                        challenge,
-                        &id,
-                    )
-                })?;
-                if submit {
-                    let _environment = self.environment.lock()?;
-                    let outcome = self.native.send_user_message(
-                        app,
-                        &id,
-                        &op.text,
-                        None,
-                        None,
-                        None,
-                        Some(&op.id),
-                    );
-                    if outcome.is_err() {
-                        op.state = "unknown".into();
-                        op.detail =
-                            "Submission could not be verified. Inspect the task in CCEM.".into();
-                        op.updated_at = now();
-                        self.with_store(|s| s.save_operation(&op))?;
+                if let Some(cwd) = id.strip_prefix("create:") {
+                    if !route.allow_input || !route.permits(cwd) {
+                        return Err("workspace_not_authorized".into());
                     }
+                    let (mut op, submit) = self.with_store(|s| {
+                        s.confirm(
+                            &confirmed_route,
+                            p.source_message_id.as_deref().unwrap_or(""),
+                            challenge,
+                            &id,
+                        )
+                    })?;
+                    if submit {
+                        let control = app.state::<Arc<ExternalControlManager>>();
+                        match control.create_managed_session(app.clone(), cwd.to_string(), op.text.clone()) {
+                            Ok(created_runtime_id) => {
+                                let folder = std::path::Path::new(cwd)
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| cwd.to_string());
+                                op.runtime_id = created_runtime_id.clone();
+                                op.state = "running".into();
+                                op.detail = format!("已在「{folder}」新建会话并开始执行");
+                                op.updated_at = now();
+                                self.with_store(|s| s.save_operation(&op))?;
+                                if let Ok(pref) = self.conversation_model(&account) {
+                                    if let (Some(env_name), Some(model_name)) = (pref["envName"].as_str(), pref["model"].as_str()) {
+                                        let _ = self.with_store(|s| {
+                                            s.bind_session(
+                                                store::SessionBinding {
+                                                    id: String::new(),
+                                                    runtime_id: created_runtime_id.clone(),
+                                                    route_id: route.id.clone(),
+                                                    generation: route.generation,
+                                                    title: op.text.chars().take(80).collect(),
+                                                    model_env: env_name.into(),
+                                                    model: model_name.into(),
+                                                    cursor: 0,
+                                                    input_context: Some(op.text.chars().take(600).collect()),
+                                                    created_at: now(),
+                                                    last_decision_at: None,
+                                                    last_decision: None,
+                                                    error: None,
+                                                },
+                                                &route,
+                                            )
+                                        });
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                op.state = "failed".into();
+                                op.detail = "新建会话失败，请在桌面端检查运行环境。".into();
+                                op.updated_at = now();
+                                self.with_store(|s| s.save_operation(&op))?;
+                            }
+                        }
+                    }
+                    Ok(json!({"operationId":op.id,"runtimeId":op.runtime_id,"state":op.state,"detail":op.detail}))
+                } else {
+                    self.scoped_session(&route, &id)?;
+                    let (mut op, submit) = self.with_store(|s| {
+                        s.confirm(
+                            &confirmed_route,
+                            p.source_message_id.as_deref().unwrap_or(""),
+                            challenge,
+                            &id,
+                        )
+                    })?;
+                    if submit {
+                        let _environment = self.environment.lock()?;
+                        let outcome = self.native.send_user_message(
+                            app,
+                            &id,
+                            &op.text,
+                            None,
+                            None,
+                            None,
+                            Some(&op.id),
+                        );
+                        if outcome.is_err() {
+                            op.state = "unknown".into();
+                            op.detail =
+                                "提交结果未能确认，请在桌面端查看任务状态。".into();
+                            op.updated_at = now();
+                            self.with_store(|s| s.save_operation(&op))?;
+                        }
+                    }
+                    Ok(
+                        json!({"operationId":op.id,"runtimeId":op.runtime_id,"state":op.state,"detail":op.detail}),
+                    )
                 }
-                Ok(
-                    json!({"operationId":op.id,"runtimeId":op.runtime_id,"state":op.state,"detail":op.detail}),
-                )
             }
             "ccem.bridge.cancel" => {
                 let challenge = p.challenge.as_deref().ok_or("challenge_required")?;
                 let (confirmed_route, _) = self.confirmation_route(&route, challenge)?;
                 self.with_store(|s| s.cancel(&confirmed_route, challenge))?;
                 Ok(json!({"state":"cancelled"}))
+            }
+            "ccem.bridge.cancelAll" => {
+                let count = self.with_store(|s| s.cancel_all_pending(&route))?;
+                Ok(json!({"state":"cancelled","cancelledCount":count}))
             }
             "ccem.bridge.operation" => {
                 let op = self.with_store(|s| {
@@ -692,13 +889,20 @@ impl HermesBridgeManager {
                 {
                     return Err("operation_not_authorized".into());
                 }
-                self.scoped_session(&route, &op.runtime_id)?;
+                if !op.runtime_id.starts_with("create:") {
+                    self.scoped_session(&route, &op.runtime_id)?;
+                }
                 Ok(
                     json!({"operationId":op.id,"runtimeId":op.runtime_id,"state":op.state,"detail":op.detail}),
                 )
             }
             _ => Err("method_not_allowed".into()),
+        };
+        drop(_lifecycle);
+        if wake_outbox {
+            self.schedule_poll(&account);
         }
+        rpc_result
     }
     pub fn activate(self: &Arc<Self>, app: &AppHandle, background_services: bool) {
         let weak = Arc::downgrade(self);

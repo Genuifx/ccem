@@ -213,7 +213,7 @@ impl HermesBridgeManager {
     }
 
     pub(super) fn pairing_action(
-        &self,
+        self: &Arc<Self>,
         _app: &AppHandle,
         action: &str,
         payload: &Value,
@@ -258,22 +258,53 @@ impl HermesBridgeManager {
                 return Err("invalid_pairing_response".into());
             }
             source.validate()?;
+            let user_name = reply["userName"].as_str().map(str::to_owned);
             let baselines: Vec<_> = self
                 .native
                 .list_sessions()
                 .into_iter()
                 .map(|s| (s.runtime_id, s.project_dir, s.last_event_seq.unwrap_or(0)))
                 .collect();
+            let model_ready = self
+                .conversation_model(account)
+                .ok()
+                .is_some_and(|m| !m.is_null());
             self.with_store(|s| {
-                s.approve_route_with_baselines(
+                let route = s.approve_route_with_meta(
                     source,
+                    user_name,
                     workspaces,
                     payload["allowInput"] == true,
                     payload["notifications"] != false,
                     &baselines,
-                )
-                .map(|_| ())
+                )?;
+                let welcome_text = if model_ready {
+                    let scope_note = if route.workspaces.is_empty() {
+                        "当前未绑定工作区，可直接与我日常对话；如需跟进项目会话，可在桌面端授权工作区或点击会话右下角「交给机器人」。"
+                    } else {
+                        "已关联授权工作区，你可以直接向我询问任务进展或让我继续处理。"
+                    };
+                    format!("已与 CCEM 配对成功！{scope_note}\n发送 /help 可查看常用指令。")
+                } else {
+                    "已与 CCEM 配对成功！请先在电脑端 CCEM 的机器人详情中选择一个可用的 API 环境作为对话模型，随后即可直接对话。".to_string()
+                };
+                s.enqueue_delivery(&super::store::Delivery {
+                    id: super::store::digest(&format!("welcome:{}:{}", route.id, route.generation)),
+                    route_id: route.id.clone(),
+                    generation: route.generation,
+                    text: super::bounded_chat_text(&welcome_text),
+                    status: "pending".into(),
+                    receipt: None,
+                    created_at: super::store::now(),
+                    cron: None,
+                    session_binding_id: None,
+                    conversation_scope: Some(super::conversation::scope(&route)),
+                    confirmation_preview: None,
+                })?;
+                Ok(())
             })?;
+            drop(_guard);
+            self.schedule_poll(account);
         }
         Ok(self.status())
     }

@@ -43,7 +43,7 @@ export function HermesNotificationPicker({ value, onChange }: {
         {targets.map((target) => <SelectItem key={key(target)} value={key(target)}>
           <span className="flex items-center gap-2 text-xs [&_.hermes-platform-icon]:h-6 [&_.hermes-platform-icon]:w-6 [&_img]:h-4 [&_img]:w-4">
             <HermesPlatformIcon platform={target.platform} />
-            <span className="truncate">{target.label} · {target.chatType === 'dm' || target.chatType === 'private' ? t('cron.hermesPrivateChat') : t('cron.hermesGroupChat')} {target.chatId}{target.threadId ? ` / ${target.threadId}` : ''}</span>
+            <span className="truncate">{target.label} · {target.userName?.trim() ? `${target.userName.trim()} · ` : ''}{target.chatType === 'dm' || target.chatType === 'private' ? t('cron.hermesPrivateChat') : t('cron.hermesGroupChat')} {target.chatId}{target.threadId ? ` / ${target.threadId}` : ''}</span>
           </span>
         </SelectItem>)}
       </SelectContent>

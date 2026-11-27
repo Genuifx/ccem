@@ -9,7 +9,8 @@ import './hermes.css';
 import { HermesConnectionDrawer } from './HermesConnectionDrawer';
 import { HermesConnectionCard, HermesConnectionDetails } from './HermesConnectionCard';
 import { HermesChannelForm, HermesChannelPicker, HermesQrSetup } from './HermesChannelSetup';
-import { errorText, INSTALLING, platformDisplayName, SETUP_CANCELLABLE, SETUP_WAIT_MS, setupErrorKey, timestamp, TRANSITIONING } from './hermes-presentation';
+import { HermesConversationModel } from './HermesConversationModel';
+import { INSTALLING, localizeHermesError, localizeOperationDetail, platformDisplayName, SETUP_CANCELLABLE, SETUP_WAIT_MS, setupErrorKey, timestamp, TRANSITIONING } from './hermes-presentation';
 
 type Wizard = { kind: 'add'; platformId?: string; manual: boolean } | { kind: 'authorize'; accountRef: string };
 type Details = { accountRef: string; editing: boolean };
@@ -18,6 +19,8 @@ const RUNTIME_ACTIONS = new Set<HermesAction>(['install', 'removeRuntime', 'canc
 
 export function HermesPanel({ children }: { children?: ReactNode }) {
   const { t, lang } = useLocale();
+  const tRef = useRef(t);
+  tRef.current = t;
   const [status, setStatus] = useState<HermesStatus | null>(null);
   const [requestError, setRequestError] = useState<string | null>(null);
   const [setupRequestError, setSetupRequestError] = useState<string | null>(null);
@@ -55,7 +58,7 @@ export function HermesPanel({ children }: { children?: ReactNode }) {
       const next = await getHermesStatus();
       if (mounted.current && revision === mutationRevision.current) { latestStatus.current = next; setStatus(next); setReadError(null); }
     } catch (error) {
-      if (mounted.current && revision === mutationRevision.current) setReadError(errorText(error));
+      if (mounted.current && revision === mutationRevision.current) setReadError(localizeHermesError(error, tRef.current));
     } finally { pollPending.current = false; }
   }, []);
 
@@ -69,7 +72,7 @@ export function HermesPanel({ children }: { children?: ReactNode }) {
   const run: HermesRunAction = async (action, payload, secrets = []) => {
     const isCancel = action === 'cancelInstall';
     const accountRef = payload && 'accountRef' in payload ? payload.accountRef
-      : action === 'disableRoute' && payload && 'id' in payload ? latestStatus.current?.routes.find((route) => route.id === payload.id)?.source.accountRef : undefined;
+      : (action === 'disableRoute' || action === 'removeRoute') && payload && 'id' in payload ? latestStatus.current?.routes.find((route) => route.id === payload.id)?.source.accountRef : undefined;
     const scope = accountRef ? `account:${accountRef}` : 'global';
     const globalAction = pendingActions.current.get('global');
     const sameAccountAction = pendingActions.current.get(scope);
@@ -105,12 +108,10 @@ export function HermesPanel({ children }: { children?: ReactNode }) {
     } catch (error) {
       if (mounted.current && scopeSequences.current.get(scope) === id) {
         if (accountRef) {
-          const message = errorText(error, secrets);
-          setConnectionRequestErrors((current) => ({ ...current, [accountRef]: action === 'configureTools' && message.trim() === 'hermes_native_tools_update_required'
-            ? t('hermes.nativeToolsUpdateRequired') : message }));
+          setConnectionRequestErrors((current) => ({ ...current, [accountRef]: localizeHermesError(error, t, secrets) }));
         }
         else if (action === 'beginSetup' || action === 'cancelSetup') setSetupRequestError(setupErrorKey(error));
-        else setRequestError(errorText(error, secrets));
+        else setRequestError(localizeHermesError(error, t, secrets));
       }
       return false;
     } finally {
@@ -234,6 +235,7 @@ export function HermesPanel({ children }: { children?: ReactNode }) {
     const interruptDisabled = runtimeDisabled || Boolean(action && !PAIRING_ACTIONS.has(action));
     return { connection, platform: platforms.find((item) => item.id === connection.platform),
       conversationModels: status?.conversationModels ?? [],
+      unavailableModels: status?.unavailableModels ?? [],
       routes: status?.routes.filter((route) => route.source.accountRef === connection.accountRef) ?? [], workspaces: status?.workspaces ?? [],
       disabled: runtimeDisabled || Boolean(action), stopDisabled: interruptDisabled, removeDisabled: interruptDisabled,
       editDisabled: disabled || Boolean(setupConnecting), requestError: connectionRequestErrors[connection.accountRef],
@@ -266,6 +268,9 @@ export function HermesPanel({ children }: { children?: ReactNode }) {
           {setupRequestError && <p role="alert" className="hermes-alert" data-hermes-setup-request-error>{t(setupRequestError)}</p>}
           {wizard.kind === 'authorize' ? authorizationConnection ? <>
             {authorized ? <div className="hermes-complete" role="status"><CheckCircle2 aria-hidden="true" /><h4>{t('hermes.connectionReady')}</h4><p>{t('hermes.connectionReadyHint')}</p>
+              <div className="hermes-complete-config">
+                <HermesConversationModel connection={authorizationConnection} models={status?.conversationModels ?? []} unavailableModels={status?.unavailableModels ?? []} disabled={runtimeDisabled || Boolean(busyActions[`account:${authorizationConnection.accountRef}`])} run={run} />
+              </div>
               <Button onClick={() => void changeWizard(null, authorizationConnection.accountRef)}>{t('hermes.finishSetup')}</Button>
             </div> : <><p className="hermes-authorization-intro">{t('hermes.authorizeHint')}</p>
               <HermesConnectionDetails key={authorizationConnection.accountRef} {...connectionProps(authorizationConnection)} authorizationOnly />
@@ -274,7 +279,7 @@ export function HermesPanel({ children }: { children?: ReactNode }) {
           </> : <p className="hermes-loading" role="status">{t('hermes.loading')}</p> : <>
             {editorSetup && setupStatusError && !manual && !setupRequestError && <p role="alert" className="hermes-alert" data-hermes-setup-error>{t(setupStatusError)}</p>}
             {platforms.length === 0 ? <div className="hermes-discovery"><p>{t(discoveryTransitioning ? 'hermes.loadingPlatforms' : 'hermes.noPlatforms')}</p>
-              {status?.gateway.error && <p role="alert" className="hermes-error">{errorText(status.gateway.error)}</p>}
+              {status?.gateway.error && <p role="alert" className="hermes-error">{localizeHermesError(status.gateway.error, t)}</p>}
               <Button size="sm" disabled={disabled || discoveryTransitioning} onClick={() => void run('refreshPlatforms')}>{t('hermes.loadPlatforms')}</Button>
             </div> : !platform ? <HermesChannelPicker platforms={platforms} disabled={disabled || Boolean(setupConnecting)} onSelect={(id) => void changeWizard({ kind: 'add', platformId: id, manual: false })} /> : <>
               {manual ? <HermesChannelForm key={`new:${platform.id}`} platform={platform} disabled={disabled || Boolean(setupConnecting)} run={run} onSaved={(accountRef) => {
@@ -305,10 +310,10 @@ export function HermesPanel({ children }: { children?: ReactNode }) {
       {(status.operations.length > 0 || status.deliveries.length > 0) && <section className="hermes-activity" aria-labelledby="hermes-activity-title">
         <div className="hermes-section-heading"><h3 id="hermes-activity-title">{t('hermes.activity')}</h3><Activity aria-hidden="true" /></div>
         <div className="hermes-activity-columns">
-          {status.operations.length > 0 && <div><h4 className="hermes-caption">{t('hermes.operations')}</h4>{recentOperations.map((operation) => <div key={operation.id} className="hermes-activity-row"><div className="min-w-0"><p className="hermes-activity-detail">{operation.detail}</p><p className="hermes-activity-id" title={operation.runtimeId}>{operation.runtimeId}</p></div><span className="hermes-activity-state">{stateLabel(operation.state === 'running' ? 'started' : operation.state)}</span></div>)}</div>}
+          {status.operations.length > 0 && <div><h4 className="hermes-caption">{t('hermes.operations')}</h4>{recentOperations.map((operation) => <div key={operation.id} className="hermes-activity-row"><div className="min-w-0"><p className="hermes-activity-detail">{localizeOperationDetail(operation.detail, t)}</p><p className="hermes-activity-id" title={operation.runtimeId}>{[operation.botLabel, operation.sessionTitle, operation.runtimeId].filter(Boolean).join(' · ')}</p></div><span className="hermes-activity-state">{stateLabel(operation.state === 'running' ? 'started' : operation.state)}</span></div>)}</div>}
           {status.deliveries.length > 0 && <div><h4 className="hermes-caption">{t('hermes.deliveries')}</h4>{recentDeliveries.map((delivery) => {
             const date = new Date(timestamp(delivery.createdAt));
-            return <div key={delivery.id} className="hermes-activity-row"><div className="min-w-0"><p>{t('hermes.chatNotification')}{Number.isFinite(date.getTime()) && <> · <time dateTime={date.toISOString()}>{date.toLocaleString(lang === 'zh' ? 'zh-CN' : 'en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</time></>}</p><p className="hermes-activity-id" title={delivery.id}>{delivery.id.length > 16 ? `…${delivery.id.slice(-8)}` : delivery.id}</p></div><span className="hermes-activity-state">{stateLabel(delivery.status)}</span></div>;
+            return <div key={delivery.id} className="hermes-activity-row"><div className="min-w-0"><p>{delivery.botLabel || t('hermes.chatNotification')}{Number.isFinite(date.getTime()) && <> · <time dateTime={date.toISOString()}>{date.toLocaleString(lang === 'zh' ? 'zh-CN' : 'en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</time></>}</p>{delivery.preview && <p className="hermes-activity-detail text-muted-foreground">{delivery.preview}</p>}<p className="hermes-activity-id" title={delivery.id}>{delivery.id.length > 16 ? `…${delivery.id.slice(-8)}` : delivery.id}</p></div><div className="flex items-center gap-2 shrink-0"><span className="hermes-activity-state">{stateLabel(delivery.status)}</span>{delivery.retryable && <Button size="sm" variant="outline" className="h-6 px-2 text-[11px]" disabled={disabled} data-hermes-retry-delivery={delivery.id} onClick={() => void run('retryDelivery', { id: delivery.id })}>{t('hermes.retryDelivery')}</Button>}</div></div>;
           })}</div>}
         </div>
       </section>}

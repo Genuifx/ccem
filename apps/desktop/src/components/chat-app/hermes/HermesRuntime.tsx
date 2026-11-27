@@ -1,10 +1,10 @@
 import { useState } from 'react';
-import { ChevronDown, PackageCheck } from '@/lib/lucide-react';
+import { ChevronDown, PackageCheck, ShieldCheck } from '@/lib/lucide-react';
 import { Button } from '@/components/ui/button';
 import { Progress } from '@/components/ui/progress';
 import { useLocale } from '@/locales';
 import type { HermesRunAction, HermesStatus } from '@/lib/hermes-ipc';
-import { errorText } from './hermes-presentation';
+import { localizeHermesError } from './hermes-presentation';
 
 export function HermesRuntime({ installer, runtimeAvailable, installed, installing, installAccepted, cancelling, hasActions,
   activeConnection, setupActive, cancelDisabled, run, stateLabel }: {
@@ -30,7 +30,17 @@ export function HermesRuntime({ installer, runtimeAvailable, installed, installi
       {!attention && <ChevronDown className={`hermes-chevron ${open ? 'is-open' : ''}`} aria-hidden="true" />}
     </Button>
     <div id="hermes-runtime-details" className="hermes-runtime-details" hidden={!open} data-hermes-disclosure-content>
-      {!runtimeAvailable && <p className="hermes-caption">{t('hermes.installDescription')}</p>}
+      {!runtimeAvailable && <div className="hermes-onboarding-card" data-hermes-onboarding>
+        <p className="hermes-onboarding-lead">{t('hermes.installDescription')}</p>
+        <div className="hermes-onboarding-pills">
+          <span>{t('hermes.platformFeishu')}</span>
+          <span>{t('hermes.platformWecom')}</span>
+          <span>Telegram</span>
+          <span>Discord</span>
+          <span>Slack</span>
+        </div>
+        <p className="hermes-caption flex items-center gap-1.5"><ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" />{t('hermes.installSizeHint')}</p>
+      </div>}
       {runtimeAvailable && <div className="hermes-runtime-actions">
         {installed && !installing && <Button size="sm" variant="outline" disabled={hasActions || setupActive} onClick={() => void run('install')}>{t('hermes.updateComponent')}</Button>}
         <Button size="sm" variant="ghost" disabled={hasActions || installing || activeConnection || setupActive} onClick={() => void run('removeRuntime')}>{t('hermes.removeComponent')}</Button>
@@ -39,7 +49,7 @@ export function HermesRuntime({ installer, runtimeAvailable, installed, installi
         <span>{installAccepted ? installer.state === 'downloading' ? <>{(installer.downloadedBytes / 1024 / 1024).toFixed(1)} MB{installer.totalBytes ? ` / ${(installer.totalBytes / 1024 / 1024).toFixed(1)} MB` : ''}</> : <>{stateLabel(installer.state)}{fileProgress && <> · {t('hermes.installFiles', { completed: completed.toLocaleString(), total: installer.phaseTotal!.toLocaleString() })}</>}</> : t('hermes.installRequested')}</span>
         <Button size="sm" variant="ghost" disabled={!installAccepted || cancelling || cancelDisabled} onClick={() => void run('cancelInstall')}>{t('hermes.cancel')}</Button>
       </div></div>}
-      {installer.error && <p role="alert" className="hermes-error">{errorText(installer.error)}</p>}
+      {installer.error && <p role="alert" className="hermes-error">{localizeHermesError(installer.error, t)}</p>}
       {!installed && !installing && <Button disabled={hasActions || (installer.state === 'error' && !installer.retryable)} onClick={() => void run('install')}>{t(installer.state === 'paused' ? 'hermes.resumeInstall' : installer.state === 'error' || installer.state === 'cancelled' ? 'hermes.retryInstall' : 'hermes.install')}</Button>}
     </div>
   </section>;

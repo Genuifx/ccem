@@ -57,14 +57,15 @@ export function HermesToolsMode({ connection, disabled, run }: {
           <ToolsModeOption mode="ccem" />
         </SelectContent>
       </Select>
-      <Button size="sm" disabled={disabled || unavailable || !changed} onClick={async () => {
+      <Button size="sm" variant={changed && !unavailable ? 'default' : 'outline'} disabled={disabled || unavailable || !changed} onClick={async () => {
         if (disabled || unavailable || !changed) return;
         const result = await run('configureTools', { accountRef: connection.accountRef, toolsMode: selected });
         if (result) setLastSaved(selected);
       }}>{t('hermes.saveToolsMode')}</Button>
     </div>
     <p className="hermes-caption" id={`${id}-scope`}>{t(selected === 'native' ? 'hermes.toolsModeNativeHint' : 'hermes.toolsModeCcemHint')}</p>
-    {selected === 'native' && <p className="hermes-caption">{t('hermes.toolsModeWorkspaceBoundary')}</p>}
+    {selected === 'native' && <p className="hermes-boundary-warning" data-hermes-native-boundary>{t('hermes.toolsModeWorkspaceBoundary')}</p>}
+    {changed && !unavailable && <p className="hermes-caption" role="status">{t(connection.state === 'running' ? 'hermes.toolsModeReconnectHint' : 'hermes.unsavedChanges')}</p>}
     {(unavailable || (lastSaved === selected && !changed)) && <p className={unavailable ? 'hermes-error' : 'hermes-caption'} role="status">
       {t(unavailable ? 'hermes.nativeToolsUpdateRequired' : 'hermes.toolsModeSaved')}
     </p>}

@@ -5,8 +5,9 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { useLocale } from '@/locales';
 import type { HermesConnection, HermesRunAction } from '@/lib/hermes-ipc';
 
-export function HermesConversationModel({ connection, models, disabled, run }: {
+export function HermesConversationModel({ connection, models, unavailableModels = [], disabled, run }: {
   connection: HermesConnection; models: { envName: string; model: string }[];
+  unavailableModels?: { envName: string; reason: string }[];
   disabled: boolean; run: HermesRunAction;
 }) {
   const { t } = useLocale();
@@ -24,11 +25,12 @@ export function HermesConversationModel({ connection, models, disabled, run }: {
         <SelectTrigger id={id} className="min-w-0 flex-1"><SelectValue placeholder={t('hermes.chooseConversationModel')} /></SelectTrigger>
         <SelectContent>{models.map((model) => <SelectItem key={model.envName} value={model.envName}>{model.envName} · {model.model}</SelectItem>)}</SelectContent>
       </Select>
-      <Button size="sm" disabled={disabled || !available || !changed} onClick={async () => {
+      <Button size="sm" variant={changed && available ? 'default' : 'outline'} disabled={disabled || !available || !changed} onClick={async () => {
         const result = await run('configureConversation', { accountRef: connection.accountRef, modelEnv: selected });
         if (result) setDidSave(true);
       }}>{t('hermes.saveConversationModel')}</Button>
     </div>
-    <p className="hermes-caption" role="status">{t(!models.length ? 'hermes.noConversationModels' : saved && !models.some((m) => m.envName === saved) ? 'hermes.conversationModelUnavailable' : didSave ? 'hermes.conversationModelSaved' : 'hermes.conversationModelHint')}</p>
+    <p className="hermes-caption" role="status">{t(!models.length ? 'hermes.noConversationModels' : saved && !models.some((m) => m.envName === saved) ? 'hermes.conversationModelUnavailable' : changed && available ? 'hermes.unsavedChanges' : didSave ? 'hermes.conversationModelSaved' : 'hermes.conversationModelHint')}</p>
+    {unavailableModels.length > 0 && !models.length && <p className="hermes-caption">{t('hermes.unavailableModelsHint', { envs: unavailableModels.map((item) => item.envName).join(', ') })}</p>}
   </section>;
 }

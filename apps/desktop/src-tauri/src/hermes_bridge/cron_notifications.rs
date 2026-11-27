@@ -79,6 +79,7 @@ impl HermesBridgeManager {
                         "accountRef": connection.account_ref, "platform": connection.platform,
                         "label": connection.label, "chatId": route.source.chat_id,
                         "threadId": route.source.thread_id, "userId": route.source.user_id,
+                        "userName": route.user_name,
                         "chatType": route.source.chat_type,
                     }))
                 })
