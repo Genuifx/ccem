@@ -873,10 +873,13 @@
   display: none;
 }
 
-/* Keep Radix's generated content wrapper from sizing narrow panels by content. */
+/* Keep Radix's generated content wrapper from sizing narrow panels by content
+   or letting uncontained descendants inflate scrollWidth on vertical-only
+   viewports (which allows WKWebView to trap overflow-x: hidden at scrollLeft > 0). */
 .ccem-scroll-area-viewport > div {
   display: block !important;
   max-width: 100% !important;
+  overflow-x: clip;
 }
 
 /* Always-mounted scrollbars (type="always") keep their discoverability but read

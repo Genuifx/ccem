@@ -76,8 +76,8 @@ export const WorkspaceNextStepsCard = memo(function WorkspaceNextStepsCard({
               data-next-step-state={childKeys ? 'started' : 'suggested'}
               className={cn('py-1.5', index > 0 && 'border-t border-border-subtle/40')}
             >
-              <p className="text-[13px] font-medium leading-5 text-foreground">{suggestion.title}</p>
-              <p className="line-clamp-2 whitespace-pre-line text-[12px] leading-[18px] text-muted-foreground">
+              <p className="break-words text-[13px] font-medium leading-5 text-foreground">{suggestion.title}</p>
+              <p className="line-clamp-2 break-words whitespace-pre-line text-[12px] leading-[18px] text-muted-foreground">
                 {suggestion.prompt}
               </p>
               <div className="mt-1.5 flex items-center gap-1.5">

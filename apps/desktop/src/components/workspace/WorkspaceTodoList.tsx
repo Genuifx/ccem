@@ -71,7 +71,7 @@ export const WorkspaceTodoList = memo(function WorkspaceTodoList({
             </span>
             <div className="min-w-0">
               <p className={cn(
-                'text-[13px] leading-5',
+                'break-words text-[13px] leading-5',
                 item.status === 'completed' && 'text-muted-foreground/60 line-through decoration-muted-foreground/30',
                 item.status === 'in_progress' && 'font-medium text-foreground',
                 item.status === 'pending' && 'text-foreground/75',
@@ -80,7 +80,7 @@ export const WorkspaceTodoList = memo(function WorkspaceTodoList({
                 {item.text}
               </p>
               {item.status === 'in_progress' && item.activeText && item.activeText !== item.text ? (
-                <p className="text-[11px] leading-4 text-muted-foreground/70">{item.activeText}</p>
+                <p className="break-words text-[11px] leading-4 text-muted-foreground/70">{item.activeText}</p>
               ) : null}
             </div>
           </li>

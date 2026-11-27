@@ -79,7 +79,7 @@ function isNearBottom(container: HTMLElement): boolean {
 }
 
 function scrollToLatest(container: HTMLElement) {
-  container.scrollTo({ top: container.scrollHeight });
+  container.scrollTo({ top: container.scrollHeight, left: 0 });
 }
 import type {
   ConversationMessageData,
@@ -4767,7 +4767,7 @@ const WorkspaceNativeSessionViewContent = memo(function WorkspaceNativeSessionVi
       ) : null}
 
       <ScrollArea viewportRef={containerRef} className="workspace-transcript-scroll flex-1 bg-background/30">
-        <div className={cn(compact ? 'px-3' : 'px-2 sm:px-4')}>
+        <div className={cn('overflow-x-clip', compact ? 'px-3' : 'px-2 sm:px-4')}>
           <div
             ref={contentRef}
             data-workspace-transcript-column="true"

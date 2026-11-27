@@ -892,7 +892,7 @@ export function WorkspaceTranscriptSelection({
         className="pointer-events-none absolute inset-0 z-10 select-none"
       >
         {placements.map((placement) => {
-          const tooltipOnLeft = placement.markerLeft > contentWidth - 320;
+          const tooltipOnLeft = placement.markerLeft > contentWidth - 340;
           const appearance = appearanceFor(placement.annotation);
           return (
             <div

@@ -176,7 +176,7 @@ function AgentsDetail({
               {selected.resultSummary ? <p className="mt-1.5 line-clamp-2 text-[11px] text-muted-foreground">{selected.resultSummary}</p> : null}
             </div>
             <ScrollArea className="min-h-0 flex-1">
-              <div className="px-4 py-3">
+              <div className="overflow-x-clip px-4 py-3">
                 {agentDetail && agentDetail.length > 0 ? (
                   <WorkspaceTranscriptList messages={agentDetail} isAwaitingResponse={selected.status === 'running'} />
                 ) : error ? (

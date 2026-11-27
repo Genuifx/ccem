@@ -21,17 +21,35 @@ test('scroll area viewport hides native browser scrollbars from app CSS', async 
   assert.match(styles, /display:\s*none/);
 });
 
-test('radix inner wrapper override stays scoped to ccem scroll areas', async () => {
+test('radix inner wrapper override stays scoped to ccem scroll areas and clips horizontal overflow', async () => {
   const styles = await fs.readFile(path.join(desktopDir, 'src', 'index.css'), 'utf8');
 
   assert.match(
     styles,
-    /\.ccem-scroll-area-viewport\s*>\s*div\s*\{/,
+    /\.ccem-scroll-area-viewport\s*>\s*div\s*\{[\s\S]*display:\s*block\s*!important;[\s\S]*max-width:\s*100%\s*!important;[\s\S]*overflow-x:\s*clip;/,
   );
   assert.doesNotMatch(
     styles,
     /\/\*[^*]*Radix ScrollArea[^*]*\*\/\s*\[data-radix-scroll-area-viewport\]\s*>\s*div\s*\{/,
   );
+});
+
+test('workspace transcript scroll surfaces clip horizontal overflow and reset scrollLeft on pin', async () => {
+  const [nativeView, historyDetail, reviewDetails, markdownRenderer] = await Promise.all([
+    fs.readFile(path.join(desktopDir, 'src/components/workspace/WorkspaceNativeSessionView.tsx'), 'utf8'),
+    fs.readFile(path.join(desktopDir, 'src/components/workspace/WorkspaceConversationDetail.tsx'), 'utf8'),
+    fs.readFile(path.join(desktopDir, 'src/components/workspace/WorkspaceReviewDetails.tsx'), 'utf8'),
+    fs.readFile(path.join(desktopDir, 'src/components/history/MarkdownRenderer.tsx'), 'utf8'),
+  ]);
+
+  assert.match(nativeView, /container\.scrollTo\(\{\s*top:\s*container\.scrollHeight,\s*left:\s*0\s*\}\)/);
+  assert.match(historyDetail, /container\.scrollTo\(\{\s*top:\s*container\.scrollHeight,\s*left:\s*0\s*\}\)/);
+  assert.match(nativeView, /className=\{cn\('overflow-x-clip',/);
+  assert.match(historyDetail, /className=\{cn\('overflow-x-clip',/);
+  assert.match(reviewDetails, /className="overflow-x-clip px-4 py-3"/);
+  assert.match(markdownRenderer, /<p className="break-words /);
+  assert.match(markdownRenderer, /<li className="break-words /);
+  assert.match(markdownRenderer, /'break-words underline-offset-2'/);
 });
 
 test('workspace virtualized transcript rows keep paint slop for left-edge glyphs', async () => {

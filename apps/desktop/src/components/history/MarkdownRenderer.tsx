@@ -533,7 +533,7 @@ function getMarkdownComponents(
 
           // Paragraph
           p: ({ children }) => (
-            <p className="text-[14px] leading-[1.75] mb-3 last:mb-0">{children}</p>
+            <p className="break-words text-[14px] leading-[1.75] mb-3 last:mb-0">{children}</p>
           ),
 
           // Lists
@@ -544,7 +544,7 @@ function getMarkdownComponents(
             <ol className="pl-5 list-decimal text-[14px] leading-[1.75] mb-3 last:mb-0 space-y-1 [&_ul]:mt-1 [&_ol]:mt-1 [&_ul]:mb-0 [&_ol]:mb-0">{children}</ol>
           ),
           li: ({ children }) => (
-            <li className="text-[14px] leading-[1.75]">{children}</li>
+            <li className="break-words text-[14px] leading-[1.75]">{children}</li>
           ),
 
           // Links
@@ -552,7 +552,7 @@ function getMarkdownComponents(
             <MarkdownLink
               href={href}
               className={cn(
-                'underline-offset-2',
+                'break-words underline-offset-2',
                 isUser ? 'text-white/90' : 'text-primary hover:underline'
               )}
             >
